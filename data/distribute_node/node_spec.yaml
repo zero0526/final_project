@@ -1,0 +1,28 @@
+nodes:
+  cloud:
+    type: "cloud"
+    cpu_min: 5600 # GFLOPS
+    cpu_max: 5600
+    ram: 80 # GB
+    hdd: 80
+
+  edge:
+    type: "edge"
+    cpu_min: 3000 # GFLOPS
+    cpu_max: 4000
+    ram: 20 # GB
+    hdd: 10
+
+  network:
+    type: "network"
+    cpu_min: 800 # GFLOPS
+    cpu_max: 1200
+    ram: 10 # GB
+    hdd: 10 # GB
+
+  relay:
+    type: "relay"
+    cpu_min: 0
+    cpu_max: 0
+    ram: 0
+    hdd: 0

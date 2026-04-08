@@ -1,0 +1,9 @@
+node-cfg:
+  atlanta:
+    cloud: ["N15"]
+    edge: ["N4", "N5", "N11", "N12", "N13"]
+    network: ["N10", "N8"]
+  ta2:
+    cloud: ["N65"]
+    edge: ["N7", "N15", "N18", "N42", "N62"]
+    network: ["N1", "N13"]
