@@ -1,11 +1,11 @@
-from src.utils import cfg
+from src.configs.configs import cfg
 from .topology_manager import TopologyManager
 
 
 class ChannelModel:
-    def __init__(self, config=None):
+    def __init__(self, topo: TopologyManager, config=cfg):
         self.config = config or {}
-        self.topo: TopologyManager = TopologyManager()
+        self.topo = topo
         self.topo.load_topology_from_data()
 
     def compute_path_delay(
@@ -25,7 +25,7 @@ class ChannelModel:
         hops = len(path) - 1
 
         if hops == 0:
-            return float('inf')
+            return 0.0
 
         rates = []
         for i in range(hops):
@@ -38,13 +38,14 @@ class ChannelModel:
 
         return (data_size_mb * hops) / bottleneck_rate
 
-    def estimate_transmission_energy(self, total_delay, power_coeff=None):
-        p_coeff = power_coeff if power_coeff is not None else cfg.energy.get('tranmission_coef', 0.2)
+    @staticmethod
+    def estimate_transmission_energy(total_delay, power_coeff=None):
+        p_coeff = power_coeff if power_coeff is not None else getattr(cfg, 'transmission_coef', 0.2)
         return p_coeff * total_delay
 
     def get_metadata(self, from_node_id: str, to_node_id: str, data_size_mb: float):
-        tranmission_delay = self.compute_path_delay(from_node_id, to_node_id, data_size_mb)
+        transmission_delay = self.compute_path_delay(from_node_id, to_node_id, data_size_mb)
         return {
-            "tranmission_delay": tranmission_delay,
-            "transmission_energy": self.estimate_transmission_energy(tranmission_delay)
+            "transmission_delay": transmission_delay,
+            "transmission_energy": self.estimate_transmission_energy(transmission_delay)
         }

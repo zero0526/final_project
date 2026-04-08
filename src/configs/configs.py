@@ -57,7 +57,7 @@ class BaseConfig(BaseSettings):
     node_type_path: str= Field(default=str(PROJECT_ROOT / "data" / "distribute_node" / "nodes.yaml"))
     node_config_path: str= Field(default=str(PROJECT_ROOT / "data"  /"distribute_node" / "node_spec.yaml"))
     neural_cfg_path: str= Field(default=str(PROJECT_ROOT / "data" / "training_cfg.yaml"))
-    service_path: str= Field(default=str(PROJECT_ROOT / "data" / "ai_services"))
+    service_path: str= Field(default=str(PROJECT_ROOT / "data" / "ai_services.yaml"))
     nodes_type:Dict[str,str] = Field(default={})
     nodes_config:Dict[str,str] = Field(default={})
     energy_coef: float = Field(default=5e-10)
