@@ -1,4 +1,4 @@
-services:
+service:
   service_0:
     id: 0
     name: "Image Classification"

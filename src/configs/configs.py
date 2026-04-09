@@ -46,7 +46,7 @@ def load_neuron_cfg(path_cfg: str):
 
 def load_services(path_cfg: str):
     with open(path_cfg, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f).get("services")
+        return yaml.safe_load(f).get("service")
 
 class BaseConfig(BaseSettings):
     topology: str= Field(default="atlanta")
@@ -57,7 +57,7 @@ class BaseConfig(BaseSettings):
     node_type_path: str= Field(default=str(PROJECT_ROOT / "data" / "distribute_node" / "nodes.yaml"))
     node_config_path: str= Field(default=str(PROJECT_ROOT / "data"  /"distribute_node" / "node_spec.yaml"))
     neural_cfg_path: str= Field(default=str(PROJECT_ROOT / "data" / "training_cfg.yaml"))
-    service_path: str= Field(default=str(PROJECT_ROOT / "data" / "ai_services"))
+    service_path: str= Field(default=str(PROJECT_ROOT / "data" / "ai_services.yaml"))
     nodes_type:Dict[str,str] = Field(default={})
     nodes_config:Dict[str,str] = Field(default={})
     energy_coef: float = Field(default=5e-10)
@@ -73,7 +73,7 @@ class BaseConfig(BaseSettings):
     zipf_param: float= Field(default=0.8)
     default_batch_size: int= Field(default=20)
     hyper_neural: Dict[str, Any]= Field(default={})
-    services: Dict[str,str]= Field(default={})
+    services: Dict[str,Dict[str, Any]]= Field(default={})
 
     class Config:
         env_file = get_env_file()

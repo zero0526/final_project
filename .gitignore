@@ -206,7 +206,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-
+.idea/vcs.xml
 # Marimo
 marimo/_static/
 marimo/_lsp/
