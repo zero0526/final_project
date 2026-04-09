@@ -49,8 +49,6 @@ class WorkloadGenerator:
         generated_tasks = []
 
         for terminal in self.terminals:
-            # Ủy quyền việc sinh task cho từng Terminal
-            # Truyền các tham số workload toàn cục vào cho Terminal xử lý
             task = terminal.step_generate_task(
                 current_time_slot=current_time_slot,
                 batch_size=self.fixed_batch_size,

@@ -1,33 +1,36 @@
-from collections import deque, defaultdict
+from collections import deque
 import numpy as np
 import random
-from typing import List, Dict
-from src.mechanisms.kkt_solver import KKTSolver
+from typing import List
+
+from src.utils import KKTSolverADMM
 from src.utils.MechanismUtils import calc_computation_energy, update_backlog
 from src.envs.entities.task_node import Task
 from src.envs.time_manager import TimeManager
-from src.configs.configs import cfg
+from src.envs.network.channel_model import ChannelModel
+from src.configs.configs import cfg, BaseConfig
 
 
 class ComputingNode:
-    def __init__(self, node_id, specs, time_manager:TimeManager, service_config: Dict= cfg.services):
+    def __init__(self, node_id, specs, time_manager:TimeManager, channel_model: ChannelModel,  config: BaseConfig= cfg):
         self.id = node_id
 
         self.specs = specs
         self.cpu_capacity = specs['cpu']  # f_v(tau)
         self.ram_capacity = specs['ram']
         self.hdd_capacity = specs['hdd']
-        self.energy_coef = cfg.energy_coef
+        self.energy_coef = config.energy_coef
+        self.v_balance= config.lypa_coef
         self.type = specs['type']
 
-        self.service_profiles = {s.get("id"):s for s in service_config.values()}
+        self.service_profiles = {s.get("id"):s for s in config.services.values()}
 
         # x(t-1) x(t)
         self.placed_services = np.array([0]*len(self.service_profiles))
 
         self.neighbor_nodes: List[ComputingNode]= []
 
-        self.popular_services_req= {k: [0]*cfg.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10) for k in self.service_profiles.keys()}
+        self.popular_services_req= {k: [0]*config.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10) for k in self.service_profiles.keys()}
 
         n= len(self.service_profiles)
         self.expected_gpu_allocations= {k:self.cpu_capacity/n for k in self.service_profiles.keys()}
@@ -42,9 +45,9 @@ class ComputingNode:
         self.used_hdd = 0.0
 
         # Solver KKT
+        self.config= config
         self.time_manager = time_manager
-        self.solver = KKTSolver(self.cpu_capacity, learning_rate=0.05, max_iter=100)
-
+        self.channel_model= channel_model
 
     @property
     def mean_field(self):
@@ -108,14 +111,21 @@ class ComputingNode:
             return True
         return False
 
-    def admit_task(self, task: Task):
+    def admit_task(self, task: Task, model_idx: int):
+        """
+        :param task:
+        :param model_idx: order in the file config service
+        :return:
+        """
         sid = task.service_id
-        if not self.placed_services.get(sid, False): return False
+        task.assign_schedule(self.id, model_idx)
+        task_metadata= self.channel_model.get_metadata(task.source_node_id, self.id, task.total_data_size_mb)
+        task.trace_task(task_metadata)
         if task.required_workload_gflops <= 0: return False
 
         self.queues[sid].append(task)
 
-        self.backlogs[sid] = QueueDynamics.update_backlog(
+        self.backlogs[sid] = update_backlog(
             current_backlog=self.backlogs[sid],
             processed_workload=0,
             arrival_workload=task.required_workload_gflops
@@ -127,8 +137,8 @@ class ComputingNode:
 
         return True
 
-    def process_timeslot(self, current_time_elapsed, slot_duration, V_param=cfg.lypa_coef):
-        active_svcs = [sid for sid, active in self.placed_services.items() if active]
+    def process_timeslot(self, current_time_elapsed, slot_duration):
+        active_svcs = [sid for sid, active in np.ndenumerate(self.placed_services) if active]
         if not active_svcs:
             return [], 0.0
 
@@ -136,7 +146,7 @@ class ComputingNode:
         print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
 
         f_alloc_vec, slot_cold_times = self._compute_optimal_resources(
-            active_svcs, current_time_elapsed, slot_duration, V_param
+            active_svcs
         )
 
         completed_tasks, total_energy = self._execute_allocation(
@@ -148,55 +158,54 @@ class ComputingNode:
 
         return completed_tasks, total_energy
 
-    def _compute_optimal_resources(self, active_svcs, current_time_elapsed, slot_duration, V_param):
+    def __min_requirement_gpu(self, sid):
+        # estimate by ignore overloading cause over deadline before computing process
+        expect_allocation= self.expected_gpu_allocations[sid]
+        t_cold_start, e_cold_start=0, 0
+        if self.service_profiles[sid].get("omega"):
+            t_cold_start= random.uniform(self.config.cold_start_time.get("min"), self.config.cold_start_time.get("max"))
+            e_cold_start= t_cold_start*self.config.cold_start_energy_coef
+        tasks= self.queues[sid]
+        delay=0
+        min_req=0
+        is_first= True
+        for task in tasks:
+            if task.is_assigned:
+                if is_first:
+                    task.trace_task({"cold_start_delay": t_cold_start,
+                                     "cold_start_energy": e_cold_start})
+                    is_first= False
+                time_remaining = task.deadline - task.created_at - task.time_comsume
+                if time_remaining <1e-8:
+                    continue
+                expected_computing_time= self.config.delay_coef*(time_remaining - delay)
+                if expected_computing_time < 1e-8:
+                    min_req= self.cpu_capacity
+                    break
+                cpu_require= task.remaining_workload_gflops/expected_computing_time
+                min_req= max(min_req, cpu_require)
+                delay+= task.remaining_workload_gflops/(expect_allocation + 1e-8)
+        return min_req, t_cold_start
+
+    def _compute_optimal_resources(self, active_svcs):
         num_active = len(active_svcs)
-        G_vec = np.zeros(num_active)
-        Z_vec = np.zeros(num_active)
+        g_vec = np.zeros(num_active)
+        z_vec = np.zeros(num_active)
         f_min_vec = np.zeros(num_active)
         f_max_vec = np.zeros(num_active)
-
-        slot_cold_times = {}
-
+        slot_cold_times={}
+        solver= KKTSolverADMM(f_max_node= self.cpu_capacity,rho=1.0, max_iter=100)
         for i, sid in enumerate(active_svcs):
-            profile = self.service_profiles[sid]
-            omega = profile['omega']
-
-            G_vec[i] = self.backlogs.get(sid, 0.0)
+            g_vec[i] = self.backlogs.get(sid, 0.0)
 
             arrival_load = self.slot_arrival_workload.get(sid, 0.0)
-            Z_vec[i] = V_param * self.energy_coeff * arrival_load
-            Z_vec[i] = max(Z_vec[i], 1e-12)
+            z_vec[i] = self.v_balance * self.energy_coeff * arrival_load
+            z_vec[i] = max(z_vec[i], 1e-12)
 
             f_max_vec[i] = self.cpu_capacity
-
-            max_f_min_req = 0.0
-            t_cold_val = 0.0
-            if omega == 0:
-                eps_cold = cfg.network["cold_start_time"]
-                t_cold_val = random.uniform(eps_cold["min"], eps_cold["max"])
-            slot_cold_times[sid] = t_cold_val
-
-            current_t_q_max = self.t_queue_max.get(sid, 0.05)
-
-            for task in list(self.queues[sid]):
-                birth_time = task.created_at * slot_duration
-                time_spent = current_time_elapsed - birth_time
-                time_remaining = task.deadline - time_spent - t_cold_val - current_t_q_max
-
-                req_f = 0.0
-                if time_remaining <= 1e-8:
-                    req_f = self.cpu_capacity
-                else:
-                    if len(profile["models"]) > task.selected_model_idx:
-                        task_workload = task.batch_size * profile["models"][task.selected_model_idx]["workload"]
-                        req_f = task_workload / time_remaining
-
-                if req_f > max_f_min_req:
-                    max_f_min_req = req_f
-
-            f_min_vec[i] = min(max_f_min_req, self.cpu_capacity)
-
-        f_alloc_vec = self.solver.solve(G_vec, Z_vec, f_min_vec, f_max_vec)
+            f_min_vec[i], cold_times = self.__min_requirement_gpu(sid)
+            slot_cold_times[sid] = cold_times
+        f_alloc_vec = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
 
         return f_alloc_vec, slot_cold_times
 
@@ -222,17 +231,14 @@ class ComputingNode:
 
             actual_workload = q_before - q_after
 
-            energy_param = cfg.network.get("energy", {})
-            epsilon_cold = energy_param.get('cold_start', 0.2)
-
             effective_t_cold = t_cold if f_val > 1e-6 else 0.0
 
-            e_comp = EnergyModel.calc_computation_energy(
-                epsilon_c=self.energy_coeff,
+            e_comp = calc_computation_energy(
+                epsilon_c=self.config.energy_coef,
                 f_allocated=f_val,
                 workload_total=actual_workload,
                 omega=omega,
-                epsilon_cold=epsilon_cold,
+                epsilon_cold=self.config.cold_start_energy_coef,
                 t_cold=effective_t_cold
             )
 
@@ -244,14 +250,9 @@ class ComputingNode:
                   f"Queue: {q_before:8.2f} -> {q_after:8.2f} GFLOPS")
 
             remaining_cap = processed_workload
-
+            delay= 0
             while self.queues[sid] and remaining_cap > 0:
                 task = self.queues[sid][0]
-
-                if not hasattr(task, 'remaining_workload'):
-                    task.remaining_workload = task.required_workload_gflops
-                if not hasattr(task, 'initial_workload'):
-                    task.initial_workload = task.required_workload_gflops
 
                 if task.remaining_workload <= remaining_cap:
                     remaining_cap -= task.remaining_workload
@@ -259,17 +260,17 @@ class ComputingNode:
                     done_task = self.queues[sid].popleft()
 
                     time_in_slot = (processed_workload - remaining_cap) / f_val if f_val > 0 else 0
-                    finish_time = current_time_elapsed + time_in_slot
+                    task.trace_task({"queue_delay": delay, "computation_delay": time_in_slot})
+                    finish_time= task.time_comsume + task.created_at
 
-                    # Kiểm tra xem task đã bị quá hạn ngay từ lúc bắt đầu slot chưa để tối ưu tài nguyên
-                    birth_time = done_task.created_at * slot_duration
-                    if current_time_elapsed > birth_time + done_task.deadline:
+                    if finish_time> done_task.deadline:
                         # Task này đã chết rồii, không tính là thành công cho dù xử lý xong
                         done_task.qos_status = False
                     else:
                         done_task.qos_status = True
 
                     done_task.finished_at = finish_time
+                    delay+=time_in_slot
                     completed_tasks.append(done_task)
                 else:
                     task.remaining_workload -= remaining_cap

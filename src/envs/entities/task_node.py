@@ -39,7 +39,7 @@ class Task:
         self.remaining_workload_gflops = -1.0
 
         # --- Reward/Log) ---
-        self.created_at = created_at
+        self.created_at = created_at #second
         self.finished_at = None
 
         # trace task
@@ -48,20 +48,26 @@ class Task:
         self.computation_delay = 0.0
         self.cold_start_delay = 0.0
 
+        self.transmission_energy = 0.0
+        self.computation_energy = 0.0
+        self.cold_start_energy = 0.0
+
     def assign_schedule(self, node_id, model_idx):
         """
         Gán quyết định từ Agent (Lower-level) cho Task.
 
         Args:
             node_id: computing node is assigned task (v).
-            model_idx: Index của model được chọn trong danh sách model của service này.
+            model_idx: Index của model được chọn trong danh sách model của service này giữ nguyên order trong file config service
             unit_workload: Khối lượng tính toán (GFLOPS) để xử lý 1 đơn vị dữ liệu (1 item).
         """
         self.assigned_node_id = node_id
         self.selected_model_idx = model_idx
         self.model = self.models[model_idx]
         # eq12: Workload = unit_workload * Batch_size
-        self.required_workload_gflops = self.model.get("workload") * self.batch_size
+        total_workload= self.model.get("workload") * self.batch_size
+        self.required_workload_gflops = total_workload
+        self.remaining_workload_gflops = total_workload
 
     @property
     def total_delay(self):
@@ -84,6 +90,27 @@ class Task:
     @property
     def is_assigned(self):
         return self.assigned_node_id is not None
+
+    def trace_task(self, attr: Dict[str, Any]):
+        self.finished_at = attr.get("finished_at", None)
+
+        self.transmission_delay = attr.get("transmission_delay", 0.0)
+        self.queue_delay = attr.get("queue_delay", 0.0)
+        self.computation_delay = attr.get("computation_delay", 0.0)
+        self.cold_start_delay = attr.get("cold_start_delay", 0.0)
+
+
+        self.transmission_energy = attr.get("transmission_energy", 0.0)
+        self.computation_energy = attr.get("computation_energy", 0.0)
+        self.cold_start_energy = attr.get("cold_start_energy", 0.0)
+
+    @property
+    def time_comsume(self):
+        return self.transmission_delay + self.queue_delay + self.computation_delay +self.cold_start_delay
+
+    @property
+    def energy_comsume(self):
+        return self.transmission_energy + self.computation_energy + self.cold_start_energy
 
     def __repr__(self):
         status = "DONE" if self.finished_at else "PENDING"

@@ -63,7 +63,7 @@ class BaseConfig(BaseSettings):
     energy_coef: float = Field(default=5e-10)
     transmission_rate: Dict[str, float] = Field(default={"min": 50, "max": 100})
     topology_data: Dict[str, Any] = Field(default_factory=dict)
-    cold_start_energy: float= Field(default= 0.2)
+    cold_start_energy_coef: float= Field(default= 0.2)
     transmission_coef: float= Field(default=0.2)
     lypa_coef: float= Field(default=1e5)
     cold_start_time: Dict[str, float]= Field(default={"min":0.15, "max":0.85})
@@ -74,6 +74,7 @@ class BaseConfig(BaseSettings):
     default_batch_size: int= Field(default=20)
     hyper_neural: Dict[str, Any]= Field(default={})
     services: Dict[str,Dict[str, Any]]= Field(default={})
+    delay_coef:float= Field(default=0.9)
 
     class Config:
         env_file = get_env_file()
