@@ -8,7 +8,6 @@ from src.utils import KKTSolverADMM, EMA
 from src.utils.MechanismUtils import calc_computation_energy, update_backlog
 from src.envs.entities.task_node import Task
 from src.envs.network.channel_model import ChannelModel
-from src.envs.time_manager import TimeManager
 from src.configs.configs import cfg, BaseConfig
 
 # init
