@@ -1,9 +1,10 @@
+from asyncio import tasks
 from collections import deque
 import numpy as np
 import random
 from typing import List, Dict
 import math
-from src.utils import KKTSolverADMM, ema
+from src.utils import KKTSolverADMM, EMA
 from src.utils.MechanismUtils import calc_computation_energy, update_backlog
 from src.envs.entities.task_node import Task
 from src.envs.network.channel_model import ChannelModel
@@ -53,6 +54,7 @@ class ComputingNode:
         # Solver KKT
         self.config= config
         self.channel_model= channel_model
+        self.ema= EMA()
 
     def upper_reset(self):
         self.placed_services = np.zeros_like(self.placed_services)
@@ -130,6 +132,8 @@ class ComputingNode:
         """
         sid = task.service_id
         task.queue_delay=0
+        if len(self.popular_services_req) == 0:
+            self.popular_services_req.append(np.zeros_like(self.placed_services))
         self.popular_services_req[-1][sid]+=task.batch_size
 
         task.assign_schedule(self.id, model_idx)
@@ -151,8 +155,28 @@ class ComputingNode:
 
         return True
 
+    def __clear_queue_task(self, s_id):
+        violate_qos = 0
+        tasks_to_keep = deque()
+
+        for t in self.queues[s_id]:
+            # Nếu thời gian chờ vượt quá deadline -> Vứt bỏ
+            if t.queue_delay + self.config.hyper_neural["SLOT_DURATION"] > t.deadline:
+                violate_qos += 1
+                self.backlogs[s_id] -= t.remaining_workload_gflops
+            else:
+                tasks_to_keep.append(t)
+
+        self.queues[s_id] = tasks_to_keep  # Cập nhật lại hàng đợi
+        self.backlogs[s_id] = max(0.0, self.backlogs[s_id])  # Đảm bảo không bị số âm
+        return violate_qos
+
     def process_timeslot(self, current_time_elapsed, slot_duration):
-        active_svcs = [sid for sid, active in np.ndenumerate(self.placed_services) if active]
+        active_svcs = [sid for sid, active in enumerate(self.placed_services) if active]
+        violate_qos=0
+        for s_id in self.service_profiles:
+            if s_id not in active_svcs:
+                violate_qos+=self.__clear_queue_task(s_id)
         if not active_svcs:
             return [], 0.0
 
@@ -168,24 +192,21 @@ class ComputingNode:
         )
         local_F1= total_energy*self.config.lypa_coef + lypa_punish
         self.F1.append(local_F1)
-        reward= -(local_F1 + self._calculate_QoS(completed_tasks))
+        violate_qos+=sum(1 for t in completed_tasks if not t.qos_status)
+        reward= -(local_F1 + self._calculate_QoS(violate_qos))
         self.slot_arrival_workload = {}
         self.consumption_energy = total_energy
 
         return completed_tasks, total_energy, reward
 
-    def _calculate_QoS(self, tasks:List[Task])->float:
-        cnt=0
-        for t in tasks:
-            if t.qos_status:
-                cnt+=1
-        return self.config.hyper_neural["OMEGA_Q1"]*math.exp(cnt*self.config.hyper_neural["OMEGA_Q2"])
+    def _calculate_QoS(self, violate_qos: int)->float:
+        return self.config.hyper_neural["OMEGA_Q1"]*math.exp(violate_qos*self.config.hyper_neural["OMEGA_Q2"])
 
     def __min_requirement_gpu(self, sid):
         # estimate by ignore overloading cause over deadline before computing process
         expect_allocation= self.expected_gpu_allocations[sid]
         t_cold_start, e_cold_start=0, 0
-        if self.service_profiles[sid].get("omega"):
+        if not self.service_profiles[sid].get("omega"):
             t_cold_start= random.uniform(self.config.cold_start_time.get("min"), self.config.cold_start_time.get("max"))
             e_cold_start= t_cold_start*self.config.cold_start_energy_coef
         tasks= self.queues[sid]
@@ -198,7 +219,7 @@ class ComputingNode:
                     task.trace_task({"cold_start_delay": t_cold_start,
                                      "cold_start_energy": e_cold_start})
                     is_first= False
-                expected_computing_time = self.config.delay_coef*(task.deadline - task.created_at - task.time_comsume -delay)
+                expected_computing_time = self.config.delay_coef*(task.deadline - task.created_at - task.time_consume -delay)
 
                 if expected_computing_time < 1e-8:
                     min_req= self.cpu_capacity
@@ -227,9 +248,11 @@ class ComputingNode:
             f_min_vec[i], cold_times = self.__min_requirement_gpu(sid)
             slot_cold_times[sid] = cold_times
         f_alloc_vec = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
-        for s_id, e_service_allocation in self.expected_gpu_allocations.items():
-            self.expected_gpu_allocations= ema(f_alloc_vec[s_id], e_service_allocation, n=)
-        self.expected_gpu_allocations
+        for i, sid in enumerate(active_svcs):
+            self.expected_gpu_allocations[sid] = self.ema.update(
+                f_alloc_vec[i],
+                self.expected_gpu_allocations[sid]
+            )
         return f_alloc_vec, slot_cold_times
 
     def _execute_allocation(self, active_svcs, f_alloc_vec, slot_cold_times, slot_duration, current_time_elapsed):
@@ -274,37 +297,38 @@ class ComputingNode:
                   f"Queue: {q_before:8.2f} -> {q_after:8.2f} GFLOPS")
 
             remaining_cap = processed_workload
-            delay= 0
+            current_slot_time = 0
             while self.queues[sid] and remaining_cap > 0:
+
                 task = self.queues[sid][0]
-                task.queue_delay += delay
-                if task.remaining_workload <= remaining_cap:
-                    remaining_cap -= task.remaining_workload
-                    task.remaining_workload = 0
+                task.queue_delay += current_slot_time
+                if task.remaining_workload_gflops <= remaining_cap:
+                    processed_now = task.remaining_workload_gflops
+                    duration = processed_now / f_val if f_val > 0 else 0
+
+                    remaining_cap -= processed_now
+                    task.remaining_workload_gflops = 0
                     done_task = self.queues[sid].popleft()
 
-                    time_in_slot = (processed_workload - remaining_cap) / f_val if f_val > 0 else 0
-                    task.trace_task({"computation_delay": time_in_slot})
-                    finish_time= task.time_comsume + task.created_at
+                    task.trace_task({"computation_delay": duration})
+                    finish_time= task.time_consume + task.created_at
 
-                    if finish_time> done_task.deadline:
-                        # Task này đã chết rồii, không tính là thành công cho dù xử lý xong
-                        done_task.qos_status = False
-                    else:
-                        done_task.qos_status = True
+                    done_task.qos_status = finish_time <= done_task.deadline
 
                     done_task.finished_at = finish_time
-                    delay+=time_in_slot
                     completed_tasks.append(done_task)
+                    current_slot_time += duration
                 else:
-                    time_processing= remaining_cap/f_val if f_val > 0 else 0
-                    task.computation_delay+=time_processing
-                    delay+=time_processing
-                    task.remaining_workload -= remaining_cap
+                    processed_now = remaining_cap
+                    duration = processed_now / f_val if f_val > 0 else 0
+
+                    task.computation_delay += duration
+                    task.remaining_workload_gflops -= processed_now
                     remaining_cap = 0
+                    current_slot_time += duration
 
             for t in self.queues[sid]:
-                t.queue_delay += delay
+                t.queue_delay += current_slot_time
         print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)}")
         return completed_tasks, total_energy, lypa_punish
 

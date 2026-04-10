@@ -107,11 +107,11 @@ class Task:
         self.cold_start_energy = attr.get("cold_start_energy", 0.0)
 
     @property
-    def time_comsume(self):
+    def time_consume(self):
         return self.transmission_delay + self.queue_delay + self.computation_delay +self.cold_start_delay
 
     @property
-    def energy_comsume(self):
+    def energy_consume(self):
         return self.transmission_energy + self.computation_energy + self.cold_start_energy
 
     def __repr__(self):

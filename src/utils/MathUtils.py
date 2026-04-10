@@ -90,9 +90,10 @@ class EMA:
     def __init__(self, init_step=0):
         self.step= init_step
 
-    def ema(self, prev: float, curr: float):
+    def update(self, prev: float, curr: float):
         if self.step<0:
             raise ValueError('n must be non-negative')
         alpha= 1/(2+self.step)
+        self.step+=1
         return prev*(1-alpha) + curr*alpha
 
