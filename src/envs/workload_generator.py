@@ -38,7 +38,7 @@ class WorkloadGenerator:
         probs = weights / np.sum(weights)
         return probs
 
-    def step(self, current_time_slot: int) -> List[Task]:
+    def step(self, abs_current_time: float) -> List[Task]:
         """
         Hàm chính được gọi tại mỗi bước mô phỏng (Simulation Step).
         Yêu cầu tất cả các Terminal sinh task.
@@ -50,7 +50,7 @@ class WorkloadGenerator:
 
         for terminal in self.terminals:
             task = terminal.step_generate_task(
-                current_time_slot=current_time_slot,
+                abs_current_time=abs_current_time,
                 batch_size=self.fixed_batch_size,
                 zipf_probs=self.zipf_probs
             )

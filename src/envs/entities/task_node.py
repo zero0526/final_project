@@ -40,7 +40,9 @@ class Task:
 
         # --- Reward/Log) ---
         self.created_at = created_at #second
+        self.queue_delay=0
         self.finished_at = None
+        self.qos_status= False
 
         # trace task
         self.transmission_delay = 0.0

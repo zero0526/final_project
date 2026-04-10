@@ -33,7 +33,7 @@ class Terminal:
 
     def step_generate_task(
             self,
-            current_time_slot: int,
+            abs_current_time: float,
             batch_size: int,
             zipf_probs: np.ndarray,
     ) -> Optional[Task]:
@@ -61,16 +61,16 @@ class Terminal:
         sigma = 0.1
         min_acc_required = float(min(np.random.normal(mu, sigma), max(task_acc)))
         # 4. create Task
-        task_id = f"T_{self.id}_{current_time_slot}"
+        task_id = f"T_{self.id}_{abs_current_time}"
         deadline = random.gauss(svc_info.get('mean_deadline'), svc_info.get('std_deadline'))
         new_task = Task(
             task_id=task_id,
             terminal_id=self.id,
             source_node_id=self.edge_id,
             batch_size=batch_size,
-            deadline=max(deadline, 1.0),
+            deadline=abs_current_time + max(deadline, 1.0),
             min_accuracy=min_acc_required,
-            created_at=current_time_slot,
+            created_at=abs_current_time,
             service_info=svc_info
         )
 

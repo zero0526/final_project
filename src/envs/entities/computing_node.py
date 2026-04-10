@@ -1,18 +1,22 @@
 from collections import deque
 import numpy as np
 import random
-from typing import List
-
+from typing import List, Dict
+import math
 from src.utils import KKTSolverADMM
 from src.utils.MechanismUtils import calc_computation_energy, update_backlog
 from src.envs.entities.task_node import Task
-from src.envs.time_manager import TimeManager
 from src.envs.network.channel_model import ChannelModel
 from src.configs.configs import cfg, BaseConfig
 
-
+# init
+# start time frame call upper_reset and start timeslot call lower_reset
+# call admit task để assign lower level agent's action to computing node
+# call mean field to get mean_field and popularity_service to get popularity_service
+# update_placement to deploy new service in new timeframe
+# process_timeslot to process task in queue of node
 class ComputingNode:
-    def __init__(self, node_id, specs, time_manager:TimeManager, channel_model: ChannelModel,  config: BaseConfig= cfg):
+    def __init__(self, node_id, type_node, specs, channel_model: ChannelModel,  config: BaseConfig= cfg):
         self.id = node_id
 
         self.specs = specs
@@ -21,33 +25,47 @@ class ComputingNode:
         self.hdd_capacity = specs['hdd']
         self.energy_coef = config.energy_coef
         self.v_balance= config.lypa_coef
-        self.type = specs['type']
+        self.type = type_node
 
         self.service_profiles = {s.get("id"):s for s in config.services.values()}
 
-        # x(t-1) x(t)
-        self.placed_services = np.array([0]*len(self.service_profiles))
 
         self.neighbor_nodes: List[ComputingNode]= []
 
-        self.popular_services_req= {k: [0]*config.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10) for k in self.service_profiles.keys()}
 
         n= len(self.service_profiles)
         self.expected_gpu_allocations= {k:self.cpu_capacity/n for k in self.service_profiles.keys()}
 
+        self.placed_services = np.array([0]*len(self.service_profiles))
+        time_slot_in_tf= config.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10)
+        self.popular_services_req: deque[np.ndarray]= deque(maxlen=time_slot_in_tf)
+        self.F1: deque[float]= deque(maxlen=time_slot_in_tf)
         self.queues: dict[str, deque[Task]] = {}
         self.backlogs = {}
         self.slot_arrival_workload = {}
-        self.last_cpu_allocations = {}
-        self.last_energy = 0.0  # <--- Added to track per-node consumption
+        self.cpu_allocations = {}
+        self.consumption_energy = 0.0  # <--- Added to track per-node consumption
 
         self.used_ram = 0.0
         self.used_hdd = 0.0
 
         # Solver KKT
         self.config= config
-        self.time_manager = time_manager
         self.channel_model= channel_model
+
+    def upper_reset(self):
+        self.placed_services = np.zeros_like(self.placed_services)
+        # maintaining task in queue regardless of enđ time frame or timeslot
+        # self.queues = {}
+        # self.backlogs = {}
+        self.used_ram = 0.0
+        self.used_hdd = 0.0
+
+    def lower_reset(self):
+        self.popular_services_req.append(np.zeros_like(self.placed_services))
+        self.cpu_allocations = {}
+        self.slot_arrival_workload = {}
+        self.consumption_energy = 0.0
 
     @property
     def mean_field(self):
@@ -56,25 +74,17 @@ class ComputingNode:
 
     @property
     def popularity_service(self):
-        sorted_ids = sorted(self.popular_services_req.keys())
-        requests_matrix = np.array([self.popular_services_req[i] for i in sorted_ids])  # Shape: (S, T)
+        total_per_service = np.sum(self.popular_services_req, axis=0)
+        sum_all_services = np.sum(total_per_service)
 
-        sum_per_service = np.sum(requests_matrix, axis=1)  # Shape: (S,)
-
-        total_requests = np.sum(sum_per_service) + 1e-8
+        if sum_all_services.item() > 0:
+            phi_vector = total_per_service / sum_all_services
+        else:
+            phi_vector = np.zeros_like(total_per_service)
 
         # (Phi_v,s)
-        return sum_per_service / total_requests
+        return phi_vector
 
-    def reset(self):
-        self.placed_services = {}
-        self.queues = {}
-        self.backlogs = {}
-        self.slot_arrival_workload = {}
-        self.last_cpu_allocations = {}
-        self.last_energy = 0.0
-        self.used_ram = 0.0
-        self.used_hdd = 0.0
 
     def update_placement(self, placement_vector):
         constraint_violations = 0
@@ -118,6 +128,9 @@ class ComputingNode:
         :return:
         """
         sid = task.service_id
+        task.queue_delay=0
+        self.popular_services_req[-1][sid]+=task.batch_size
+
         task.assign_schedule(self.id, model_idx)
         task_metadata= self.channel_model.get_metadata(task.source_node_id, self.id, task.total_data_size_mb)
         task.trace_task(task_metadata)
@@ -149,14 +162,23 @@ class ComputingNode:
             active_svcs
         )
 
-        completed_tasks, total_energy = self._execute_allocation(
+        completed_tasks, total_energy, lypa_punish = self._execute_allocation(
             active_svcs, f_alloc_vec, slot_cold_times, slot_duration, current_time_elapsed
         )
-
+        local_F1= total_energy*self.config.lypa_coef + lypa_punish
+        self.F1.append(local_F1)
+        reward= -(local_F1 + self._calculate_QoS(completed_tasks))
         self.slot_arrival_workload = {}
-        self.last_energy = total_energy
+        self.consumption_energy = total_energy
 
-        return completed_tasks, total_energy
+        return completed_tasks, total_energy, reward
+
+    def _calculate_QoS(self, tasks:List[Task])->float:
+        cnt=0
+        for t in tasks:
+            if t.qos_status:
+                cnt+=1
+        return self.config.hyper_neural["OMEGA_Q1"]*math.exp(cnt*self.config.hyper_neural["OMEGA_Q2"])
 
     def __min_requirement_gpu(self, sid):
         # estimate by ignore overloading cause over deadline before computing process
@@ -175,10 +197,8 @@ class ComputingNode:
                     task.trace_task({"cold_start_delay": t_cold_start,
                                      "cold_start_energy": e_cold_start})
                     is_first= False
-                time_remaining = task.deadline - task.created_at - task.time_comsume
-                if time_remaining <1e-8:
-                    continue
-                expected_computing_time= self.config.delay_coef*(time_remaining - delay)
+                expected_computing_time = self.config.delay_coef*(task.deadline - task.created_at - task.time_comsume -delay)
+
                 if expected_computing_time < 1e-8:
                     min_req= self.cpu_capacity
                     break
@@ -199,7 +219,7 @@ class ComputingNode:
             g_vec[i] = self.backlogs.get(sid, 0.0)
 
             arrival_load = self.slot_arrival_workload.get(sid, 0.0)
-            z_vec[i] = self.v_balance * self.energy_coeff * arrival_load
+            z_vec[i] = self.v_balance * self.energy_coef * arrival_load
             z_vec[i] = max(z_vec[i], 1e-12)
 
             f_max_vec[i] = self.cpu_capacity
@@ -212,19 +232,20 @@ class ComputingNode:
     def _execute_allocation(self, active_svcs, f_alloc_vec, slot_cold_times, slot_duration, current_time_elapsed):
         total_energy = 0.0
         completed_tasks = []
-        self.last_cpu_allocations = {}
-
+        self.cpu_allocations = {}
+        lypa_punish= 0.0
         for i, sid in enumerate(active_svcs):
             f_val = f_alloc_vec[i]
             if not np.isfinite(f_val): f_val = 0.0
 
-            self.last_cpu_allocations[sid] = f_val
+            self.cpu_allocations[sid] = f_val
 
             profile = self.service_profiles[sid]
             omega = profile['omega']
             t_cold = slot_cold_times.get(sid, 0.0)
 
             processed_workload = f_val * slot_duration
+            lypa_punish+=self.backlogs.get(sid, 0.0)*(self.slot_arrival_workload.get(sid, 0.0) - processed_workload)
             q_before = self.backlogs.get(sid, 0.0)
             self.backlogs[sid] = max(0.0, q_before - processed_workload)
             q_after = self.backlogs[sid]
@@ -253,14 +274,14 @@ class ComputingNode:
             delay= 0
             while self.queues[sid] and remaining_cap > 0:
                 task = self.queues[sid][0]
-
+                task.queue_delay += delay
                 if task.remaining_workload <= remaining_cap:
                     remaining_cap -= task.remaining_workload
                     task.remaining_workload = 0
                     done_task = self.queues[sid].popleft()
 
                     time_in_slot = (processed_workload - remaining_cap) / f_val if f_val > 0 else 0
-                    task.trace_task({"queue_delay": delay, "computation_delay": time_in_slot})
+                    task.trace_task({"computation_delay": time_in_slot})
                     finish_time= task.time_comsume + task.created_at
 
                     if finish_time> done_task.deadline:
@@ -273,11 +294,17 @@ class ComputingNode:
                     delay+=time_in_slot
                     completed_tasks.append(done_task)
                 else:
+                    time_processing= remaining_cap/f_val if f_val > 0 else 0
+                    task.computation_delay+=time_processing
+                    delay+=time_processing
                     task.remaining_workload -= remaining_cap
                     remaining_cap = 0
 
+            for t in self.queues[sid]:
+                t.queue_delay += delay
         print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)}")
-        return completed_tasks, total_energy
+        return completed_tasks, total_energy, lypa_punish
+
 
     def get_observation_state(self, service_id):
         """
@@ -286,6 +313,6 @@ class ComputingNode:
         2. Last CPU Allocation (f) - Normalization 1/capacity
         """
         q = self.backlogs.get(service_id, 0.0)
-        f = self.last_cpu_allocations.get(service_id, 0.0) / (self.cpu_capacity if self.cpu_capacity > 0 else 1.0)
+        f = self.cpu_allocations.get(service_id, 0.0) / (self.cpu_capacity if self.cpu_capacity > 0 else 1.0)
 
         return [q, f]
