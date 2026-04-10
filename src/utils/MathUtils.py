@@ -86,9 +86,13 @@ class KKTSolverADMM:
 
         return z
 
-def ema(prev: float, curr: float, n: int= 0):
-    if n<0:
-        raise ValueError('n must be non-negative')
-    alpha= 1/(2+n)
-    return prev*(1-alpha) + curr*alpha
+class EMA:
+    def __init__(self, init_step=0):
+        self.step= init_step
+
+    def ema(self, prev: float, curr: float):
+        if self.step<0:
+            raise ValueError('n must be non-negative')
+        alpha= 1/(2+self.step)
+        return prev*(1-alpha) + curr*alpha
 

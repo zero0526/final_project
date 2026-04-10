@@ -3,10 +3,11 @@ import numpy as np
 import random
 from typing import List, Dict
 import math
-from src.utils import KKTSolverADMM
+from src.utils import KKTSolverADMM, ema
 from src.utils.MechanismUtils import calc_computation_energy, update_backlog
 from src.envs.entities.task_node import Task
 from src.envs.network.channel_model import ChannelModel
+from src.envs.time_manager import TimeManager
 from src.configs.configs import cfg, BaseConfig
 
 # init
@@ -86,7 +87,7 @@ class ComputingNode:
         return phi_vector
 
 
-    def update_placement(self, placement_vector):
+    def update_placement(self, placement_vector:np.ndarray):
         constraint_violations = 0
 
         for svc_id, decision in enumerate(placement_vector):
@@ -226,7 +227,9 @@ class ComputingNode:
             f_min_vec[i], cold_times = self.__min_requirement_gpu(sid)
             slot_cold_times[sid] = cold_times
         f_alloc_vec = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
-
+        for s_id, e_service_allocation in self.expected_gpu_allocations.items():
+            self.expected_gpu_allocations= ema(f_alloc_vec[s_id], e_service_allocation, n=)
+        self.expected_gpu_allocations
         return f_alloc_vec, slot_cold_times
 
     def _execute_allocation(self, active_svcs, f_alloc_vec, slot_cold_times, slot_duration, current_time_elapsed):

@@ -13,9 +13,6 @@ from src.envs.time_manager import TimeManager
 
 class SixGEnvironment:
     def __init__(self, config:BaseConfig = cfg):
-        """
-        Môi trường mô phỏng mạng 6G tối ưu hóa AI Service Placement & Task Scheduling.
-        """
         self.config = config
         self.service_config = config.services
         self.num_services = len(self.service_config)
@@ -91,8 +88,11 @@ class SixGEnvironment:
 
     def reset(self):
         self.time_manager.reset()
-        for node in self.nodes.values(): node.reset()
-        for cid in self.cloud_node_ids: self.nodes[cid].update_placement([1] * self.num_services, self.service_config)
+        for node in self.nodes.values():
+            if node.type in ["edge", "network"]:
+                node.upper_reset()
+                node.lower_reset()
+        self.nodes[self.cloud_node_id].update_placement(np.ones(self.num_services))
         self.frame_F1_accumulation = 0.0
         self.frame_violations_accumulation = 0
         self.total_completed_tasks = 0
@@ -102,7 +102,7 @@ class SixGEnvironment:
         self.last_terminal_actions.clear()
         self.node_frame_F1_acc.clear()
         self.node_frame_violations_acc.clear()
-        self.workload_gen.step(current_time_slot=0)
+        self.workload_gen.step(abs_current_time=0)
         return self._get_upper_obs()
 
     def step_upper(self, actions: Dict[str, List[int]]):
