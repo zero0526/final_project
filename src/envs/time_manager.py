@@ -48,7 +48,7 @@ class TimeManager:
         return (self.current_slot % self.slots_per_frame) == 0
 
     def is_done(self) -> bool:
-        return self.current_slot >= self.max_steps
+        return self.current_frame >= self.max_steps
 
     def get_relative_slot(self) -> int:
         """

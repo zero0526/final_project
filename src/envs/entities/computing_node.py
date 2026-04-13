@@ -127,7 +127,10 @@ class ComputingNode:
         """
         :param task:
         :param model_idx: order in the file config service
-        :return:
+        update popular_services_req
+        update task time and energy consumption
+        update queue and backlogs of node
+        update workloadarrival
         """
         sid = task.service_id
         task.queue_delay=0
@@ -155,27 +158,35 @@ class ComputingNode:
         return True
 
     def __clear_queue_task(self, s_id):
+        """
+        :param s_id:
+        clear task zombie cause node replace service
+        """
         violate_qos = 0
         tasks_to_keep = deque()
-
+        tasks_to_remove= []
         for t in self.queues[s_id]:
             # Nếu thời gian chờ vượt quá deadline -> Vứt bỏ
             if t.queue_delay + self.config.hyper_neural["SLOT_DURATION"] > t.deadline:
                 violate_qos += 1
                 self.backlogs[s_id] -= t.remaining_workload_gflops
+                tasks_to_remove.append(t)
             else:
                 tasks_to_keep.append(t)
 
         self.queues[s_id] = tasks_to_keep  # Cập nhật lại hàng đợi
         self.backlogs[s_id] = max(0.0, self.backlogs[s_id])  # Đảm bảo không bị số âm
-        return violate_qos
+        return violate_qos, tasks_to_remove
 
-    def process_timeslot(self, current_time_elapsed, slot_duration):
+    def process_timeslot(self, slot_duration):
         active_svcs = [sid for sid, active in enumerate(self.placed_services) if active]
         violate_qos=0
+        processed_tasks: List[Task]= []
         for s_id in self.service_profiles:
             if s_id not in active_svcs:
-                violate_qos+=self.__clear_queue_task(s_id)
+                v_qos, tasks_to_remove = self.__clear_queue_task(s_id)
+                violate_qos+=v_qos
+                processed_tasks.extend(tasks_to_remove)
         if not active_svcs:
             return [], 0.0
 
@@ -187,8 +198,9 @@ class ComputingNode:
         )
 
         completed_tasks, total_energy, lypa_punish = self._execute_allocation(
-            active_svcs, f_alloc_vec, slot_cold_times, slot_duration, current_time_elapsed
+            active_svcs, f_alloc_vec, slot_cold_times, slot_duration
         )
+        processed_tasks.extend(completed_tasks)
         local_F1= total_energy*self.config.lypa_coef + lypa_punish
         self.F1.append(local_F1)
         violate_qos+=sum(1 for t in completed_tasks if not t.qos_status)
@@ -196,7 +208,7 @@ class ComputingNode:
         self.slot_arrival_workload = {}
         self.consumption_energy = total_energy
 
-        return completed_tasks, total_energy, reward
+        return processed_tasks, total_energy, local_F1, violate_qos
 
     def _calculate_QoS(self, violate_qos: int)->float:
         return self.config.hyper_neural["OMEGA_Q1"]*math.exp(violate_qos*self.config.hyper_neural["OMEGA_Q2"])
@@ -254,7 +266,7 @@ class ComputingNode:
             )
         return f_alloc_vec, slot_cold_times
 
-    def _execute_allocation(self, active_svcs, f_alloc_vec, slot_cold_times, slot_duration, current_time_elapsed):
+    def _execute_allocation(self, active_svcs, f_alloc_vec, slot_cold_times, slot_duration):
         total_energy = 0.0
         completed_tasks = []
         self.cpu_allocations = {}
@@ -332,13 +344,14 @@ class ComputingNode:
         return completed_tasks, total_energy, lypa_punish
 
 
-    def get_observation_state(self, service_id):
+
+    def get_observation_state(self):
         """
         Trả về trạng thái cụ thể cho 1 service (Eq. 51):
         1. Queue Backlog (Q) - Trả về raw để env tự normalize
         2. Last CPU Allocation (f) - Normalization 1/capacity
         """
-        q = self.backlogs.get(service_id, 0.0)
-        f = self.cpu_allocations.get(service_id, 0.0) / (self.cpu_capacity if self.cpu_capacity > 0 else 1.0)
+        return self.backlogs, self.cpu_allocations
 
-        return [q, f]
+    def get_resource_data(self):
+        return [self.placed_services, self.popularity_service, self.mean_field]

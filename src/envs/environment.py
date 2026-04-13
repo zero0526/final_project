@@ -1,7 +1,14 @@
+import math
+
 import numpy as np
 from typing import Dict, List, Tuple, Any
 from collections import defaultdict, deque
 
+from networkx.classes import neighbors
+from torch.distributed.checkpoint._experimental import config
+
+from envs.entities.task_node import Task
+from src.utils import convert_nodeid2order, one_hot
 from src.configs.configs import cfg, BaseConfig
 from src.envs.network.topology_manager import TopologyManager
 from src.envs.network.channel_model import ChannelModel
@@ -26,9 +33,11 @@ class SixGEnvironment:
         self.nodes: Dict[str, ComputingNode] = {}
         self.agent_node_ids = []
         self.cloud_node_id = None
+        self.computing_nodes: List[ComputingNode]= []
         self._init_nodes()
 
         self.terminals: Dict[str, Terminal] = {}
+        self.terminals_group: Dict[str, List[Terminal]]= defaultdict(list)
         self._init_terminals()
 
         self.workload_gen = WorkloadGenerator(
@@ -73,18 +82,26 @@ class SixGEnvironment:
                 self.agent_node_ids.append(node.get("id"))
             if node.get("type") == "cloud":
                 self.cloud_node_id= node.get("id")
+            if node.get("type") in ["edge", "network", "cloud"]:
+                self.computing_nodes.append(node)
+        # add neighborhoods
+        for node_id, node  in self.nodes.items():
+            neighbor_ids= self.topo_manager.get_neighbor_nodes_by_type(node_id, 3, ["edge", "network", "cloud"])
+            self.nodes[node_id].neighbor_nodes= [self.nodes[i] for i in neighbor_ids]
 
     def _init_terminals(self):
         edge_ids = [idx for idx, n in self.nodes.items() if n.type == "edge"]
         n= len(edge_ids)
         for i in range(cfg.hyper_neural['NUM_LOWER_AGENTS']):
             t_id = f"UE_{i}"
+            source_id= edge_ids[i%n]
             self.terminals[t_id] = Terminal(
                 terminal_id=t_id,
-                edge_id= edge_ids[i%n],
+                edge_id= source_id,
                 arrival_rate=self.config.task_arrival_rate,
                 default_batch_size=self.config.default_batch_size
             )
+            self.terminals_group[source_id].append(self.terminals[t_id])
 
     def reset(self):
         self.time_manager.reset()
@@ -104,6 +121,24 @@ class SixGEnvironment:
         self.node_frame_violations_acc.clear()
         self.workload_gen.step(abs_current_time=0)
         return self._get_upper_obs()
+
+    def collect_backlog_resources(self):
+        """
+        service_id start from 0->n-1 when using index from config service id use minus 1
+        :return:
+        """
+        n, m= len(self.computing_nodes), self.num_services
+        observe_backlog= np.zeros((m,n), dtype=np.float32, device=self.device)
+        observe_cpu = np.zeros((m, n), dtype=np.float32, device=self.device)
+        nodes= sorted(self.computing_nodes, key=lambda x: x.id)
+        for i, n in enumerate(nodes):
+            backlog, cpu_allocation= n.get_observation_state()
+            for k,v in backlog.items():
+                observe_backlog[k-1][i]= v
+            for k,v in cpu_allocation.items():
+                observe_cpu[k-1][i]= v
+
+        return observe_backlog, observe_backlog
 
     def step_upper(self, actions: Dict[str, List[int]]):
         self.frame_F1_accumulation = 0.0
@@ -291,3 +326,67 @@ class SixGEnvironment:
             masks[tid], group = msk, edge_groups[t.edge_id]
             mf[tid] = np.mean([self.last_terminal_actions[gtid] for gtid in group], axis=0)
         return obs, mf, masks
+
+    def step_lower(self, assigned_tasks: List[Tuple[Task, int, int]]):
+        f1, v_qos = 0.0, 0
+        grouped_tasks = defaultdict(list)
+        num_nodes = len(self.computing_nodes)
+
+        # --- Assign tasks ---
+        for task, node_idx, model_idx in assigned_tasks:
+            node = self.computing_nodes[node_idx]
+            node.admit_task(task, model_idx)
+
+            grouped_tasks[task.source_node_id].append(
+                (
+                    task.terminal_id,
+                    one_hot(node_idx, num_nodes),
+                    one_hot(model_idx, self.max_models_total),
+                )
+            )
+
+        # --- Process nodes ---
+        for node in self.computing_nodes:
+            completed_tasks, total_energy, local_F1, violate_qos = node.process_timeslot(
+                self.time_manager.slot_duration
+            )
+            f1 += local_F1
+            v_qos += violate_qos
+
+        # --- Mean-field (O(n)) ---
+        mean_fields = {}
+
+        for eid, tasks in grouped_tasks.items():
+            n = len(tasks)
+
+            tids = []
+            node_vecs = []
+            model_vecs = []
+
+            for tid, node_vec, model_vec in tasks:
+                tids.append(tid)
+                node_vecs.append(node_vec)
+                model_vecs.append(model_vec)
+
+            node_vecs = np.stack(node_vecs)  # (n, num_nodes)
+            model_vecs = np.stack(model_vecs)  # (n, num_models)
+
+            total_node = node_vecs.sum(axis=0)
+            total_model = model_vecs.sum(axis=0)
+
+            for i, tid in enumerate(tids):
+                if n > 1:
+                    avg_node = (total_node - node_vecs[i]) / (n - 1)
+                    avg_model = (total_model - model_vecs[i]) / (n - 1)
+                else:
+                    avg_node = np.zeros_like(node_vecs[i])
+                    avg_model = np.zeros_like(model_vecs[i])
+
+                mean_fields[tid] = (avg_node, avg_model)
+
+        # --- Reward ---
+        reward = -f1 - self.config.hyper_neural["OMEGA_Q1"] * math.exp(
+            self.config.hyper_neural["OMEGA_Q2"] * v_qos
+        )
+
+        return reward, mean_fields
