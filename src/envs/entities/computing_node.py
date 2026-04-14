@@ -41,7 +41,7 @@ class ComputingNode:
         time_slot_in_tf= config.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10)
         self.popular_services_req: deque[np.ndarray]= deque(maxlen=time_slot_in_tf)
         self.F1: deque[float]= deque(maxlen=time_slot_in_tf)
-        self.queues: dict[str, deque[Task]] = {}
+        self.queues: dict[int, deque[Task]] = {}
         self.backlogs = {}
         self.slot_arrival_workload = {}
         self.cpu_allocations = {}
@@ -57,9 +57,6 @@ class ComputingNode:
 
     def upper_reset(self):
         self.placed_services = np.zeros_like(self.placed_services)
-        # maintaining task in queue regardless of enđ time frame or timeslot
-        # self.queues = {}
-        # self.backlogs = {}
         self.used_ram = 0.0
         self.used_hdd = 0.0
 
@@ -71,7 +68,9 @@ class ComputingNode:
 
     @property
     def mean_field(self):
-        actions= np.stack([n.placed_services for n in self.neighbor_nodes])
+        if not self.neighbor_nodes:
+            return np.zeros(len(self.service_profiles))
+        actions = np.stack([n.placed_services for n in self.neighbor_nodes])
         return actions.mean(axis=0)
 
     @property
@@ -133,6 +132,8 @@ class ComputingNode:
         update workloadarrival
         """
         sid = task.service_id
+        if self.placed_services[sid] == 0 or sid not in self.queues:
+            return False
         task.queue_delay=0
         if len(self.popular_services_req) == 0:
             self.popular_services_req.append(np.zeros_like(self.placed_services))
@@ -167,7 +168,7 @@ class ComputingNode:
         tasks_to_remove= []
         for t in self.queues[s_id]:
             # Nếu thời gian chờ vượt quá deadline -> Vứt bỏ
-            if t.queue_delay + self.config.hyper_neural["SLOT_DURATION"] > t.deadline:
+            if t.time_consume+ t.created_at + self.config.hyper_neural["SLOT_DURATION"] > t.deadline:
                 violate_qos += 1
                 self.backlogs[s_id] -= t.remaining_workload_gflops
                 tasks_to_remove.append(t)
@@ -183,12 +184,14 @@ class ComputingNode:
         violate_qos=0
         processed_tasks: List[Task]= []
         for s_id in self.service_profiles:
-            if s_id not in active_svcs:
+            if s_id not in active_svcs and s_id in self.queues:
+                for t in self.queues[s_id]:
+                    t.queue_delay += slot_duration
                 v_qos, tasks_to_remove = self.__clear_queue_task(s_id)
                 violate_qos+=v_qos
                 processed_tasks.extend(tasks_to_remove)
         if not active_svcs:
-            return [], 0.0
+            return [], 0.0, 0.0, violate_qos
 
         print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
         print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
@@ -321,7 +324,7 @@ class ComputingNode:
                     task.remaining_workload_gflops = 0
                     done_task = self.queues[sid].popleft()
 
-                    task.trace_task({"computation_delay": duration})
+                    task.computation_delay+= duration
                     finish_time= task.time_consume + task.created_at
 
                     done_task.qos_status = finish_time <= done_task.deadline
@@ -337,21 +340,21 @@ class ComputingNode:
                     task.remaining_workload_gflops -= processed_now
                     remaining_cap = 0
                     current_slot_time += duration
+                    task.queue_delay -= slot_duration
 
             for t in self.queues[sid]:
-                t.queue_delay += current_slot_time
+                t.queue_delay += slot_duration
+
         print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)}")
         return completed_tasks, total_energy, lypa_punish
 
 
 
-    def get_observation_state(self):
-        """
-        Trả về trạng thái cụ thể cho 1 service (Eq. 51):
-        1. Queue Backlog (Q) - Trả về raw để env tự normalize
-        2. Last CPU Allocation (f) - Normalization 1/capacity
-        """
-        return self.backlogs, self.cpu_allocations
+    def get_observation_state(self, sid: int):
+        # NẾU CÓ LỖI: Trả về 0.0 nếu sid không tồn tại trong dict
+        q_len = self.backlogs.get(sid, 0.0)
+        f_alloc = self.cpu_allocations.get(sid, 0.0)
+        return q_len, f_alloc
 
     def get_resource_data(self):
         return [self.placed_services, self.popularity_service, self.mean_field]

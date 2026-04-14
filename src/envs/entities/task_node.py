@@ -87,7 +87,7 @@ class Task:
         if not self.model:
             return False
         acc:float = self.model.get("accuracy")
-        return self.total_delay <= self.deadline and acc >= self.min_accuracy
+        return self.created_at + self.time_consume <= self.deadline and acc >= self.min_accuracy
 
     @property
     def is_assigned(self):

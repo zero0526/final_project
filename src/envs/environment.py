@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from networkx.classes import neighbors
 from torch.distributed.checkpoint._experimental import config
 
+from envs import time_manager
 from envs.entities.task_node import Task
 from src.utils import convert_nodeid2order, one_hot
 from src.configs.configs import cfg, BaseConfig
@@ -57,12 +58,11 @@ class SixGEnvironment:
         self.mf_lower_dim = self.num_nodes_total + self.max_models_total
 
         self.current_episode = 0
-        self.frame_F1_accumulation = 0.0
-        self.frame_violations_accumulation = 0
         self.total_completed_tasks = 0
         self.total_energy = 0.0
         self.total_violations = 0
         self.T = cfg.neuron_net.get('TIME_SLOT_PER_TIMEFRAME', 10)
+        self.frame_F1_accumulation: deque[float]= deque(maxlen=self.T)
         self.node_request_history = defaultdict(lambda: deque(maxlen=self.T))
         self.last_terminal_actions = defaultdict(lambda: np.zeros(self.mf_lower_dim, dtype=np.float32))
 
@@ -84,6 +84,7 @@ class SixGEnvironment:
                 self.cloud_node_id= node.get("id")
             if node.get("type") in ["edge", "network", "cloud"]:
                 self.computing_nodes.append(node)
+        self.computing_nodes = sorted(self.computing_nodes, key=lambda x: convert_nodeid2order(x.id))
         # add neighborhoods
         for node_id, node  in self.nodes.items():
             neighbor_ids= self.topo_manager.get_neighbor_nodes_by_type(node_id, 3, ["edge", "network", "cloud"])
@@ -103,7 +104,21 @@ class SixGEnvironment:
             )
             self.terminals_group[source_id].append(self.terminals[t_id])
 
-    def reset(self):
+    def reset_lower(self):
+        next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
+        next_states={}
+        num_nodes = len(self.computing_nodes)
+        next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
+        for task in next_tasks:
+            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], (np.zeros(num_nodes), np.zeros(self.max_models_total))
+
+        return {
+            "reward": 0.0,
+            "next_states": next_states,
+            "new_frame": self.time_manager.is_new_frame()
+        }
+
+    def reset_upper(self):
         self.time_manager.reset()
         for node in self.nodes.values():
             if node.type in ["edge", "network"]:
@@ -120,65 +135,42 @@ class SixGEnvironment:
         self.node_frame_F1_acc.clear()
         self.node_frame_violations_acc.clear()
         self.workload_gen.step(abs_current_time=0)
-        return self._get_upper_obs()
 
-    def collect_backlog_resources(self):
-        """
-        service_id start from 0->n-1 when using index from config service id use minus 1
-        :return:
-        """
-        n, m= len(self.computing_nodes), self.num_services
-        observe_backlog= np.zeros((m,n), dtype=np.float32, device=self.device)
-        observe_cpu = np.zeros((m, n), dtype=np.float32, device=self.device)
-        nodes= sorted(self.computing_nodes, key=lambda x: x.id)
-        for i, n in enumerate(nodes):
-            backlog, cpu_allocation= n.get_observation_state()
-            for k,v in backlog.items():
-                observe_backlog[k-1][i]= v
-            for k,v in cpu_allocation.items():
-                observe_cpu[k-1][i]= v
+        states = {}
+        mean_fields = {}
+        n= self.num_services
+        reward = -sum(f for f in self.frame_F1_accumulation)
+        for node in self.computing_nodes:
+            states[node.id] = (np.zeros(n), np.zeros(n))
+            mean_fields[node.id] = np.zeros(n)
+        return {
+            "reward": 0.0,
+            "states": states,
+            "mean_fields": mean_fields,
+            "done": self.time_manager.is_done()
+        }
 
-        return observe_backlog, observe_backlog
-
-    def step_upper(self, actions: Dict[str, List[int]]):
-        self.frame_F1_accumulation = 0.0
-        self.frame_violations_accumulation = 0
+    def step_upper(self, actions: Dict[str, np.ndarray]):
+        states={}
+        mean_fields= {}
+        reward= -sum(f for f in self.frame_F1_accumulation)
+        for node in self.computing_nodes:
+            states[node.id]= (node.placed_services, node.popularity_service)
+            mean_fields[node.id]= node.mean_field
+            node.upper_reset()
+        self.frame_F1_accumulation = deque(maxlen=self.T)
         for nid in self.agent_node_ids:
-            if nid in actions: self.nodes[nid].update_placement(actions[nid], self.service_config)
+            if nid in actions: self.nodes[nid].update_placement(actions[nid])
 
         # Reset accumulations at start of new frame
         self.node_frame_F1_acc.clear()
         self.node_frame_violations_acc.clear()
-
-    def get_upper_feedback(self):
-        rewards = {}
-        for nid in self.agent_node_ids:
-            penalty = self.node_frame_violations_acc[nid] * 10.0
-            r = (-self.node_frame_F1_acc[nid] * 1e-11) - penalty
-            rewards[nid] = r
-
-        all_obs, all_mf = self._get_upper_obs()
-        return {nid: all_obs[nid] for nid in self.agent_node_ids}, \
-            {nid: all_mf[nid] for nid in self.agent_node_ids}, rewards
-
-    def _get_upper_obs(self):
-        obs, mf = {}, {}
-        placements = {nid: np.array([1.0 if n.placed_services.get(i, False) else 0.0 for i in range(self.num_services)])
-                      for nid, n in self.nodes.items()}
-        for nid, node in self.nodes.items():
-            history = self.node_request_history[nid]
-            if not history:
-                phi = np.zeros(self.num_services, dtype=np.float32)
-            else:
-                phi_sum = np.sum(np.array(list(history)), axis=0)
-                tot = max(1.0, np.sum(phi_sum))
-                phi = (phi_sum / tot).astype(np.float32)
-
-            obs[nid] = np.concatenate([placements[nid], phi]).astype(np.float32)
-            neigh = [n for n in self.topo_manager.get_edge_nodes_by_depth(nid, cfg.MAX_DEPTH) if n in self.nodes]
-            mf[nid] = np.mean([placements[n] for n in neigh], axis=0) if neigh else np.zeros(self.num_services,
-                                                                                             dtype=np.float32)
-        return obs, mf
+        return {
+            "reward": reward,
+            "states": states,
+            "mean_fields": mean_fields,
+            "done": self.time_manager.is_done()
+        }
 
     def step_lower(self, actions_map: Dict[str, int]):
         slot_energy, slot_violations, slot_success, slot_avg_arrival = 0.0, 0, 0, 0
@@ -277,55 +269,19 @@ class SixGEnvironment:
         }
         return next_obs, rewards, self.time_manager.is_done(), info
 
-    def _get_lower_obs(self):
-        obs, mf, masks = {}, {}, {}
-        nids = sorted(self.nodes.keys())
-        net = {}
-        # thống kê lại q backlock và last_f_allocation cho từng service
-        for sid in range(self.num_services):
-            states = []
-            qs, fs = [], []
-            for nid in nids:
-                q, f = self.nodes[nid].get_observation_state(sid)
-                qs.append(np.log10(1 + q) / 6.0)
-                fs.append(f)
-            states.extend(qs + fs)
-            net[sid] = np.array(states, dtype=np.float32)
 
-        edge_groups = defaultdict(list)
-        for tid, t in self.terminals.items(): edge_groups[t.edge_id].append(tid)
+    def collect_backlog_resources(self):
+        """
+        service_id start from 0->n-1 when using index from config service id use minus 1
+        """
+        n, m= len(self.computing_nodes), self.num_services
+        observe_backlog= np.zeros((m,n), dtype=np.float32)
+        observe_cpu = np.zeros((m, n), dtype=np.float32)
+        for i in range(m):
+            for j, node in enumerate(self.computing_nodes):
+                observe_backlog[i, j], observe_cpu[i, j]= node.get_observation_state(i)
 
-        for tid, t in self.terminals.items():
-            task = t.current_task
-            if task is None:
-                obs[tid], msk = np.zeros(self.lower_state_dim, dtype=np.float32), np.ones(self.lower_action_dim,
-                                                                                          dtype=np.float32)
-            else:
-                loc = np.array(
-                    [np.log10(1 + task.total_data_size_mb) / 3.0, min(1.0, task.deadline / 15.0), float(task.omega),
-                     task.min_accuracy / 100.0])
-                obs[tid] = np.concatenate([loc, net[task.service_id]])
-                msk = np.zeros(self.lower_action_dim, dtype=np.float32)
-                # Unified masking for combined (Node, Model) space
-                svc = self.service_config[task.service_id]
-                num_models = len(svc['models'])
-
-                for i, nid in enumerate(nids):
-                    if self.nodes[nid].placed_services.get(task.service_id):
-                        # Mark all valid models on this node
-                        for m_idx in range(num_models):
-                            msk[i * self.max_models_total + m_idx] = 1.0
-
-                # Fallback to Cloud if no Edge node has the service
-                if np.sum(msk) == 0:
-                    for i, nid in enumerate(nids):
-                        if nid in self.cloud_node_ids:
-                            for m_idx in range(num_models):
-                                msk[i * self.max_models_total + m_idx] = 1.0
-
-            masks[tid], group = msk, edge_groups[t.edge_id]
-            mf[tid] = np.mean([self.last_terminal_actions[gtid] for gtid in group], axis=0)
-        return obs, mf, masks
+        return observe_backlog, observe_cpu
 
     def step_lower(self, assigned_tasks: List[Tuple[Task, int, int]]):
         f1, v_qos = 0.0, 0
@@ -335,8 +291,8 @@ class SixGEnvironment:
         # --- Assign tasks ---
         for task, node_idx, model_idx in assigned_tasks:
             node = self.computing_nodes[node_idx]
-            node.admit_task(task, model_idx)
-
+            is_accepted= node.admit_task(task, model_idx)
+            if not is_accepted: v_qos += 1
             grouped_tasks[task.source_node_id].append(
                 (
                     task.terminal_id,
@@ -346,10 +302,12 @@ class SixGEnvironment:
             )
 
         # --- Process nodes ---
+        all_tasks= []
         for node in self.computing_nodes:
             completed_tasks, total_energy, local_F1, violate_qos = node.process_timeslot(
                 self.time_manager.slot_duration
             )
+            all_tasks.extend(completed_tasks)
             f1 += local_F1
             v_qos += violate_qos
 
@@ -383,10 +341,20 @@ class SixGEnvironment:
                     avg_model = np.zeros_like(model_vecs[i])
 
                 mean_fields[tid] = (avg_node, avg_model)
-
+        self.frame_F1_accumulation.append(f1)
         # --- Reward ---
         reward = -f1 - self.config.hyper_neural["OMEGA_Q1"] * math.exp(
             self.config.hyper_neural["OMEGA_Q2"] * v_qos
         )
+        next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
+        self.time_manager.tick()
+        next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
+        next_states={}
+        for task in next_tasks:
+            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], mean_fields[task.terminal_id]
 
-        return reward, mean_fields
+        return {
+            "reward":reward,
+            "next_states":next_states,
+            "new_frame": self.time_manager.is_new_frame()
+        }
