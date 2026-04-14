@@ -1,9 +1,12 @@
 from asyncio import tasks
-from collections import deque
+from collections import deque, defaultdict
 import numpy as np
 import random
 from typing import List, Dict
 import math
+
+from streamlit import success
+
 from src.utils import KKTSolverADMM, EMA
 from src.utils.MechanismUtils import calc_computation_energy, update_backlog
 from src.envs.entities.task_node import Task
@@ -38,14 +41,12 @@ class ComputingNode:
         self.expected_gpu_allocations= {k:self.cpu_capacity/n for k in self.service_profiles.keys()}
 
         self.placed_services = np.array([0]*len(self.service_profiles))
-        time_slot_in_tf= config.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10)
-        self.popular_services_req: deque[np.ndarray]= deque(maxlen=time_slot_in_tf)
-        self.F1: deque[float]= deque(maxlen=time_slot_in_tf)
+        self.time_slot_in_tf= config.hyper_neural.get("TIME_SLOT_PER_TIMEFRAME", 10)
+        self.popular_services_req: deque[np.ndarray]= deque(maxlen=self.time_slot_in_tf)
         self.queues: dict[int, deque[Task]] = {}
         self.backlogs = {}
         self.slot_arrival_workload = {}
         self.cpu_allocations = {}
-        self.consumption_energy = 0.0  # <--- Added to track per-node consumption
 
         self.used_ram = 0.0
         self.used_hdd = 0.0
@@ -54,6 +55,13 @@ class ComputingNode:
         self.config= config
         self.channel_model= channel_model
         self.ema= EMA()
+
+    def reset(self):
+        self.popular_services_req= deque(maxlen=self.time_slot_in_tf)
+        self.upper_reset()
+        self.lower_reset()
+        self.queues= {}
+        self.backlogs= {}
 
     def upper_reset(self):
         self.placed_services = np.zeros_like(self.placed_services)
@@ -64,7 +72,6 @@ class ComputingNode:
         self.popular_services_req.append(np.zeros_like(self.placed_services))
         self.cpu_allocations = {}
         self.slot_arrival_workload = {}
-        self.consumption_energy = 0.0
 
     @property
     def mean_field(self):
@@ -86,6 +93,15 @@ class ComputingNode:
         # (Phi_v,s)
         return phi_vector
 
+    @property
+    def task_remaining(self)-> np.ndarray:
+        n= len(self.service_profiles)
+        remaining_task= np.zeros(n)
+        for i in range(n):
+            if i in self.queues:
+                remaining_task[i]= len(self.queues[i])
+            else: remaining_task[i]= 0
+        return remaining_task
 
     def update_placement(self, placement_vector:np.ndarray):
         constraint_violations = 0
@@ -168,7 +184,7 @@ class ComputingNode:
         tasks_to_remove= []
         for t in self.queues[s_id]:
             # Nếu thời gian chờ vượt quá deadline -> Vứt bỏ
-            if t.time_consume+ t.created_at + self.config.hyper_neural["SLOT_DURATION"] > t.deadline:
+            if t.time_consume+ t.created_at > t.deadline:
                 violate_qos += 1
                 self.backlogs[s_id] -= t.remaining_workload_gflops
                 tasks_to_remove.append(t)
@@ -181,37 +197,59 @@ class ComputingNode:
 
     def process_timeslot(self, slot_duration):
         active_svcs = [sid for sid, active in enumerate(self.placed_services) if active]
-        violate_qos=0
+        violate_qos= defaultdict(int)
+        count_violate_qos= 0
         processed_tasks: List[Task]= []
+        # collect task in service is not deploy overdue and add deadline
         for s_id in self.service_profiles:
             if s_id not in active_svcs and s_id in self.queues:
+                # add delay
                 for t in self.queues[s_id]:
                     t.queue_delay += slot_duration
                 v_qos, tasks_to_remove = self.__clear_queue_task(s_id)
-                violate_qos+=v_qos
+                violate_qos[s_id]+=v_qos
+                count_violate_qos+=v_qos
                 processed_tasks.extend(tasks_to_remove)
         if not active_svcs:
             return [], 0.0, 0.0, violate_qos
 
         print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
         print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
-
+        # allocation resource gpu
         f_alloc_vec, slot_cold_times = self._compute_optimal_resources(
             active_svcs
         )
-
+        # execute task with resource is allocated above
         completed_tasks, total_energy, lypa_punish = self._execute_allocation(
             active_svcs, f_alloc_vec, slot_cold_times, slot_duration
         )
         processed_tasks.extend(completed_tasks)
         local_F1= total_energy*self.config.lypa_coef + lypa_punish
-        self.F1.append(local_F1)
-        violate_qos+=sum(1 for t in completed_tasks if not t.qos_status)
-        reward= -(local_F1 + self._calculate_QoS(violate_qos))
+        count_violate_qos+=sum(1 for t in completed_tasks if not t.qos_status)
+        virtual_delay, realized_delay_avg, success_qos, violation_qos= self.render()
         self.slot_arrival_workload = {}
-        self.consumption_energy = total_energy
 
-        return processed_tasks, total_energy, local_F1, violate_qos
+        return processed_tasks, total_energy, local_F1, count_violate_qos, virtual_delay, realized_delay_avg, success_qos, violation_qos
+
+    def render(self, tasks: List[Task], violation_qos:Dict[str, int]):
+        success_qos= defaultdict(int)
+        virtual_delay= {}
+        realized_delay_queue= defaultdict(list)
+        realized_delay_avg= {}
+        for task in tasks:
+            if task.qos_status:
+                success_qos[task.service_id]+=1
+            else: violation_qos[task.service_id]+=1
+            realized_delay_queue[task.service_id].append(task.queue_delay)
+
+        for sid, r_delay in realized_delay_queue.items():
+            if r_delay:
+                realized_delay_avg[sid]= sum(r_delay)/len(r_delay)
+
+        for service in self.service_profiles:
+            sid= service.get("id")
+            virtual_delay[sid]= self.queues.get(sid, 0.0)/self.cpu_capacity[sid] if sid in self.queues else float('inf')
+        return virtual_delay, realized_delay_avg, success_qos, violation_qos
 
     def _calculate_QoS(self, violate_qos: int)->float:
         return self.config.hyper_neural["OMEGA_Q1"]*math.exp(violate_qos*self.config.hyper_neural["OMEGA_Q2"])
@@ -348,8 +386,6 @@ class ComputingNode:
         print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)}")
         return completed_tasks, total_energy, lypa_punish
 
-
-
     def get_observation_state(self, sid: int):
         # NẾU CÓ LỖI: Trả về 0.0 nếu sid không tồn tại trong dict
         q_len = self.backlogs.get(sid, 0.0)
@@ -358,3 +394,5 @@ class ComputingNode:
 
     def get_resource_data(self):
         return [self.placed_services, self.popularity_service, self.mean_field]
+
+
