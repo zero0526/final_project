@@ -11,13 +11,25 @@ class KKTSolverADMM:
         self.tol = tol
 
     def project_simplex(self, v, z_max):
-        """Projection onto simplex: sum(v)=z_max, v>=0"""
+        """Projection onto solid simplex: sum(v) <= z_max, v >= 0"""
         if z_max <= 0:
             return np.zeros_like(v)
 
+        # --- ĐOẠN CODE MỚI THÊM VÀO ---
+        # Chặn dưới bằng 0 trước để kiểm tra tổng
+        v_clipped = np.maximum(v, 0)
+
+        # Nếu tổng của vector đã thỏa mãn điều kiện <= z_max (không vượt ngân sách)
+        # thì không cần ép nó lên mặt phẳng tổng nữa, trả về luôn.
+        if np.sum(v_clipped) <= z_max:
+            return v_clipped
+        # ------------------------------
+
+        # --- ĐOẠN CODE CŨ DƯỚI ĐÂY LÀ ĐỂ XỬ LÝ KHI TỔNG BỊ VƯỢT QUÁ ---
+        # Khi này thuật toán sẽ ép tổng chính xác về bằng z_max
         u = np.sort(v)[::-1]
         cssv = np.cumsum(u)
-        idx = np.where(u * np.arange(1, len(v)+1) > (cssv - z_max))[0]
+        idx = np.where(u * np.arange(1, len(v) + 1) > (cssv - z_max))[0]
 
         if len(idx) == 0:
             return np.zeros_like(v)
@@ -32,8 +44,15 @@ class KKTSolverADMM:
 
         # check feasibility
         if np.sum(f_min_vec) > self.f_max_node:
-            raise ValueError("Infeasible: sum(f_min) > f_max_node")
+            # Không văng lỗi, thay vào đó áp dụng phân bổ tỷ lệ (Proportional Scaling)
+            # Tính tỷ lệ thiếu hụt
+            scale_factor = self.f_max_node / np.sum(f_min_vec)
 
+            # Cập nhật lại f_min_vec sao cho tổng đúng bằng f_max_node
+            f_min_vec = f_min_vec * scale_factor
+
+            # Cập nhật lại f_max_vec (để đảm bảo không bị lỗi logic f_min > f_max ở các bước sau)
+            f_max_vec = np.maximum(f_min_vec, f_max_vec)
         # init
         f = np.zeros(n)
         z = np.zeros(n)

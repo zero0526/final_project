@@ -32,6 +32,7 @@ class SixGEnvironment:
         self.agent_node_ids = []
         self.cloud_node_id = None
         self.computing_nodes: List[ComputingNode]= []
+        self.node_id_dict= {}
         self._init_nodes()
 
         self.terminals: Dict[str, Terminal] = {}
@@ -57,11 +58,13 @@ class SixGEnvironment:
                 specs= node.get("specs"),
                 channel_model=self.channel_model
             )
+
             if node.get("type") in ["edge", "network"]:
                 self.agent_node_ids.append(node.get("id"))
             if node.get("type") == "cloud":
                 self.cloud_node_id= node.get("id")
             if node.get("type") in ["edge", "network", "cloud"]:
+                self.node_id_dict[node.get("id")]= len(self.node_id_dict)
                 self.computing_nodes.append(self.nodes[node.get("id")])
         self.computing_nodes = sorted(self.computing_nodes, key=lambda x: convert_nodeid2order(x.id))
         # add neighborhoods
@@ -164,10 +167,11 @@ class SixGEnvironment:
         n, m= len(self.computing_nodes), self.num_services
         observe_backlog= np.zeros((m,n), dtype=np.float32)
         observe_cpu = np.zeros((m, n), dtype=np.float32)
-        f1= {}
+
         for i in range(m):
-            for j, node in enumerate(self.computing_nodes):
-                observe_backlog[i, j], observe_cpu[i, j]= node.get_observation_state(i)
+            for node in self.computing_nodes:
+                nidInt=self.node_id_dict[node.id]
+                observe_backlog[i, nidInt], observe_cpu[i, nidInt]= node.get_observation_state(i)
 
         return observe_backlog, observe_cpu
 
@@ -179,13 +183,13 @@ class SixGEnvironment:
         f1_dist={}
         # --- Assign tasks ---
         for task, node_idx, model_idx in assigned_tasks:
-            node = self.computing_nodes[node_idx]
+            node = self.nodes[node_idx]
             is_accepted= node.admit_task(task, model_idx)
             if not is_accepted: v_qos += 1
             grouped_tasks[task.source_node_id].append(
                 (
                     task.terminal_id,
-                    one_hot(node_idx, num_nodes),
+                    one_hot(self.node_id_dict[node_idx], num_nodes),
                     one_hot(model_idx, self.max_models_total),
                 )
             )
@@ -201,7 +205,7 @@ class SixGEnvironment:
                 self.time_manager.slot_duration
             )
             energy_dist[node.id]= total_energy
-            f1_dist[node_idx.id]= local_F1
+            f1_dist[node.id]= local_F1
             virtual_delay_info[node.id]= self.norm_service_vec(virtual_delay)
             realized_delay_info[node.id]= self.norm_service_vec(realized_delay_avg)
             success_qos_info[node.id]= self.norm_service_vec(success_qos)
@@ -225,21 +229,23 @@ class SixGEnvironment:
                 node_vecs.append(node_vec)
                 model_vecs.append(model_vec)
 
-            node_vecs = np.stack(node_vecs)  # (n, num_nodes)
-            model_vecs = np.stack(model_vecs)  # (n, num_models)
+            if node_vecs:
+                node_vecs = np.stack(node_vecs)  # (n, num_nodes)
+                model_vecs = np.stack(model_vecs)  # (n, num_models)
 
-            total_node = node_vecs.sum(axis=0)
-            total_model = model_vecs.sum(axis=0)
+                total_node = node_vecs.sum(axis=0)
+                total_model = model_vecs.sum(axis=0)
 
-            for i, tid in enumerate(tids):
-                if n > 1:
-                    avg_node = (total_node - node_vecs[i]) / (n - 1)
-                    avg_model = (total_model - model_vecs[i]) / (n - 1)
-                else:
-                    avg_node = np.zeros_like(node_vecs[i])
-                    avg_model = np.zeros_like(model_vecs[i])
+                for i, tid in enumerate(tids):
+                    if n > 1:
+                        avg_node = (total_node - node_vecs[i]) / (n - 1)
+                        avg_model = (total_model - model_vecs[i]) / (n - 1)
+                    else:
+                        avg_node = np.zeros_like(node_vecs[i])
+                        avg_model = np.zeros_like(model_vecs[i])
 
-                mean_fields[tid] = (avg_node, avg_model)
+                    mean_fields[tid] = (avg_node, avg_model)
+
         self.frame_F1_accumulation.append(f1)
         # --- Reward ---
         reward = -f1 - self.config.hyper_neural["OMEGA_Q1"] * math.exp(
@@ -250,7 +256,8 @@ class SixGEnvironment:
         next_states={}
         next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
         for task in next_tasks:
-            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], mean_fields[task.terminal_id]
+            mf= mean_fields[task.terminal_id] if task.terminal_id in mean_fields else (np.zeros(self.num_services), np.zeros(self.num_services))
+            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], mf
         info = {
                 "f1": f1_dist,
                 "energy": energy_dist,
@@ -272,7 +279,7 @@ class SixGEnvironment:
         }
 
     def group_terminal(self, grouped_tasks:Dict[str, List[Tuple[Task, int, int]]]):
-        node_ids= {}
+        node_ids= set()
         grouped_edges={}
         for node in self.computing_nodes:
             if node.id not in node_ids:

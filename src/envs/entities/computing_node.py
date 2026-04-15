@@ -138,7 +138,7 @@ class ComputingNode:
             return True
         return False
 
-    def admit_task(self, task: Task, model_idx: int):
+    def       admit_task(self, task: Task, model_idx: int):
         """
         :param task:
         :param model_idx: order in the file config service
@@ -191,7 +191,9 @@ class ComputingNode:
             else:
                 tasks_to_keep.append(t)
 
-        self.queues[s_id] = tasks_to_keep  # Cập nhật lại hàng đợi
+        self.queues[s_id] = tasks_to_keep
+        if s_id not in self.backlogs:
+            self.backlogs[s_id] = 0.0
         self.backlogs[s_id] = max(0.0, self.backlogs[s_id])  # Đảm bảo không bị số âm
         return violate_qos, tasks_to_remove
 
@@ -211,7 +213,7 @@ class ComputingNode:
                 count_violate_qos+=v_qos
                 processed_tasks.extend(tasks_to_remove)
         if not active_svcs:
-            return [], 0.0, 0.0, violate_qos
+            return [], 0.0, 0.0, count_violate_qos, {}, {}, {}, violate_qos
 
         print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
         print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
@@ -226,29 +228,34 @@ class ComputingNode:
         processed_tasks.extend(completed_tasks)
         local_F1= total_energy*self.config.lypa_coef + lypa_punish
         count_violate_qos+=sum(1 for t in completed_tasks if not t.qos_status)
-        virtual_delay, realized_delay_avg, success_qos, violation_qos= self.render()
+        virtual_delay, realized_delay_avg, success_qos, violation_qos= self.render(processed_tasks, violate_qos)
         self.slot_arrival_workload = {}
 
         return processed_tasks, total_energy, local_F1, count_violate_qos, virtual_delay, realized_delay_avg, success_qos, violation_qos
 
-    def render(self, tasks: List[Task], violation_qos:Dict[str, int]):
-        success_qos= defaultdict(int)
-        virtual_delay= {}
-        realized_delay_queue= defaultdict(list)
-        realized_delay_avg= {}
+    def render(self, tasks: List[Task], violation_qos: Dict[int, int]):
+        success_qos = defaultdict(int)
+        virtual_delay = {}
+        realized_delay_queue = defaultdict(list)
+        realized_delay_avg = {}
+
         for task in tasks:
             if task.qos_status:
-                success_qos[task.service_id]+=1
-            else: violation_qos[task.service_id]+=1
+                success_qos[task.service_id] += 1
+            else:
+                violation_qos[task.service_id] += 1
             realized_delay_queue[task.service_id].append(task.queue_delay)
 
         for sid, r_delay in realized_delay_queue.items():
             if r_delay:
-                realized_delay_avg[sid]= sum(r_delay)/len(r_delay)
+                realized_delay_avg[sid] = sum(r_delay) / len(r_delay)
 
-        for service in self.service_profiles:
-            sid= service.get("id")
-            virtual_delay[sid]= self.queues.get(sid, 0.0)/self.cpu_capacity[sid] if sid in self.queues else float('inf')
+        for sid in self.service_profiles:
+            # virtual_delay = backlog (GFLOPS) / cpu_allocation (GFLOPS/s) = seconds
+            q_val = self.backlogs.get(sid, 0.0)
+            f_val = self.cpu_allocations.get(sid, 0.0)
+            virtual_delay[sid] = q_val / (f_val + 1e-8)
+
         return virtual_delay, realized_delay_avg, success_qos, violation_qos
 
     def _calculate_QoS(self, violate_qos: int)->float:
@@ -278,6 +285,9 @@ class ComputingNode:
                     break
                 cpu_require= task.remaining_workload_gflops/expected_computing_time
                 min_req= max(min_req, cpu_require)
+                if min_req >self.cpu_capacity:
+                    min_req= self.cpu_capacity -1e-6
+                    break
                 delay+= task.remaining_workload_gflops/(expect_allocation + 1e-8)
         return min_req, t_cold_start
 
@@ -300,6 +310,7 @@ class ComputingNode:
             f_min_vec[i], cold_times = self.__min_requirement_gpu(sid)
             slot_cold_times[sid] = cold_times
         f_alloc_vec = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
+        self.last_cpu_allocation= f_alloc_vec
         for i, sid in enumerate(active_svcs):
             self.expected_gpu_allocations[sid] = self.ema.update(
                 f_alloc_vec[i],
