@@ -76,6 +76,14 @@ class MetricsAggregator:
         self.history["avg_realized_delay"].append(np.mean(self.episode_realized_delay) if self.episode_realized_delay else 0)
         self.history["total_success_qos"].append(np.sum(self.episode_success_qos) if self.episode_success_qos else 0)
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
+        
+        # Calculate QoS Rate: Success / (Success + Violate) as a more stable metric, 
+        # but user specifically asked for Success / Violate. We use Violate + 1 for stability.
+        success = np.sum(self.episode_success_qos) if self.episode_success_qos else 0
+        violate = np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0
+        qos_rate = success / (violate if violate > 0 else 1.0)
+        self.history["qos_rate"].append(qos_rate)
+        
         self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
         
         # Auto-reset for next episode
@@ -85,14 +93,12 @@ class MetricsAggregator:
         """Prints a summary of the current episode."""
         reward = self.history["total_reward"][-1]
         f1 = self.history["avg_f1"][-1]
-        energy = self.history["total_energy"][-1]
-        qos_v = self.history["total_violate_qos"][-1]
+        qos_rate = self.history["qos_rate"][-1]
         
         print(f"\n--- Episode {ep} Summary ---")
         print(f"Total Reward: {reward:.2f}")
         print(f"Avg F1 Score: {f1:.4f}")
-        print(f"Total Energy: {energy:.2f}")
-        print(f"QoS Violations: {qos_v}")
+        print(f"QoS Rate (S/V): {qos_rate:.2f}")
         print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1]:.2f}")
         print("---------------------------\n")
 
@@ -150,13 +156,13 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         plt.legend()
         
-        # Plot 5: QoS Violations
+        # Plot 5: QoS Rate (Success / Violate)
         plt.subplot(2, 3, 5)
-        plt.plot(episodes, self.history["total_violate_qos"], alpha=0.3, color='purple', label="Violations")
+        plt.plot(episodes, self.history["qos_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
-            ma = self._moving_average(self.history["total_violate_qos"], window)
-            plt.plot(range(window, len(self.history["total_violate_qos"]) + 1), ma, color='purple', linewidth=2)
-        plt.title("QoS Stability")
+            ma = self._moving_average(self.history["qos_rate"], window)
+            plt.plot(range(window, len(self.history["qos_rate"]) + 1), ma, color='purple', linewidth=2)
+        plt.title("QoS Rate (Success/Violate)")
         plt.xlabel("Episode")
 
         # Plot 6: Remaining Tasks
