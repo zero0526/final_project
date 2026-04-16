@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple, Any
 from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
+import sys
 
 
 class Trainer:
@@ -115,8 +116,22 @@ class Trainer:
             
             self.aggregator.store_history()
             self.aggregator.report_episode(ep)
+            
+            # Update plots every episode (latest)
+            # Every 10 episodes, save an archival copy
             if (ep + 1) % 10 == 0:
+                self.aggregator.plot_history(ep=ep+1)
+            else:
                 self.aggregator.plot_history()
+            
+            # Auto-display in notebooks
+            try:
+                from IPython.display import clear_output, display, Image
+                if 'ipykernel' in sys.modules or 'IPython' in sys.modules:
+                    clear_output(wait=True)
+                    display(Image(filename="src/visualize/plots/training_metrics.png"))
+            except ImportError:
+                pass
             
             pbar.set_postfix({"reward": f"{self.aggregator.history['total_reward'][-1]:.2f}"})
             

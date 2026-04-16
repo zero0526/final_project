@@ -101,7 +101,7 @@ class MetricsAggregator:
             return data
         return np.convolve(data, np.ones(window)/window, mode='valid')
 
-    def plot_history(self, save_dir="src/visualize/plots"):
+    def plot_history(self, save_dir="src/visualize/plots", ep=None):
         """Generates and saves performance charts showing evolution."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
@@ -110,7 +110,7 @@ class MetricsAggregator:
         window = 10 # Window for smoothing
         
         plt.figure(figsize=(18, 12))
-        plt.suptitle("Model Evolution Over Episodes", fontsize=16)
+        plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=16)
         
         # Plot 1: Rewards (with moving average)
         plt.subplot(2, 3, 1)
@@ -169,5 +169,15 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save latest
         plt.savefig(os.path.join(save_dir, "training_metrics.png"))
+        
+        # Save archival copy if episode number is provided
+        if ep is not None:
+            archive_dir = os.path.join(save_dir, "archive")
+            if not os.path.exists(archive_dir):
+                os.makedirs(archive_dir)
+            plt.savefig(os.path.join(archive_dir, f"metrics_ep_{ep}.png"))
+            
         plt.close()
