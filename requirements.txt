@@ -4,7 +4,6 @@ pyyaml
 pandas
 matplotlib
 scipy
-torch
 tqdm
 python-dotenv
 pydantic_settings
