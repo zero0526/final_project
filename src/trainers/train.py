@@ -86,7 +86,6 @@ class Trainer:
         pbar = tqdm(range(num_eps), desc="Training")
         for ep in pbar:
             self.update_exploration_rates()
-            self.aggregator.reset_episode()
 
             while True:
                 if lower_state.get("new_frame"):

@@ -65,7 +65,7 @@ class MetricsAggregator:
             self.episode_violate_qos.append(sum(np.sum(v) for v in violate_qos.values()))
 
     def store_history(self):
-        """Saves episode averages to history."""
+        """Saves episode averages to history and RESETS intra-episode data."""
         self.history["upper_reward"].append(np.sum(self.episode_upper_rewards))
         self.history["lower_reward"].append(np.sum(self.episode_lower_rewards))
         self.history["total_reward"].append(np.sum(self.episode_upper_rewards) + np.sum(self.episode_lower_rewards))
@@ -77,6 +77,9 @@ class MetricsAggregator:
         self.history["total_success_qos"].append(np.sum(self.episode_success_qos) if self.episode_success_qos else 0)
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
         self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
+        
+        # Auto-reset for next episode
+        self.reset_episode()
 
     def report_episode(self, ep):
         """Prints a summary of the current episode."""
@@ -93,58 +96,78 @@ class MetricsAggregator:
         print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1]:.2f}")
         print("---------------------------\n")
 
+    def _moving_average(self, data, window=50):
+        if len(data) < window:
+            return data
+        return np.convolve(data, np.ones(window)/window, mode='valid')
+
     def plot_history(self, save_dir="src/visualize/plots"):
-        """Generates and saves performance charts."""
+        """Generates and saves performance charts showing evolution."""
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
             
         episodes = range(1, len(self.history["total_reward"]) + 1)
+        window = 10 # Window for smoothing
         
-        plt.figure(figsize=(15, 10))
+        plt.figure(figsize=(18, 12))
+        plt.suptitle("Model Evolution Over Episodes", fontsize=16)
         
-        # Plot 1: Rewards
+        # Plot 1: Rewards (with moving average)
         plt.subplot(2, 3, 1)
-        plt.plot(episodes, self.history["total_reward"], label="Total")
-        plt.plot(episodes, self.history["upper_reward"], label="Upper")
-        plt.plot(episodes, self.history["lower_reward"], label="Lower")
-        plt.title("Rewards")
+        plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["total_reward"], window)
+            plt.plot(range(window, len(self.history["total_reward"]) + 1), ma, color='blue', label=f"MA-{window}")
+        plt.title("Reward Evolution")
         plt.xlabel("Episode")
         plt.legend()
         
         # Plot 2: F1 Score
         plt.subplot(2, 3, 2)
-        plt.plot(episodes, self.history["avg_f1"], color='green')
-        plt.title("Average F1 Score")
+        plt.plot(episodes, self.history["avg_f1"], alpha=0.3, color='green')
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["avg_f1"], window)
+            plt.plot(range(window, len(self.history["avg_f1"]) + 1), ma, color='green', label=f"MA-{window}")
+        plt.title("F1 Score Improvement")
         plt.xlabel("Episode")
         
         # Plot 3: Energy
         plt.subplot(2, 3, 3)
-        plt.plot(episodes, self.history["total_energy"], color='orange')
-        plt.title("Total Energy Consumption")
+        plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["total_energy"], window)
+            plt.plot(range(window, len(self.history["total_energy"]) + 1), ma, color='orange', label=f"MA-{window}")
+        plt.title("Energy Consumption Trend")
         plt.xlabel("Episode")
         
         # Plot 4: Delays
         plt.subplot(2, 3, 4)
-        plt.plot(episodes, self.history["avg_virtual_delay"], label="Virtual")
-        plt.plot(episodes, self.history["avg_realized_delay"], label="Realized")
-        plt.title("Average Delays")
+        plt.plot(episodes, self.history["avg_realized_delay"], alpha=0.3, color='red', label="Realized")
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["avg_realized_delay"], window)
+            plt.plot(range(window, len(self.history["avg_realized_delay"]) + 1), ma, color='red', label=f"MA-{window}")
+        plt.title("Delay Evolution")
         plt.xlabel("Episode")
         plt.legend()
         
-        # Plot 5: QoS
+        # Plot 5: QoS Violations
         plt.subplot(2, 3, 5)
-        plt.plot(episodes, self.history["total_success_qos"], label="Success", color='blue')
-        plt.plot(episodes, self.history["total_violate_qos"], label="Violate", color='red')
-        plt.title("QoS metrics")
+        plt.plot(episodes, self.history["total_violate_qos"], alpha=0.3, color='purple', label="Violations")
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["total_violate_qos"], window)
+            plt.plot(range(window, len(self.history["total_violate_qos"]) + 1), ma, color='purple', linewidth=2)
+        plt.title("QoS Stability")
         plt.xlabel("Episode")
-        plt.legend()
 
         # Plot 6: Remaining Tasks
         plt.subplot(2, 3, 6)
-        plt.plot(episodes, self.history["avg_remaining_tasks"], color='purple')
-        plt.title("Avg Remaining Tasks")
+        plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["avg_remaining_tasks"], window)
+            plt.plot(range(window, len(self.history["avg_remaining_tasks"]) + 1), ma, color='brown')
+        plt.title("Task Clearing Efficiency")
         plt.xlabel("Episode")
         
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(os.path.join(save_dir, "training_metrics.png"))
         plt.close()
