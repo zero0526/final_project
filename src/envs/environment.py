@@ -143,13 +143,14 @@ class SixGEnvironment:
         states={}
         mean_fields= {}
         reward= -sum(f for f in self.frame_F1_accumulation)
+        self.frame_F1_accumulation = deque(maxlen=self.T)
+        for nid in self.agent_node_ids:
+            if nid in actions: self.nodes[nid].update_placement(actions[nid])
+
         for node in self.computing_nodes:
             states[node.id]= (node.placed_services, node.popularity_service)
             mean_fields[node.id]= node.mean_field
             node.upper_reset()
-        self.frame_F1_accumulation = deque(maxlen=self.T)
-        for nid in self.agent_node_ids:
-            if nid in actions: self.nodes[nid].update_placement(actions[nid])
 
         return {
             "reward": reward,
@@ -247,9 +248,12 @@ class SixGEnvironment:
 
         self.frame_F1_accumulation.append(f1)
         # --- Reward ---
-        reward = -f1 - self.config.hyper_neural["OMEGA_Q1"] * math.exp(
-            self.config.hyper_neural["OMEGA_Q2"] * v_qos
-        )
+        # Linearize QoS penalty to avoid exponential explosion
+        # Reward = -F1 - OMEGA_Q1 * v_qos
+        reward = -f1 - self.config.hyper_neural["OMEGA_Q1"] * v_qos
+        
+        # Optional: Scale reward to a smaller range for DQN stability
+        reward = reward * 0.01 
         next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
         self.time_manager.tick()
         next_states={}

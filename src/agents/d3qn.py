@@ -92,7 +92,7 @@ class D3QNAgent:
 
         self.mf_optimizer.zero_grad()
         loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
         self.mf_optimizer.step()
 
     def store_transition(self, state, prev_mf, curr_mf, action, reward, next_state, done):
@@ -128,7 +128,7 @@ class D3QNAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         # ---------------- SOFT UPDATE ----------------
