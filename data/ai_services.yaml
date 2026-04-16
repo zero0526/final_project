@@ -5,8 +5,8 @@ service:
     omega: 1
     size: 365.2
     input_data_size: 0.57 #mb
-    mean_deadline: 3 #1.5
-    std_deadline: 0.3
+    mean_deadline: 2
+    std_deadline: 0.5
     models:
       - id: 0
         name: "ConvNeXt_Tiny"
@@ -30,73 +30,73 @@ service:
     omega: 1
     size: 114.6
     input_data_size: 19.66 # MB wav
-    mean_deadline: 15 #10.0
-    std_deadline: 2.0
+    mean_deadline: 3
+    std_deadline: 0.5
     models:
       - id: 0
-        name: "MViT_V1_B"
-        workload: 70.6
-        accuracy: 78.477
-      - id: 1
-        name: "Swin3D_S"
-        workload: 82.84
-        accuracy: 79.521
-      - id: 2
         name: "Swin3D_S"
         workload: 43.88
         accuracy: 77.715
+      - id: 1
+        name: "MViT_V1_B"
+        workload: 70.6
+        accuracy: 78.477
+      - id: 2
+        name: "Swin3D_S"
+        workload: 82.84
+        accuracy: 79.521
   service_2:
     id: 2
     name: "Semantic Segmentation"
     omega: 1
     size: 114
     input_data_size: 3.0 # MB (Text light)
-    mean_deadline: 8 #4.0
-    std_deadline: 0.8
+    mean_deadline: 4 #4.0
+    std_deadline: 0.5
     models:
       - id: 0
         name: "DeepLabV3_MobileNet_V3"
         workload: 10.45
         accuracy: 60.3
       - id: 1
-        name: "DeepLabV3_ResNet101"
-        workload: 258.74
-        accuracy: 67.4
-      - id: 2
         name: "DeepLabV3_ResNet50"
         workload: 178.72
         accuracy: 66.4
+      - id: 2
+        name: "DeepLabV3_ResNet101"
+        workload: 258.74
+        accuracy: 67.4
   service_3:
     id: 3
     name: "Instance Segmentation"
     omega: 0
     size: 90.8
     input_data_size: 7.81 # MB
-    mean_deadline: 13 #7.5
-    std_deadline: 1.2
+    mean_deadline: 5 #7.5
+    std_deadline: 0.5
     models:
       - id: 0
-        name: "MaskRCNN_ResNet50_FPN_V2"
-        workload: 133.92
-        accuracy: 47.4
-      - id: 1
         name: "MaskRCNN_ResNet50_FPN"
-        workload: 137.42
+        workload: 133.92
         accuracy: 37.9
+      - id: 1
+        name: "MaskRCNN_ResNet50_FPN_V2"
+        workload: 137.42
+        accuracy: 47.4
   service_4:
     id: 4
     name: "Object Detection"
     omega: 0         # Occasional -> HDD
     size: 72.2        # MB
     input_data_size: 7.81
-    mean_deadline: 10 #8.5
-    std_deadline: 1.5
+    mean_deadline: 5 #8.5
+    std_deadline: 0.5
     models:
       - id: 0
-        name: "RetinaNet_ResNet50_FPN_V2"
-        workload: 152.24
-        accuracy: 41.5
-      - id: 1
         name: "RetinaNet_ResNet50_FPN"
         workload: 151.54
         accuracy: 36.4
+      - id: 1
+        name: "RetinaNet_ResNet50_FPN_V2"
+        workload: 152.24
+        accuracy: 41.5

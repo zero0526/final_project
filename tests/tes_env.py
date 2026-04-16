@@ -30,6 +30,7 @@ if __name__=="__main__":
     lower_action_map= []
     for task,backlog, cpu, mean_field  in lower_state.get('next_states').values():
         lower_action_map.append((task, random.choice(service_node[task.service_id]), random.randint(0, services[task.service_id]) ))
+    print(f"num of task {len(lower_action_map)}")
     env.step_lower(lower_action_map)
     print("hello")
 

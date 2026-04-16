@@ -15,7 +15,7 @@ class Task:
         self.id = task_id
         self.terminal_id = terminal_id
         self.source_node_id = source_node_id
-        self.service_id = service_info.get("id")
+        self.service_id:int = service_info.get("id")
         self.models:List[Dict[str, Any]] = service_info.get("models")
         self.batch_size = batch_size
 

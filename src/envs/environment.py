@@ -3,9 +3,7 @@ import numpy as np
 from typing import Dict, List, Tuple
 from collections import defaultdict, deque
 
-from sympy.physics.units import energy
-
-from envs.entities.task_node import Task
+from src.envs.entities.task_node import Task
 from src.utils import convert_nodeid2order, one_hot
 from src.configs.configs import cfg, BaseConfig
 from src.envs.network.topology_manager import TopologyManager
@@ -17,9 +15,9 @@ from src.envs.time_manager import TimeManager
 
 
 class SixGEnvironment:
-    def __init__(self, config:BaseConfig = cfg):
+    def __init__(self, num_terminals: int, config:BaseConfig = cfg):
         self.config = config
-        self.service_config = config.services
+        self.service_config = {s.get("id"):s for s in config.services.values()}
         self.num_services = len(self.service_config)
         self.device = cfg.device
 
@@ -33,11 +31,12 @@ class SixGEnvironment:
         self.cloud_node_id = None
         self.computing_nodes: List[ComputingNode]= []
         self.node_id_dict= {}
+        self.invert_node_id= {}
         self._init_nodes()
 
         self.terminals: Dict[str, Terminal] = {}
         self.terminals_group: Dict[str, List[Terminal]]= defaultdict(list)
-        self._init_terminals()
+        self._init_terminals(num_terminals)
 
         self.workload_gen = WorkloadGenerator(
             terminals=list(self.terminals.values())
@@ -64,7 +63,9 @@ class SixGEnvironment:
             if node.get("type") == "cloud":
                 self.cloud_node_id= node.get("id")
             if node.get("type") in ["edge", "network", "cloud"]:
-                self.node_id_dict[node.get("id")]= len(self.node_id_dict)
+                local_id=len(self.node_id_dict)
+                self.node_id_dict[node.get("id")]= local_id
+                self.invert_node_id[local_id]= node.get("id")
                 self.computing_nodes.append(self.nodes[node.get("id")])
         self.computing_nodes = sorted(self.computing_nodes, key=lambda x: convert_nodeid2order(x.id))
         # add neighborhoods
@@ -72,10 +73,10 @@ class SixGEnvironment:
             neighbor_ids= self.topo_manager.get_neighbor_nodes_by_type(node_id, 3, ["edge", "network", "cloud"])
             self.nodes[node_id].neighbor_nodes= [self.nodes[i] for i in neighbor_ids]
 
-    def _init_terminals(self):
+    def _init_terminals(self, num_terminals):
         edge_ids = [idx for idx, n in self.nodes.items() if n.type == "edge"]
         n= len(edge_ids)
-        for i in range(cfg.hyper_neural['NUM_LOWER_AGENTS']):
+        for i in range(num_terminals):
             t_id = f"UE_{i}"
             source_id= edge_ids[i%n]
             self.terminals[t_id] = Terminal(
@@ -92,13 +93,12 @@ class SixGEnvironment:
         for node in self.computing_nodes:
             node.upper_reset()
             node.lower_reset()
-            node.backlogs= {}
 
         next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
         # generate task
         next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
         for task in next_tasks:
-            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], (np.zeros(num_nodes), np.zeros(self.max_models_total))
+            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], np.zeros(num_nodes + self.max_models_total)
         zero_data= {nid:np.zeros(self.num_services) for nid in self.nodes.keys()}
         info = {
             "f1": 0,
@@ -133,7 +133,7 @@ class SixGEnvironment:
             mean_fields[node.id] = np.zeros(n)
         return {
             "reward": 0.0,
-            "states": states,
+            "next_states": states,
             "mean_fields": mean_fields,
             "done": self.time_manager.is_done(),
             "remaining_task": self.compose_task_remaining()
@@ -153,7 +153,7 @@ class SixGEnvironment:
 
         return {
             "reward": reward,
-            "states": states,
+            "next_states": states,
             "mean_fields": mean_fields,
             "done": self.time_manager.is_done(),
             "remaining_task": self.compose_task_remaining()
@@ -178,19 +178,18 @@ class SixGEnvironment:
     def step_lower(self, assigned_tasks: List[Tuple[Task, int, int]]):
         f1, v_qos = 0.0, 0
         grouped_tasks = defaultdict(list)
-        num_nodes = len(self.computing_nodes)
         energy_dist={}
         f1_dist={}
         # --- Assign tasks ---
         for task, node_idx, model_idx in assigned_tasks:
-            node = self.nodes[node_idx]
+            node = self.nodes[self.invert_node_id[node_idx]]
             is_accepted= node.admit_task(task, model_idx)
             if not is_accepted: v_qos += 1
             grouped_tasks[task.source_node_id].append(
                 (
                     task.terminal_id,
-                    one_hot(self.node_id_dict[node_idx], num_nodes),
-                    one_hot(model_idx, self.max_models_total),
+                    one_hot(node_idx, len(self.computing_nodes)),
+                    one_hot(model_idx, self.max_models_total)
                 )
             )
 
@@ -221,17 +220,17 @@ class SixGEnvironment:
             n = len(tasks)
 
             tids = []
-            node_vecs = []
-            model_vecs = []
+            node_vecs_list = []
+            model_vecs_list = []
 
             for tid, node_vec, model_vec in tasks:
                 tids.append(tid)
-                node_vecs.append(node_vec)
-                model_vecs.append(model_vec)
+                node_vecs_list.append(node_vec)
+                model_vecs_list.append(model_vec)
 
-            if node_vecs:
-                node_vecs = np.stack(node_vecs)  # (n, num_nodes)
-                model_vecs = np.stack(model_vecs)  # (n, num_models)
+            if node_vecs_list:
+                node_vecs = np.stack(node_vecs_list)  # (n, num_nodes)
+                model_vecs = np.stack(model_vecs_list)  # (n, num_models)
 
                 total_node = node_vecs.sum(axis=0)
                 total_model = model_vecs.sum(axis=0)
@@ -244,7 +243,7 @@ class SixGEnvironment:
                         avg_node = np.zeros_like(node_vecs[i])
                         avg_model = np.zeros_like(model_vecs[i])
 
-                    mean_fields[tid] = (avg_node, avg_model)
+                    mean_fields[tid] = np.concatenate([avg_node, avg_model], axis=0)
 
         self.frame_F1_accumulation.append(f1)
         # --- Reward ---
@@ -275,6 +274,7 @@ class SixGEnvironment:
             "reward":reward,
             "next_states":next_states,
             "new_frame": self.time_manager.is_new_frame(),
+            "done": self.time_manager.is_done(),
             "info": info
         }
 
@@ -299,11 +299,14 @@ class SixGEnvironment:
         return vec
 
     def compose_task_remaining(self):
-        remaining_tasks: Dict[str, List[int]] = {}
+        remaining_tasks: Dict[str, np.ndarray] = {}
         for node in self.computing_nodes:
             remaining_tasks[node.id] = node.task_remaining
         return remaining_tasks
 
 
 
-
+def encoding(max_models, num_node, node_id, model_id):
+    vec= np.zeros(max_models*num_node)
+    vec[node_id*max_models +model_id] = 1
+    return vec

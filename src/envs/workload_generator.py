@@ -10,13 +10,6 @@ class WorkloadGenerator:
             terminals: List[Terminal],
             config: BaseConfig = cfg
     ):
-        """
-        Quản lý việc sinh tải cho toàn mạng.
-        Nó chứa các tham số workload toàn cục và danh sách các Terminal.
-
-        Args:
-            terminals: Danh sách các đối tượng Terminal đã được khởi tạo
-        """
         self.terminals = terminals
 
         self.arrival_rate = config.task_arrival_rate
@@ -39,13 +32,6 @@ class WorkloadGenerator:
         return probs
 
     def step(self, abs_current_time: float) -> List[Task]:
-        """
-        Hàm chính được gọi tại mỗi bước mô phỏng (Simulation Step).
-        Yêu cầu tất cả các Terminal sinh task.
-
-        Returns:
-            List các Task được sinh ra trong slot này.
-        """
         generated_tasks = []
 
         for terminal in self.terminals:

@@ -215,8 +215,8 @@ class ComputingNode:
         if not active_svcs:
             return [], 0.0, 0.0, count_violate_qos, {}, {}, {}, violate_qos
 
-        print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
-        print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
+        # print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
+        # print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
         # allocation resource gpu
         f_alloc_vec, slot_cold_times = self._compute_optimal_resources(
             active_svcs
@@ -309,11 +309,14 @@ class ComputingNode:
             f_max_vec[i] = self.cpu_capacity
             f_min_vec[i], cold_times = self.__min_requirement_gpu(sid)
             slot_cold_times[sid] = cold_times
-        f_alloc_vec = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
-        self.last_cpu_allocation= f_alloc_vec
-        for i, sid in enumerate(active_svcs):
+        f_alloc_vec_active = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
+        f_alloc_vec = np.zeros(len(self.service_profiles))
+        for i, f in enumerate(f_alloc_vec_active):
+            f_alloc_vec[active_svcs[i]] = f
+
+        for sid in active_svcs:
             self.expected_gpu_allocations[sid] = self.ema.update(
-                f_alloc_vec[i],
+                f_alloc_vec[sid].item(),
                 self.expected_gpu_allocations[sid]
             )
         return f_alloc_vec, slot_cold_times
@@ -324,7 +327,7 @@ class ComputingNode:
         self.cpu_allocations = {}
         lypa_punish= 0.0
         for i, sid in enumerate(active_svcs):
-            f_val = f_alloc_vec[i]
+            f_val = f_alloc_vec[sid]
             if not np.isfinite(f_val): f_val = 0.0
 
             self.cpu_allocations[sid] = f_val
@@ -353,11 +356,11 @@ class ComputingNode:
             )
 
             total_energy += e_comp
-
-            print(f"    [Svc {sid:2}] CPU: {f_val:8.2f} GFLOPS ({f_val / self.cpu_capacity * 100:5.1f}%) | "
-                  f"Energy: {e_comp:8.4f} J | "
-                  f"Processed: {actual_workload:8.2f} GFLOPS | "
-                  f"Queue: {q_before:8.2f} -> {q_after:8.2f} GFLOPS")
+            #
+            # print(f"    [Svc {sid:2}] CPU: {f_val:8.2f} GFLOPS ({f_val / self.cpu_capacity * 100:5.1f}%) | "
+            #       f"Energy: {e_comp:8.4f} J | "
+            #       f"Processed: {actual_workload:8.2f} GFLOPS | "
+            #       f"Queue: {q_before:8.2f} -> {q_after:8.2f} GFLOPS")
 
             remaining_cap = processed_workload
             current_slot_time = 0
@@ -393,8 +396,8 @@ class ComputingNode:
 
             for t in self.queues[sid]:
                 t.queue_delay += slot_duration
-
-        print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)}")
+        suc= sum(1 for t in completed_tasks if t.qos_status)
+        # print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)} rate qos= {suc/len(completed_tasks) if completed_tasks else 0}")
         return completed_tasks, total_energy, lypa_punish
 
     def get_observation_state(self, sid: int):

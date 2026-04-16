@@ -50,7 +50,7 @@
                 "y": "43.0"
             },
             "specs": {
-                "cpu": 3348.85,
+                "cpu": 3100.87,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -64,7 +64,7 @@
                 "y": "31.0"
             },
             "specs": {
-                "cpu": 3110.24,
+                "cpu": 3103.04,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -106,7 +106,7 @@
                 "y": "298.0"
             },
             "specs": {
-                "cpu": 837.29,
+                "cpu": 842.29,
                 "ram": 10,
                 "hdd": 10,
                 "is_computing": true
@@ -134,7 +134,7 @@
                 "y": "403.0"
             },
             "specs": {
-                "cpu": 892.44,
+                "cpu": 950.43,
                 "ram": 10,
                 "hdd": 10,
                 "is_computing": true
@@ -148,7 +148,7 @@
                 "y": "132.0"
             },
             "specs": {
-                "cpu": 3451.66,
+                "cpu": 3109.91,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -162,7 +162,7 @@
                 "y": "466.0"
             },
             "specs": {
-                "cpu": 3021.38,
+                "cpu": 3740.77,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -176,7 +176,7 @@
                 "y": "59.0"
             },
             "specs": {
-                "cpu": 3226.12,
+                "cpu": 3906.16,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -216,135 +216,134 @@
             "id": "L1",
             "source": "N1",
             "target": "N6",
-            "transmission_rate": 53.0645
+            "transmission_rate": 307.0641
         },
         {
             "id": "L2",
             "source": "N1",
             "target": "N7",
-            "transmission_rate": 79.1103
+            "transmission_rate": 275.0917
         },
         {
             "id": "L3",
             "source": "N1",
             "target": "N8",
-            "transmission_rate": 96.5206
+            "transmission_rate": 353.5877
         },
         {
             "id": "L4",
             "source": "N2",
             "target": "N3",
-            "transmission_rate": 66.9505
+            "transmission_rate": 265.9908
         },
         {
             "id": "L5",
             "source": "N2",
             "target": "N5",
-            "transmission_rate": 89.2433
+            "transmission_rate": 203.6637
         },
         {
             "id": "L6",
             "source": "N2",
             "target": "N6",
-            "transmission_rate": 50.5526
+            "transmission_rate": 322.6479
         },
         {
             "id": "L7",
             "source": "N3",
             "target": "N5",
-            "transmission_rate": 92.5173
+            "transmission_rate": 131.2851
         },
         {
             "id": "L8",
             "source": "N3",
             "target": "N8",
-            "transmission_rate": 52.3946
+            "transmission_rate": 141.792
         },
         {
             "id": "L9",
             "source": "N4",
             "target": "N5",
-            "transmission_rate": 78.9848
+            "transmission_rate": 263.9988
         },
         {
             "id": "L10",
             "source": "N4",
             "target": "N6",
-            "transmission_rate": 56.1975
+            "transmission_rate": 233.2171
         },
         {
             "id": "L11",
             "source": "N6",
             "target": "N13",
-            "transmission_rate": 73.4353
+            "transmission_rate": 181.3186
         },
         {
             "id": "L12",
             "source": "N7",
             "target": "N10",
-            "transmission_rate": 51.408
+            "transmission_rate": 126.0134
         },
         {
             "id": "L13",
             "source": "N7",
             "target": "N14",
-            "transmission_rate": 73.9505
+            "transmission_rate": 275.0624
         },
         {
             "id": "L14",
             "source": "N8",
             "target": "N9",
-            "transmission_rate": 91.8358
+            "transmission_rate": 256.2769
         },
         {
             "id": "L15",
             "source": "N8",
             "target": "N15",
-            "transmission_rate": 58.1917
+            "transmission_rate": 309.0527
         },
         {
             "id": "L16",
             "source": "N9",
             "target": "N10",
-            "transmission_rate": 61.4367
+            "transmission_rate": 285.8938
         },
         {
             "id": "L17",
             "source": "N9",
             "target": "N12",
-            "transmission_rate": 93.6165
+            "transmission_rate": 296.4735
         },
         {
             "id": "L18",
             "source": "N9",
             "target": "N15",
-            "transmission_rate": 79.297
+            "transmission_rate": 290.56
         },
         {
             "id": "L19",
             "source": "N10",
             "target": "N12",
-            "transmission_rate": 85.9295
+            "transmission_rate": 323.7374
         },
         {
             "id": "L20",
             "source": "N11",
             "target": "N13",
-            "transmission_rate": 70.3819
+            "transmission_rate": 241.6485
         },
         {
             "id": "L21",
             "source": "N11",
             "target": "N14",
-            "transmission_rate": 51.8045
+            "transmission_rate": 177.0858
         },
         {
             "id": "L22",
             "source": "N13",
             "target": "N14",
-            "transmission_rate": 79.9789
+            "transmission_rate": 201.8226
         }
     ],
     "topology": "atlanta"
 }
-

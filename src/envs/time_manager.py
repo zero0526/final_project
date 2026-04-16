@@ -13,7 +13,7 @@ class TimeManager:
         # Constants
         self.slot_duration: float = float(neuron_cfg['SLOT_DURATION'])
         self.slots_per_frame: int = int(neuron_cfg['TIME_SLOT_PER_TIMEFRAME'])
-        self.max_steps: int = int(neuron_cfg['TIME_STEP_OFEP'])
+        self.max_steps: int = int(neuron_cfg['NUMOF_TF_EP'])
 
         # State variables
         self.current_slot: int = 0
