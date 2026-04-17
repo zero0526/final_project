@@ -238,10 +238,10 @@ class Trainer:
     def decode_lower_action_idx(self, lower_action_id: int):
         node_id = int(lower_action_id // self.env.max_models_total)
         model_id = int(lower_action_id % self.env.max_models_total)
-        return node_id, model_id
+        return self.env.invert_node_id[node_id], model_id
 
     def encode_lower_action(self, action: Tuple[int, int]):
-        return self.env.max_models_total * action[0] + action[1]
+        return self.env.max_models_total * self.env.node_id_dict[action[0]] + action[1]
 
     def add_lower_action(self, actions: List[Tuple[Task, int, int]], prev_states: Dict[str, np.ndarray],
                           pre_mfs: Dict[str, np.ndarray], lower_state: Dict[str, Any]):
@@ -262,9 +262,12 @@ class Trainer:
             s = np.concatenate(
                 [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
                 axis=-1)
+            penalty = self.config.hyper_neural["OMEGA_Q1"] * math.exp(self.config.hyper_neural["OMEGA_Q3"])
             if tid in rewards:
-                rw= lower_state.get("reward") - self.config.hyper_neural["OMEGA_Q1"]*math.exp(self.config.hyper_neural["OMEGA_Q3"])
-            else: rw= lower_state.get("reward")
+                # Linearize this penalty as well to avoid large exponential constants
+                rw= lower_state.get("reward") - penalty
+            else:
+                rw = lower_state.get("reward") + penalty
             self.lower_agents[tid].store_transition(
                 prev_states[tid],
                 pre_mfs[tid],

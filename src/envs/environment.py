@@ -181,7 +181,7 @@ class SixGEnvironment:
         rewards=set()
         # --- Assign tasks ---
         for task, node_idx, model_idx in assigned_tasks:
-            node = self.nodes[self.invert_node_id[node_idx]]
+            node = self.nodes[node_idx]
             is_accepted= node.admit_task(task, model_idx)
             if not is_accepted:
                 v_qos += 1
@@ -189,7 +189,7 @@ class SixGEnvironment:
             grouped_tasks[task.source_node_id].append(
                 (
                     task.terminal_id,
-                    one_hot(node_idx, len(self.computing_nodes)),
+                    one_hot(self.node_id_dict[node_idx], len(self.computing_nodes)),
                     one_hot(model_idx, self.max_models_total)
                 )
             )
@@ -205,7 +205,9 @@ class SixGEnvironment:
                 self.time_manager.slot_duration
             )
             for t in completed_tasks:
-                rewards.add(t.terminal_id)
+                # CHỈ PHẠT NẾU TASK BỊ LỖI QOS (Trễ hạn/Drop)
+                if not t.qos_status:
+                    rewards.add(t.terminal_id)
             energy_dist[node.id]= total_energy
             f1_dist[node.id]= local_F1
             virtual_delay_info[node.id]= self.norm_service_vec(virtual_delay)
@@ -252,8 +254,9 @@ class SixGEnvironment:
         self.frame_F1_accumulation.append(f1)
         # --- Reward ---
         # Linearize QoS penalty to avoid exponential explosion
-        # Reward = -F1 - OMEGA_Q1 * v_qos
-        reward = -f1 - self.config.hyper_neural["OMEGA_Q1"]* math.exp(self.config.hyper_neural["OMEGA_Q2"]*v_qos)
+        # Reward = -f1 - OMEGA_Q1 * v_qos (scaled up to match F1 magnitude which is ~1e7)
+        qos_penalty = self.config.hyper_neural["OMEGA_Q1"] * v_qos * 1e6
+        reward = -f1 - qos_penalty
 
         # Optional: Scale reward to a smaller range for DQN stability
         reward = reward * 1e-9

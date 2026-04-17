@@ -90,7 +90,7 @@ class D3QNAgent:
             mf_input = torch.cat([state_tensor, mf_tensor], dim=-1)
             pred_mf = self.mf_net(mf_input)
 
-            if np.random.rand() < epsilon:
+            if np.random.rand() < 0: #epsilon:
                 if mask is not None and np.any(mask):
                     valid_indices = np.where(mask == 1)[0]
                     if self.exclude_zero:
@@ -135,6 +135,7 @@ class D3QNAgent:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
         self.mf_optimizer.step()
+        return loss.item()
 
     def store_transition(self, state, prev_mf, curr_mf, action, reward, next_state, done):
         self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)

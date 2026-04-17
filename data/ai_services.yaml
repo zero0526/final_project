@@ -5,7 +5,7 @@ service:
     omega: 1
     size: 365.2
     input_data_size: 0.57 #mb
-    mean_deadline: 2
+    mean_deadline: 1
     std_deadline: 0.5
     models:
       - id: 0
@@ -30,7 +30,7 @@ service:
     omega: 1
     size: 114.6
     input_data_size: 19.66 # MB wav
-    mean_deadline: 3
+    mean_deadline: 4
     std_deadline: 0.5
     models:
       - id: 0
