@@ -26,7 +26,7 @@ class FFN(nn.Module):
         else:
             for h_dim in hidden_sizes:
                 layers.append(nn.Linear(in_features, h_dim))
-                layers.append(nn.GELU())
+                layers.append(nn.ReLU())
                 in_features = h_dim
             layers.append(nn.Linear(in_features, output_size))
 

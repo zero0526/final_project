@@ -7,6 +7,7 @@ from src.visualize.aggregator import MetricsAggregator
 from typing import Dict, List, Tuple, Any
 from collections import defaultdict
 import numpy as np
+import math
 from tqdm import tqdm
 import sys
 
@@ -91,7 +92,6 @@ class Trainer:
 
             while True:
                 if lower_state.get("new_frame"):
-                    print("hellow world!!!")
                     upper_actions, prev_states, prev_mfs = self.placement_service(upper_state)
                     self.service_map_node(upper_actions)
                     upper_state = self.env.step_upper(upper_actions)
@@ -246,6 +246,7 @@ class Trainer:
     def add_lower_action(self, actions: List[Tuple[Task, int, int]], prev_states: Dict[str, np.ndarray],
                           pre_mfs: Dict[str, np.ndarray], lower_state: Dict[str, Any]):
         curr_states = lower_state.get("next_states")
+        rewards: set= lower_state.get("rewards")
         curr_mfs: Dict[str, np.ndarray] = {}
 
         action_dict: Dict[str, Tuple[int, int]] = {action[0].terminal_id: (action[1], action[2]) for action in actions}
@@ -261,13 +262,15 @@ class Trainer:
             s = np.concatenate(
                 [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
                 axis=-1)
-
+            if tid in rewards:
+                rw= lower_state.get("reward") - self.config.hyper_neural["OMEGA_Q1"]*math.exp(self.config.hyper_neural["OMEGA_Q3"])
+            else: rw= lower_state.get("reward")
             self.lower_agents[tid].store_transition(
                 prev_states[tid],
                 pre_mfs[tid],
                 curr_mf,
                 self.encode_lower_action(action_dict[tid]),
-                lower_state.get("reward"),
+                rw,
                 s,
                 lower_state.get("done")
             )

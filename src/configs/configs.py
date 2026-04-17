@@ -61,7 +61,7 @@ class BaseConfig(BaseSettings):
     nodes_type:Dict[str,str] = Field(default={})
     nodes_config:Dict[str,str] = Field(default={})
     energy_coef: float = Field(default=5e-10)
-    transmission_rate: Dict[str, float] = Field(default={"min": 125, "max": 375})
+    transmission_rate: Dict[str, float] = Field(default={"min": 10000, "max": 50000})
     topology_data: Dict[str, Any] = Field(default_factory=dict)
     cold_start_energy_coef: float= Field(default= 0.2)
     transmission_coef: float= Field(default=0.2)

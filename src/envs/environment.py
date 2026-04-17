@@ -150,7 +150,7 @@ class SixGEnvironment:
             if nid in actions: self.nodes[nid].update_placement(actions[nid])
 
         return {
-            "reward": reward,
+            "reward": reward*1e-10,
             "next_states": states,
             "mean_fields": mean_fields,
             "done": self.time_manager.is_done(),
@@ -178,11 +178,14 @@ class SixGEnvironment:
         grouped_tasks = defaultdict(list)
         energy_dist={}
         f1_dist={}
+        rewards=set()
         # --- Assign tasks ---
         for task, node_idx, model_idx in assigned_tasks:
             node = self.nodes[self.invert_node_id[node_idx]]
             is_accepted= node.admit_task(task, model_idx)
-            if not is_accepted: v_qos += 1
+            if not is_accepted:
+                v_qos += 1
+                rewards.add(task.terminal_id)
             grouped_tasks[task.source_node_id].append(
                 (
                     task.terminal_id,
@@ -201,6 +204,8 @@ class SixGEnvironment:
             completed_tasks, total_energy, local_F1, violate_qos, virtual_delay, realized_delay_avg, success_qos, violation_qos = node.process_timeslot(
                 self.time_manager.slot_duration
             )
+            for t in completed_tasks:
+                rewards.add(t.terminal_id)
             energy_dist[node.id]= total_energy
             f1_dist[node.id]= local_F1
             virtual_delay_info[node.id]= self.norm_service_vec(virtual_delay)
@@ -208,6 +213,7 @@ class SixGEnvironment:
             success_qos_info[node.id]= self.norm_service_vec(success_qos)
             violate_qos_info[node.id]= self.norm_service_vec(violation_qos)
             all_tasks.extend(completed_tasks)
+            # rewards[node.]= -(local_F1 + calculate_rw(self.config.hyper_neural["OMEGA_Q1"], self.config.hyper_neural["OMEGA_Q2"], violate_qos))
             f1 += local_F1
             v_qos += violate_qos
 
@@ -247,10 +253,10 @@ class SixGEnvironment:
         # --- Reward ---
         # Linearize QoS penalty to avoid exponential explosion
         # Reward = -F1 - OMEGA_Q1 * v_qos
-        reward = -f1 - self.config.hyper_neural["OMEGA_Q1"] * v_qos
+        reward = -f1 - self.config.hyper_neural["OMEGA_Q1"]* math.exp(self.config.hyper_neural["OMEGA_Q2"]*v_qos)
 
         # Optional: Scale reward to a smaller range for DQN stability
-        reward = reward * 1e-5
+        reward = reward * 1e-9
         next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
         self.time_manager.tick()
         next_states={}
@@ -273,6 +279,7 @@ class SixGEnvironment:
 
         return {
             "reward":reward,
+            "rewards": rewards,
             "next_states":next_states,
             "new_frame": self.time_manager.is_new_frame(),
             "done": self.time_manager.is_done(),
@@ -311,3 +318,6 @@ def encoding(max_models, num_node, node_id, model_id):
     vec= np.zeros(max_models*num_node)
     vec[node_id*max_models +model_id] = 1
     return vec
+
+def calculate_rw(ome_1, ome_2, vio:int):
+    return ome_1*math.exp(ome_2*vio)

@@ -214,7 +214,7 @@ class ComputingNode:
                 processed_tasks.extend(tasks_to_remove)
         if not active_svcs:
             return [], 0.0, 0.0, count_violate_qos, {}, {}, {}, violate_qos
-
+        #
         # print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
         # print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
         # allocation resource gpu
