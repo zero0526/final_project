@@ -105,7 +105,7 @@ class ComputingNode:
 
     def update_placement(self, placement_vector:np.ndarray):
         constraint_violations = 0
-
+        self.upper_reset()
         for svc_id, decision in enumerate(placement_vector):
             if decision == 1:
                 profile = self.service_profiles[svc_id]
@@ -261,9 +261,9 @@ class ComputingNode:
     def _calculate_QoS(self, violate_qos: int)->float:
         return self.config.hyper_neural["OMEGA_Q1"]*math.exp(violate_qos*self.config.hyper_neural["OMEGA_Q2"])
 
-    def __min_requirement_gpu(self, sid):
+    def __min_requirement_gpu(self, sid, expect_allocation):
         # estimate by ignore overloading cause over deadline before computing process
-        expect_allocation= self.expected_gpu_allocations[sid]
+
         t_cold_start, e_cold_start=0, 0
         if not self.service_profiles[sid].get("omega"):
             t_cold_start= random.uniform(self.config.cold_start_time.get("min"), self.config.cold_start_time.get("max"))
@@ -293,6 +293,8 @@ class ComputingNode:
 
     def _compute_optimal_resources(self, active_svcs):
         num_active = len(active_svcs)
+        total_past_expectation = sum(self.expected_gpu_allocations[sid] for sid in active_svcs)
+        
         g_vec = np.zeros(num_active)
         z_vec = np.zeros(num_active)
         f_min_vec = np.zeros(num_active)
@@ -307,7 +309,14 @@ class ComputingNode:
             z_vec[i] = max(z_vec[i], 1e-12)
 
             f_max_vec[i] = self.cpu_capacity
-            f_min_vec[i], cold_times = self.__min_requirement_gpu(sid)
+            
+            # Calculate temporary local expectation for this timeslot
+            if total_past_expectation > 1e-9:
+                loc_expect = (self.expected_gpu_allocations[sid] / total_past_expectation) * (self.cpu_capacity * 0.8)
+            else:
+                loc_expect = (self.cpu_capacity * 0.8) / num_active
+                
+            f_min_vec[i], cold_times = self.__min_requirement_gpu(sid, loc_expect)
             slot_cold_times[sid] = cold_times
         f_alloc_vec_active = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
         f_alloc_vec = np.zeros(len(self.service_profiles))
