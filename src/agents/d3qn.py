@@ -40,14 +40,14 @@ class RunningNorm:
 class DuelingNetwork(nn.Module):
     def __init__(self, input_dim: int, action_dim: int, hidden_sizes: Tuple[int, ...]):
         super(DuelingNetwork, self).__init__()
-        self.norm= RunningNorm(input_dim)
+        # self.norm= RunningNorm(input_dim)
         self.value_stream = FFN(input_size=input_dim, output_size=1, hidden_sizes=hidden_sizes)
         self.advantage_stream = FFN(input_size=input_dim, output_size=action_dim, hidden_sizes=hidden_sizes)
 
     def forward(self, state, pred_mf):
         x = torch.cat([state, pred_mf], dim=-1)
-        self.norm.update(x)
-        x=self.norm.normalize(x)
+        # self.norm.update(x)
+        # x=self.norm.normalize(x)
         V = self.value_stream(x)
         A = self.advantage_stream(x)
 
@@ -107,35 +107,21 @@ class D3QNAgent:
 
             q_values = self.eval_net(state_tensor, pred_mf)
 
-            scaled_q_values = zeta * q_values
             if mask is not None and np.any(mask):
                 mask_tensor = torch.FloatTensor(mask).to(self.device).unsqueeze(0)
-                scaled_q_values = scaled_q_values + (mask_tensor - 1.0) * 1e9
+                # Apply large penalty to masked actions
+                q_values = q_values + (mask_tensor - 1.0) * 1e9
             
             if self.exclude_zero and self.u_action_dim > 1:
-                scaled_q_values[:, 0] -= 1e18
-            action_probs = F.softmax(scaled_q_values, dim=1)
-            dist = Categorical(action_probs)
-            action = dist.sample()
+                q_values[:, 0] -= 1e18
+                
+            action = q_values.argmax(dim=1)
 
         return action.item()
 
     def learn_mf(self, state, prev_mf, ground_truth_mf):
-        # online training mf_net
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        prev_mf_tensor = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
-        gt_mf_tensor = torch.FloatTensor(ground_truth_mf).unsqueeze(0).to(self.device)
-
-        mf_input = torch.cat([state_tensor, prev_mf_tensor], dim=-1)
-        pred_mf = self.mf_net(mf_input)
-
-        loss = self.loss_fn(pred_mf, gt_mf_tensor)
-
-        self.mf_optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
-        self.mf_optimizer.step()
-        return loss.item()
+        # We now train MF network via Minibatch in learn() to avoid noisy Batch=1 updates
+        pass
 
     def store_transition(self, state, prev_mf, curr_mf, action, reward, next_state, done):
         self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)
@@ -147,10 +133,19 @@ class D3QNAgent:
         # Sample data
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
 
-        # ---------------- DOUBLE DQN LOGIC ----------------
+        # ---------------- TRAIN MF NETWORK ----------------
         mf_input = torch.cat([states, prev_mfs], dim=-1)
-        pred_mfs = self.mf_net(mf_input).detach()
-        q_eval = self.eval_net(states, pred_mfs).gather(1, actions)
+        pred_curr_mfs = self.mf_net(mf_input)
+        mf_loss = self.loss_fn(pred_curr_mfs, curr_mfs)
+        
+        self.mf_optimizer.zero_grad()
+        mf_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
+        self.mf_optimizer.step()
+
+        # ---------------- DOUBLE DQN LOGIC ----------------
+        pred_mfs_detached = pred_curr_mfs.detach()
+        q_eval = self.eval_net(states, pred_mfs_detached).gather(1, actions)
 
         with torch.no_grad():
             next_mf_input = torch.cat([next_states, curr_mfs], dim=-1)

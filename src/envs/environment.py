@@ -70,7 +70,7 @@ class SixGEnvironment:
         self.computing_nodes = sorted(self.computing_nodes, key=lambda x: convert_nodeid2order(x.id))
         # add neighborhoods
         for node_id, node  in self.nodes.items():
-            neighbor_ids= self.topo_manager.get_neighbor_nodes_by_type(node_id, 3, ["edge", "network", "cloud"])
+            neighbor_ids= self.topo_manager.get_neighbor_nodes_by_type(node_id, 2, ["edge", "network", "cloud"])
             self.nodes[node_id].neighbor_nodes= [self.nodes[i] for i in neighbor_ids]
 
     def _init_terminals(self, num_terminals):
@@ -119,7 +119,7 @@ class SixGEnvironment:
         self.time_manager.reset()
         self.frame_F1_accumulation = deque(maxlen=self.T)
         for node in self.nodes.values():
-            if node.type in ["edge", "network"]:
+            if node.type in ["edge", "network", "cloud"]:
                 node.reset()
         self.nodes[self.cloud_node_id].update_placement(np.ones(self.num_services))
         self.workload_gen.step(abs_current_time=0)
@@ -302,7 +302,7 @@ class SixGEnvironment:
             for neighbor_node in node.neighbor_nodes:
                 node_ids.add(neighbor_node.id)
                 grouped_edges[node.id].extend(grouped_tasks[neighbor_node.id])
-        return grouped_edges
+        return grouped_tasks
 
     def norm_service_vec(self, vec_data:Dict[int, float])->np.ndarray:
         vec= np.zeros(self.num_services)

@@ -28,9 +28,8 @@ class Trainer:
         self.lower_u_action_dim = len(self.env.computing_nodes) * self.env.max_models_total
 
         # --- INITIALIZE EPSILON & ZETA ---
-        self.min_epsilon = cfg.hyper_neural.get("EPSILON", 0.01)
-        self.annealing_length = cfg.hyper_neural.get("ANNEALING_LENGTH", 1500)
-        self.epsilon_decay = (1.0 - self.min_epsilon) / self.annealing_length
+        self.min_epsilon = cfg.hyper_neural.get("EPSILON", 0.05)
+        self.epsilon_decay_factor = cfg.hyper_neural.get("EPSILON_DECAY", 0.9985)
 
         self.epsilons = {nid: 1.0 for nid in self.env.agent_node_ids}
         self.lower_epsilons = {tid: 1.0 for tid in self.env.terminals.keys()}
@@ -76,10 +75,10 @@ class Trainer:
 
     def update_exploration_rates(self):
         for nid in self.epsilons:
-            self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] - self.epsilon_decay)
+            self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay_factor)
 
         for tid in self.lower_epsilons:
-            self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] - self.epsilon_decay)
+            self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay_factor)
 
     def train(self):
         num_eps = self.config.hyper_neural['NUMOF_TRAIN_EP']
@@ -161,15 +160,24 @@ class Trainer:
     def add_state2buffer(self, prev_states, prev_mfs, actions, upper_state):
         curr_states = upper_state.get("next_states")
         curr_mfs = upper_state.get("mean_fields")
+        local_penalties = upper_state.get("local_penalties", {})
+        global_reward = upper_state.get("reward", 0)
+        
+        # Scale for local penalty: approx 0.01 per dropped task
+        local_penalty_scale = self.config.hyper_neural.get("OMEGA_Q1", 1.0) * 0.01
+
         for node in self.env.computing_nodes:
             nid = node.id
             if nid ==self.env.cloud_node_id: continue
             node_placement, node_phi = curr_states[nid]
             curr_s = np.concatenate([node_placement, node_phi], axis=-1)
+            
+            agent_reward = global_reward - (local_penalties.get(nid, 0) * local_penalty_scale)
+            
             self.upper_agents[nid].store_transition(
                 prev_states[nid], prev_mfs[nid], curr_mfs[nid],
                 from_binary(actions[nid]),
-                upper_state.get("reward"), curr_s, upper_state.get("done")
+                agent_reward, curr_s, upper_state.get("done")
             )
         return curr_mfs
 
@@ -194,14 +202,7 @@ class Trainer:
         for tid, t in self.env.terminals.items():
             task, backlogs, cpu_allocations, mf = states[tid]
 
-            norm_d = task.total_data_size_mb / 4.0
-            norm_deadline = (task.deadline - task.created_at)
-            norm_acc = task.min_accuracy
-            norm_backlogs = backlogs / 100.0
-            norm_resource_allocations = cpu_allocations / 8.0
-            s = np.concatenate(
-                [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
-                axis=-1)
+            s = self.get_lower_state(task, backlogs, cpu_allocations)
 
             prev_states[tid] = s
             prev_mfs[tid] = mf
@@ -240,6 +241,16 @@ class Trainer:
 
         return final_mask
 
+    def get_lower_state(self, task, backlogs, cpu_allocations):
+        norm_d = task.total_data_size_mb / 400.0
+        norm_deadline = (task.deadline - task.created_at) / 7.0
+        norm_acc = task.min_accuracy / 100.0
+        norm_backlogs = backlogs / 1000.0
+        norm_resource_allocations = cpu_allocations / 4000.0
+        return np.concatenate(
+            [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
+            axis=-1)
+
     def decode_lower_action_idx(self, lower_action_id: int):
         node_id = int(lower_action_id // self.env.max_models_total)
         model_id = int(lower_action_id % self.env.max_models_total)
@@ -259,20 +270,16 @@ class Trainer:
         for tid, t in self.env.terminals.items():
             task, backlogs, cpu_allocations, curr_mf = curr_states[tid]
             curr_mfs[tid] = curr_mf
-            norm_d = task.total_data_size_mb / 4.0
-            norm_deadline = (task.deadline - task.created_at)
-            norm_acc = task.min_accuracy
-            norm_backlogs = backlogs / 100.0
-            norm_resource_allocations = cpu_allocations / 8.0
-            s = np.concatenate(
-                [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
-                axis=-1)
-            penalty = self.config.hyper_neural["OMEGA_Q1"] * math.exp(self.config.hyper_neural["OMEGA_Q3"])
+            
+            s = self.get_lower_state(task, backlogs, cpu_allocations)
+            
+            # The penalty base
+            penalty = self.config.hyper_neural["OMEGA_Q1"] * 0.05
             if tid in rewards:
-                # Linearize this penalty as well to avoid large exponential constants
-                rw= lower_state.get("reward") - penalty
+                rw = lower_state.get("reward") - penalty
             else:
                 rw = lower_state.get("reward") + penalty
+                
             self.lower_agents[tid].store_transition(
                 prev_states[tid],
                 pre_mfs[tid],
