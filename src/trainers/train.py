@@ -175,10 +175,15 @@ class Trainer:
 
     def service_map_node(self, actions: Dict[str, np.ndarray]):
         self.service_id_node = defaultdict(list)
+        cloud_id= self.env.node_id_dict[self.env.cloud_node_id]
+
         for nid, action in actions.items():
             active_services = np.where(action == 1)[0]
             for i in active_services:
                 self.service_id_node[i].append(self.env.node_id_dict[nid])
+        for i in range(self.env.num_services):
+            self.service_id_node[i].append(cloud_id)
+
 
     def task_scheduling(self, lower_state):
         states = lower_state.get("next_states")
@@ -189,11 +194,11 @@ class Trainer:
         for tid, t in self.env.terminals.items():
             task, backlogs, cpu_allocations, mf = states[tid]
 
-            norm_d = task.total_data_size_mb / 400.0
-            norm_deadline = (task.deadline - task.created_at) / 7.0
-            norm_acc = task.min_accuracy / 100
-            norm_backlogs = backlogs / 1000.0
-            norm_resource_allocations = cpu_allocations / 4000.0
+            norm_d = task.total_data_size_mb / 4.0
+            norm_deadline = (task.deadline - task.created_at)
+            norm_acc = task.min_accuracy
+            norm_backlogs = backlogs / 100.0
+            norm_resource_allocations = cpu_allocations / 8.0
             s = np.concatenate(
                 [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
                 axis=-1)
@@ -254,11 +259,11 @@ class Trainer:
         for tid, t in self.env.terminals.items():
             task, backlogs, cpu_allocations, curr_mf = curr_states[tid]
             curr_mfs[tid] = curr_mf
-            norm_d = task.total_data_size_mb / 400.0
-            norm_deadline = (task.deadline - task.created_at) / 7.0
-            norm_acc = task.min_accuracy / 100
-            norm_backlogs = backlogs / 1000.0
-            norm_resource_allocations = cpu_allocations / 4000.0
+            norm_d = task.total_data_size_mb / 4.0
+            norm_deadline = (task.deadline - task.created_at)
+            norm_acc = task.min_accuracy
+            norm_backlogs = backlogs / 100.0
+            norm_resource_allocations = cpu_allocations / 8.0
             s = np.concatenate(
                 [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
                 axis=-1)

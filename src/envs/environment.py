@@ -93,7 +93,7 @@ class SixGEnvironment:
         for node in self.computing_nodes:
             node.upper_reset()
             node.lower_reset()
-
+        self.nodes[self.cloud_node_id].update_placement(np.ones(self.num_services))
         next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
         # generate task
         next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
@@ -147,7 +147,8 @@ class SixGEnvironment:
             mean_fields[node.id]= node.mean_field
         self.frame_F1_accumulation = deque(maxlen=self.T)
         for nid in self.agent_node_ids:
-            if nid in actions: self.nodes[nid].update_placement(actions[nid])
+            if nid in actions:
+                self.nodes[nid].update_placement(actions[nid])
 
         return {
             "reward": reward*1e-10,

@@ -138,7 +138,7 @@ class ComputingNode:
             return True
         return False
 
-    def       admit_task(self, task: Task, model_idx: int):
+    def admit_task(self, task: Task, model_idx: int):
         """
         :param task:
         :param model_idx: order in the file config service

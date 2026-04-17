@@ -90,7 +90,7 @@ class D3QNAgent:
             mf_input = torch.cat([state_tensor, mf_tensor], dim=-1)
             pred_mf = self.mf_net(mf_input)
 
-            if np.random.rand() < 0: #epsilon:
+            if np.random.rand() < epsilon:
                 if mask is not None and np.any(mask):
                     valid_indices = np.where(mask == 1)[0]
                     if self.exclude_zero:
