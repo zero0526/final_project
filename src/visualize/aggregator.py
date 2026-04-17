@@ -6,6 +6,7 @@ import os
 class MetricsAggregator:
     def __init__(self):
         self.history = defaultdict(list)
+        self.episode_count = 0
         self.reset_episode()
 
     def reset_episode(self):
@@ -21,6 +22,9 @@ class MetricsAggregator:
         self.episode_realized_delay = []
         self.episode_success_qos = []
         self.episode_violate_qos = []
+        
+        # Per-node per-service delays (realized)
+        self.episode_node_service_delays = defaultdict(lambda: defaultdict(list))
 
     def add_upper(self, step_output):
         """Adds data from an upper-level step."""
@@ -55,6 +59,11 @@ class MetricsAggregator:
         r_delay = info.get("realized_delay", {})
         if r_delay:
             self.episode_realized_delay.append(np.mean([np.mean(v) for v in r_delay.values()]))
+            # Track per-node per-service avg delay
+            for nid, delays in r_delay.items():
+                for sid, d in enumerate(delays):
+                    if d > 1e-9: # Only track actual delays
+                        self.episode_node_service_delays[nid][sid].append(d)
             
         success_qos = info.get("success_qos", {})
         if success_qos:
@@ -77,30 +86,78 @@ class MetricsAggregator:
         self.history["total_success_qos"].append(np.sum(self.episode_success_qos) if self.episode_success_qos else 0)
         self.history["total_violate_qos"].append(np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0)
         
-        # Calculate QoS Rate: Success / (Success + Violate) as a more stable metric, 
-        # but user specifically asked for Success / Violate. We use Violate + 1 for stability.
+        # Calculate QoS Rate: Success / (Success + Violate)
         success = np.sum(self.episode_success_qos) if self.episode_success_qos else 0
         violate = np.sum(self.episode_violate_qos) if self.episode_violate_qos else 0
+        qos_success_rate = success / (success + violate) if (success + violate) > 0 else 0
+        self.history["qos_success_rate"].append(qos_success_rate)
+        
+        # Keep old qos_rate for backward compatibility if needed, but we focus on success rate
         qos_rate = success / (violate if violate > 0 else 1.0)
         self.history["qos_rate"].append(qos_rate)
         
         self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
         
+        self.episode_count += 1
+        
+        # Auto-plot every 100 episodes
+        if self.episode_count % 100 == 0:
+            self.plot_history(ep=self.episode_count)
+            
         # Auto-reset for next episode
-        self.reset_episode()
+        # Note: We reset AFTER report_episode is called usually, 
+        # but store_history is called FIRST in train.py. 
+        # So we should probably NOT reset here if report_episode needs the data.
+        # However, report_episode in this class uses self.history which is NOT reset.
+        # But per-node delays ARE in episode_node_service_delays.
+        # I'll move reset_episode() to the end of report_episode or make report_episode use history.
+        # Actually, let's store the node delays in history too if we want them persistent.
+        # For now, I'll let train.py call report_episode then store_history maybe? 
+        # No, train.py calls store_history then report_episode.
+        # I'll keep the episode data until reset_episode is explicitly called or at start of next store cycle.
+        # Let's just NOT reset here, and instead reset at the start of add_upper if it's a new episode.
+        # Or even better, reset at the end of report_episode.
 
     def report_episode(self, ep):
         """Prints a summary of the current episode."""
-        reward = self.history["total_reward"][-1]
-        f1 = self.history["avg_f1"][-1]
-        qos_rate = self.history["qos_rate"][-1]
+        upper_reward = np.mean(self.episode_upper_rewards) if self.episode_upper_rewards else 0
+        lower_reward = np.mean(self.episode_lower_rewards) if self.episode_lower_rewards else 0
+        total_reward = self.history["total_reward"][-1]
+        energy = self.history["total_energy"][-1]
+        qos_success_rate = self.history["qos_success_rate"][-1]
         
         print(f"\n--- Episode {ep} Summary ---")
-        print(f"Total Reward: {reward:.2f}")
-        print(f"Avg F1 Score: {f1:.4f}")
-        print(f"QoS Rate (S/V): {qos_rate:.2f}")
+        print(f"Avg Upper Reward: {upper_reward:.4f}")
+        print(f"Avg Lower Reward: {lower_reward:.4f}")
+        print(f"Total Reward:     {total_reward:.2f}")
+        print(f"Total Energy:     {energy:.4f} J")
+        print(f"QoS Success Rate: {qos_success_rate:.2%}")
         print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1]:.2f}")
+        
+        print("\n--- Average Delay per Node and Service ---")
+        if not self.episode_node_service_delays:
+            print("No delay data recorded for this episode.")
+        else:
+            # Find the number of services from the first node's data
+            num_services = len(next(iter(self.episode_node_service_delays.values())))
+            header = "Node ID | " + " | ".join([f"Svc {i}" for i in range(num_services)])
+            print(header)
+            print("-" * len(header))
+            
+            # Sort nodes for consistent output
+            for nid in sorted(self.episode_node_service_delays.keys()):
+                delays = self.episode_node_service_delays[nid]
+                row = f"{nid:<7} | "
+                svc_delays = []
+                for sid in sorted(delays.keys()):
+                    d_list = delays[sid]
+                    avg_d = np.mean(d_list) if d_list else 0.0
+                    svc_delays.append(f"{avg_d:7.4f}")
+                print(row + " | ".join(svc_delays))
         print("---------------------------\n")
+        
+        # Reset episode data after reporting
+        self.reset_episode()
 
     def _moving_average(self, data, window=50):
         if len(data) < window:

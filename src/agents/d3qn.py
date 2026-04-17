@@ -10,15 +10,44 @@ from torch.distributions import Categorical
 from src.agents.ffn import FFN
 from src.agents.ReplayBuffer import ReplayBuffer
 
+class RunningNorm:
+    def __init__(self, shape):
+        self.mean = torch.zeros(shape)
+        self.var = torch.ones(shape)
+        self.count = 1e-4
+
+    def update(self, x):
+        batch_mean = x.mean(0)
+        batch_var = x.var(0, unbiased=False)
+        batch_count = x.size(0)
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / total_count
+        new_var = M2 / total_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = total_count
+
+    def normalize(self, x):
+        return (x - self.mean) / (torch.sqrt(self.var) + 1e-8)
+
 class DuelingNetwork(nn.Module):
     def __init__(self, input_dim: int, action_dim: int, hidden_sizes: Tuple[int, ...]):
         super(DuelingNetwork, self).__init__()
-
+        self.norm= RunningNorm(input_dim)
         self.value_stream = FFN(input_size=input_dim, output_size=1, hidden_sizes=hidden_sizes)
         self.advantage_stream = FFN(input_size=input_dim, output_size=action_dim, hidden_sizes=hidden_sizes)
 
     def forward(self, state, pred_mf):
         x = torch.cat([state, pred_mf], dim=-1)
+        self.norm.update(x)
+        x=self.norm.normalize(x)
         V = self.value_stream(x)
         A = self.advantage_stream(x)
 
@@ -29,8 +58,10 @@ class DuelingNetwork(nn.Module):
 # ---D3QN AGENT ---
 class D3QNAgent:
     def __init__(self, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
-                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64):
+                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64, exclude_zero=False):
         self.action_dim = action_dim
+        self.u_action_dim = u_action_dim # Store u_action_dim
+        self.exclude_zero = exclude_zero
         self.gamma = gamma
         self.alpha = float(alpha)  # Ensure it is a scalar float
         self.batch_size = batch_size
@@ -62,9 +93,16 @@ class D3QNAgent:
             if np.random.rand() < epsilon:
                 if mask is not None and np.any(mask):
                     valid_indices = np.where(mask == 1)[0]
+                    if self.exclude_zero:
+                        valid_indices = valid_indices[valid_indices != 0]
+                        if len(valid_indices) == 0: # Fallback if only 0 was valid
+                            valid_indices = np.array([1]) if self.u_action_dim > 1 else np.array([0])
                     action = np.random.choice(valid_indices)
                 else:
-                    action = np.random.randint(self.action_dim)
+                    if self.exclude_zero and self.u_action_dim > 1:
+                        action = np.random.randint(1, self.u_action_dim)
+                    else:
+                        action = np.random.randint(self.u_action_dim)
                 return int(action)
 
             q_values = self.eval_net(state_tensor, pred_mf)
@@ -73,6 +111,9 @@ class D3QNAgent:
             if mask is not None and np.any(mask):
                 mask_tensor = torch.FloatTensor(mask).to(self.device).unsqueeze(0)
                 scaled_q_values = scaled_q_values + (mask_tensor - 1.0) * 1e9
+            
+            if self.exclude_zero and self.u_action_dim > 1:
+                scaled_q_values[:, 0] -= 1e18
             action_probs = F.softmax(scaled_q_values, dim=1)
             dist = Categorical(action_probs)
             action = dist.sample()

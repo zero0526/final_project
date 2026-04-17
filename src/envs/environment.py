@@ -91,8 +91,9 @@ class SixGEnvironment:
         next_states={}
         num_nodes = len(self.computing_nodes)
         for node in self.computing_nodes:
-            node.upper_reset()
-            node.lower_reset()
+            if node.id != self.cloud_node_id:
+                node.upper_reset()
+                node.lower_reset()
 
         next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
         # generate task
@@ -122,7 +123,6 @@ class SixGEnvironment:
             if node.type in ["edge", "network"]:
                 node.reset()
         self.nodes[self.cloud_node_id].update_placement(np.ones(self.num_services))
-        self.frame_F1_accumulation = deque(maxlen=self.T)
         self.workload_gen.step(abs_current_time=0)
 
         states = {}
@@ -146,7 +146,6 @@ class SixGEnvironment:
         for node in self.computing_nodes:
             states[node.id]= (node.placed_services, node.popularity_service)
             mean_fields[node.id]= node.mean_field
-            node.upper_reset()
         self.frame_F1_accumulation = deque(maxlen=self.T)
         for nid in self.agent_node_ids:
             if nid in actions: self.nodes[nid].update_placement(actions[nid])
@@ -203,6 +202,8 @@ class SixGEnvironment:
             completed_tasks, total_energy, local_F1, violate_qos, virtual_delay, realized_delay_avg, success_qos, violation_qos = node.process_timeslot(
                 self.time_manager.slot_duration
             )
+            node.slot_arrival_workload = {}
+
             energy_dist[node.id]= total_energy
             f1_dist[node.id]= local_F1
             virtual_delay_info[node.id]= self.norm_service_vec(virtual_delay)

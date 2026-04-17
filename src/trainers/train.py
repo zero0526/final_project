@@ -54,7 +54,8 @@ class Trainer:
                 gamma=self.config.hyper_neural['DISCOUNT_FACTOR'],
                 alpha=float(self.config.hyper_neural['UPDATE_TARGET_COEF']),
                 buffer_size=self.config.hyper_neural['MEMORY_SIZE'],
-                batch_size=self.config.hyper_neural['BATCH_SIZE']
+                batch_size=self.config.hyper_neural['BATCH_SIZE'],
+                exclude_zero=True
             )
 
         for t in self.env.terminals.keys():
@@ -90,6 +91,7 @@ class Trainer:
 
             while True:
                 if lower_state.get("new_frame"):
+                    print("hellow world!!!")
                     upper_actions, prev_states, prev_mfs = self.placement_service(upper_state)
                     self.service_map_node(upper_actions)
                     upper_state = self.env.step_upper(upper_actions)
@@ -132,7 +134,8 @@ class Trainer:
             
             pbar.set_postfix({"reward": f"{self.aggregator.history['total_reward'][-1]:.2f}"})
             
-            upper_state = self.env.reset_upper()
+
+            upper_state= self.env.reset_upper()
             lower_state = self.env.reset_lower()
 
     def placement_service(self, upper_state):
