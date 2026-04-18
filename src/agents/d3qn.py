@@ -119,36 +119,29 @@ class D3QNAgent:
         with torch.no_grad():
             mf_input = torch.cat([state_tensor, mf_tensor], dim=-1)
             pred_mf = self.mf_net(mf_input)
-
-            if np.random.rand() < epsilon:
-                if mask is not None and np.any(mask):
-                    valid_indices = np.where(mask == 1)[0]
-                    if self.exclude_zero:
-                        valid_indices = valid_indices[valid_indices != 0]
-                        if len(valid_indices) == 0: # Fallback if only 0 was valid
-                            valid_indices = np.array([1]) if self.u_action_dim > 1 else np.array([0])
-                    action = np.random.choice(valid_indices)
-                else:
-                    if self.exclude_zero and self.u_action_dim > 1:
-                        action = np.random.randint(1, self.u_action_dim)
-                    else:
-                        action = np.random.randint(self.u_action_dim)
-                return int(action)
-
+            
+            # Predict Q-values
             q_values = self.eval_net(state_tensor, pred_mf)
 
+            # Apply masking mechanism
             if mask is not None and np.any(mask):
                 mask_tensor = torch.FloatTensor(mask).to(self.device).unsqueeze(0)
-                # Apply large penalty to masked actions
-                q_values = q_values + (mask_tensor - 1.0) * 1e9
+                # Apply large penalty to masked actions (-1e18 for numerical stability in softmax)
+                q_values = q_values + (mask_tensor - 1.0) * 1e18
             
             if self.exclude_zero and self.u_action_dim > 1:
                 q_values[:, 0] -= 1e18
-                
-            action = q_values.argmax(dim=1)
-        if assigned_node_id:
-            pass
-        return action.item()
+            
+            # Boltzmann Selection (Softmax with temperature parameter zeta)
+            # P(a) = exp(zeta * Q_a) / sum(exp(zeta * Q_i))
+            # We use torch.softmax on (zeta * Q) for numerical stability.
+            scaled_q = q_values * zeta
+            probs = torch.softmax(scaled_q, dim=1).cpu().numpy().squeeze()
+            
+            # Weighted random selection based on Boltzmann probabilities
+            action = np.random.choice(len(probs), p=probs)
+            
+        return int(action)
 
     def learn_mf(self, state, prev_mf, ground_truth_mf):
         # We now train MF network via Minibatch in learn() to avoid noisy Batch=1 updates

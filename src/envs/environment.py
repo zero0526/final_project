@@ -96,11 +96,20 @@ class SixGEnvironment:
             node.upper_reset()
             node.lower_reset()
         self.nodes[self.cloud_node_id].update_placement(np.ones(self.num_services))
-        next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
+        next_observe_backlog, next_observe_cpu, total_backlog, total_cpu = self.collect_backlog_resources()
         # generate task
         next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
+        mf_size = num_nodes + self.max_models_total
         for task in next_tasks:
-            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], np.zeros(num_nodes + self.max_models_total)
+            # Include: task, svc_backlog, svc_cpu, mf, total_backlog, total_cpu
+            next_states[task.terminal_id] = (
+                task, 
+                next_observe_backlog[task.service_id], 
+                next_observe_cpu[task.service_id], 
+                np.zeros(mf_size),
+                total_backlog,
+                total_cpu
+            )
         zero_data= {nid:np.zeros(self.num_services) for nid in self.nodes.keys()}
         info = {
             "f1": 0,
@@ -171,16 +180,19 @@ class SixGEnvironment:
         """
         service_id start from 0->n-1 when using index from config service id use minus 1
         """
-        n, m= len(self.computing_nodes), self.num_services
-        observe_backlog= np.zeros((m,n), dtype=np.float32)
-        observe_cpu = np.zeros((m, n), dtype=np.float32)
+        n, m = len(self.computing_nodes), self.num_services
+        observe_backlog, observe_cpu = np.zeros((m,n), dtype=np.float32), np.zeros((m, n), dtype=np.float32)
 
         for i in range(m):
             for node in self.computing_nodes:
                 nidInt=self.node_id_dict[node.id]
                 observe_backlog[i, nidInt], observe_cpu[i, nidInt]= node.get_observation_state(i)
+        
+        # Calculate total load per node across all services
+        total_backlog = observe_backlog.sum(axis=0)
+        total_cpu = observe_cpu.sum(axis=0)
 
-        return observe_backlog, observe_cpu
+        return observe_backlog, observe_cpu, total_backlog, total_cpu
 
     def step_lower(self, assigned_tasks: List[Tuple[Task, int, int]]):
         f1, v_qos = 0.0, 0
@@ -296,16 +308,30 @@ class SixGEnvironment:
         # Linearize QoS penalty to avoid exponential explosion (e.g., billions of reward)
         # We use a fixed penalty per task violation
         qos_penalty = calculate_rw(self.config.hyper_neural["OMEGA_Q1"], self.config.hyper_neural["OMEGA_Q2"], v_qos)
-        reward = -f1 - qos_penalty
         
-        # Clip reward to avoid extreme values and normalize learning signal
-        next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
+        # Scale reward from Billion-scale (due to lypa_coef=1e6) down to human-readable scale [-100, +10]
+        # This prevents gradient explosion and ensures DRL stability
+        reward_scale = 1e-6 
+        reward = -(f1 + qos_penalty) * reward_scale
+        
+        # Clip reward to avoid extreme outliers and focus on meaningful differences
+        reward = float(np.clip(reward, -200.0, 500.0))
+        
+        next_observe_backlog, next_observe_cpu, total_backlog, total_cpu = self.collect_backlog_resources()
         self.time_manager.tick()
         next_states={}
         next_tasks = self.workload_gen.step(self.time_manager.time_elapsed)
         for task in next_tasks:
             mf= mean_fields[task.terminal_id] if task.terminal_id in mean_fields else (np.zeros(self.num_services), np.zeros(self.num_services))
-            next_states[task.terminal_id]= task, next_observe_backlog[task.service_id], next_observe_cpu[task.service_id], mf
+            # Include: task, service-specific backlog, service-specific cpu, mean-field, AND global node backlog, global node cpu
+            next_states[task.terminal_id]= (
+                task, 
+                next_observe_backlog[task.service_id], 
+                next_observe_cpu[task.service_id], 
+                mf,
+                total_backlog,
+                total_cpu
+            )
         info = {
                 "f1": f1_dist,
                 "energy": energy_dist,
@@ -362,4 +388,7 @@ def encoding(max_models, num_node, node_id, model_id):
     return vec
 
 def calculate_rw(ome_1, ome_2, vio:int):
-    return ome_1*math.exp(ome_2*vio)
+    # Redesigned as a strong linear penalty to avoid exponential explosion (Billions)
+    # While still providing a distinct gradient for the number of violations.
+    return ome_1 * vio * 10.0 
+

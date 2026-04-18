@@ -21,7 +21,8 @@ class Trainer:
         self.lower_agents: Dict[str, D3QNAgent] = {}
 
         self.upper_state_dim = self.env.num_services * 2
-        self.lower_state_dim = 4 + len(self.env.computing_nodes) * 2
+        # State: omega, data_size, deadline, accuracy (4) + Service Backlogs (N) + Service CPU (N) + Global Backlogs (N) + Global CPU (N)
+        self.lower_state_dim = 4 + len(self.env.computing_nodes) * 4
         self.upper_u_action_dim = 1 << self.env.num_services
         self.upper_action_dim = self.env.num_services
         self.lower_action_dim = len(self.env.computing_nodes) + self.env.max_models_total
@@ -73,12 +74,22 @@ class Trainer:
                 batch_size=self.config.hyper_neural['BATCH_SIZE']
             )
 
-    def update_exploration_rates(self):
+    def update_exploration_rates(self, ep):
+        # Apply epsilon decay as usual
         for nid in self.epsilons:
             self.epsilons[nid] = max(self.min_epsilon, self.epsilons[nid] * self.epsilon_decay_factor)
-
         for tid in self.lower_epsilons:
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay_factor)
+            
+        # Linear growth for Zeta (Inverse Temperature) based on ANNEALING_LENGTH
+        annealing_len = self.config.hyper_neural.get("ANNEALING_LENGTH", 1500)
+        start_zeta = self.config.hyper_neural.get("ZETA", 1.0)
+        target_zeta = 15.0 # High value for strong exploitation
+        
+        if ep < annealing_len:
+            self.zeta = start_zeta + (target_zeta - start_zeta) * (ep / annealing_len)
+        else:
+            self.zeta = target_zeta
 
     def train(self):
         num_eps = self.config.hyper_neural['NUMOF_TRAIN_EP']
@@ -87,7 +98,7 @@ class Trainer:
 
         pbar = tqdm(range(num_eps), desc="Training")
         for ep in pbar:
-            self.update_exploration_rates()
+            self.update_exploration_rates(ep)
 
             while True:
                 if lower_state.get("new_frame"):
@@ -138,7 +149,10 @@ class Trainer:
                 # Still store history every episode for moving average consistency
                 pass
             
-            pbar.set_postfix({"reward": f"{self.aggregator.history['total_reward'][-1]:.2f}"})
+            pbar.set_postfix({
+                "reward": f"{self.aggregator.history['total_reward'][-1]:.2f}",
+                "zeta": f"{self.zeta:.2f}"
+            })
             
 
             upper_state= self.env.reset_upper()
@@ -249,9 +263,10 @@ class Trainer:
         prev_mfs: Dict[str, np.ndarray] = {}
 
         for tid, t in self.env.terminals.items():
-            task, backlogs, cpu_allocations, mf = states[tid]
+            # states[tid] now contains 6 elements: task, svc_backlogs, svc_cpu, mf, global_backlogs, global_cpu
+            task, backlogs, cpu_allocations, mf, global_backlogs, global_cpu = states[tid]
 
-            s = self.get_lower_state(task, backlogs, cpu_allocations)
+            s = self.get_lower_state(task, backlogs, cpu_allocations, global_backlogs, global_cpu)
 
             prev_states[tid] = s
             prev_mfs[tid] = mf
@@ -293,15 +308,24 @@ class Trainer:
 
         return final_mask
 
-    def get_lower_state(self, task, backlogs, cpu_allocations):
+    def get_lower_state(self, task, backlogs, cpu_allocations, global_backlogs=None, global_cpu=None):
         norm_d = task.total_data_size_mb / 400.0
         norm_deadline = (task.deadline - task.created_at) / 7.0
         norm_acc = task.min_accuracy / 100.0
+        
+        # Service-specific loads
         norm_backlogs = backlogs / 1000.0
         norm_resource_allocations = cpu_allocations / 4000.0
-        return np.concatenate(
-            [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations],
-            axis=-1)
+        
+        state_parts = [np.array([task.omega, norm_d, norm_deadline, norm_acc]), norm_backlogs, norm_resource_allocations]
+        
+        # Global node loads (cross-service awareness)
+        if global_backlogs is not None and global_cpu is not None:
+            norm_global_backlogs = global_backlogs / 5000.0 # Scale reflects total capacity
+            norm_global_cpu = global_cpu / 15000.0
+            state_parts.extend([norm_global_backlogs, norm_global_cpu])
+            
+        return np.concatenate(state_parts, axis=-1)
 
     def decode_lower_action_idx(self, lower_action_id: int):
         node_id = int(lower_action_id // self.env.max_models_total)
@@ -316,26 +340,33 @@ class Trainer:
         curr_states = lower_state.get("next_states")
         rewards: set= lower_state.get("rewards")
         curr_mfs: Dict[str, np.ndarray] = {}
-
         action_dict: Dict[str, Tuple[str, int]] = {action[0].terminal_id: (action[1], action[2]) for action in actions}
-        v_delays = lower_state.get("info", {}).get("virtual_delay", {})
 
+        # Get both service-specific virtual delays and global node backlogs
+        v_delays = lower_state.get("info", {}).get("virtual_delay", {})
+        global_backlogs = lower_state.get("next_states", {}).get(next(iter(self.env.terminals.keys())))[4] # Index 4 is total_backlog
+        
         for tid, t in self.env.terminals.items():
-            task, backlogs, cpu_allocations, curr_mf = curr_states[tid]
+            task, backlogs, cpu_allocations, curr_mf, g_backlogs, g_cpu = curr_states[tid]
             curr_mfs[tid] = curr_mf
             
-            s = self.get_lower_state(task, backlogs, cpu_allocations)
+            s = self.get_lower_state(task, backlogs, cpu_allocations, g_backlogs, g_cpu)
             
             target_node_id, _ = action_dict[tid]
-            # Use localized reward: Negative of the target node's virtual delay for this service
+            target_node_idx = self.env.node_id_dict[target_node_id]
+            
+            # Local service delay
             node_v_delay = v_delays.get(target_node_id, np.zeros(self.env.num_services))[task.service_id]
             
-            # Base reward is the negative delay
-            rw = - float(node_v_delay)
+            # Global node load (normalized) to force awareness of other services' contention
+            node_total_load = g_backlogs[target_node_idx] / 5000.0
+            
+            # Composite reward: service delay + global congestion penalty
+            rw = - (float(node_v_delay) + 0.5 * node_total_load)
             
             # Extra penalty if the task was dropped or failed QoS immediately
             if tid in rewards:
-                penalty = self.config.hyper_neural["OMEGA_Q1"] * 20.0 
+                penalty = self.config.hyper_neural.get("OMEGA_Q1", 1.0) * 20.0 
                 rw -= penalty
                 
             self.lower_agents[tid].store_transition(
