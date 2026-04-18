@@ -27,7 +27,8 @@ NEURON_NET:
     MF_HIDDEN_LAYER: [50, 50]
     DISCOUNT_FACTOR: 0.99
     UPDATE_TARGET_COEF: 0.01 # 0.005
-    ZETA: 1.0
+    ZETA: 0.5 # Start lower for more exploration
     EPSILON: 0.05 # 0.01
     EPSILON_DECAY: 0.995
+    BUFFER_MIN_SIZE: 1500 # Wait longer before training to ensure diverse state/action pairs
 

@@ -73,13 +73,14 @@ class DuelingNetwork(nn.Module):
 # ---D3QN AGENT ---
 class D3QNAgent:
     def __init__(self, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
-                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64, exclude_zero=False):
+                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64, buffer_min_size=1000, exclude_zero=False):
         self.action_dim = action_dim
         self.u_action_dim = u_action_dim # Store u_action_dim
         self.exclude_zero = exclude_zero
         self.gamma = gamma
         self.alpha = float(alpha)  # Ensure it is a scalar float
         self.batch_size = batch_size
+        self.buffer_min_size = buffer_min_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Evaluation Network, Target Network
@@ -151,8 +152,8 @@ class D3QNAgent:
         self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)
 
     def learn(self):
-        if len(self.memory) < self.batch_size:
-            return None  # dont enough data
+        if len(self.memory) < self.buffer_min_size:
+            return None  # Wait until enough data is gathered for better initialization
 
         # Sample data
         states, prev_mfs, curr_mfs, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)

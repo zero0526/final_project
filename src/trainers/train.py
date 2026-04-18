@@ -36,7 +36,8 @@ class Trainer:
         self.lower_epsilons = {tid: 1.0 for tid in self.env.terminals.keys()}
 
         self.zeta = cfg.hyper_neural.get("ZETA", 1.0)
-
+        
+        self.prev_node_loads: Dict[str, np.ndarray] = {} # Store previous backlogs for trend analysis
         self.service_id_node: Dict[int, List[str]] = {}
         self.aggregator = MetricsAggregator()
 
@@ -56,6 +57,7 @@ class Trainer:
                 alpha=float(self.config.hyper_neural['UPDATE_TARGET_COEF']),
                 buffer_size=self.config.hyper_neural['MEMORY_SIZE'],
                 batch_size=self.config.hyper_neural['BATCH_SIZE'],
+                buffer_min_size=self.config.hyper_neural.get('BUFFER_MIN_SIZE', 1000),
                 exclude_zero=True
             )
 
@@ -71,7 +73,8 @@ class Trainer:
                 gamma=self.config.hyper_neural['DISCOUNT_FACTOR'],
                 alpha=float(self.config.hyper_neural['UPDATE_TARGET_COEF']),
                 buffer_size=self.config.hyper_neural['MEMORY_SIZE'],
-                batch_size=self.config.hyper_neural['BATCH_SIZE']
+                batch_size=self.config.hyper_neural['BATCH_SIZE'],
+                buffer_min_size=self.config.hyper_neural.get('BUFFER_MIN_SIZE', 1000)
             )
 
     def update_exploration_rates(self, ep):
@@ -81,14 +84,23 @@ class Trainer:
         for tid in self.lower_epsilons:
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay_factor)
             
-        # Linear growth for Zeta (Inverse Temperature) based on ANNEALING_LENGTH
+        # Refined Zeta (Inverse Temperature) schedule: Warmup + Piecewise Linear growth
         annealing_len = self.config.hyper_neural.get("ANNEALING_LENGTH", 1500)
-        start_zeta = self.config.hyper_neural.get("ZETA", 1.0)
-        target_zeta = 15.0 # High value for strong exploitation
+        start_zeta = self.config.hyper_neural.get("ZETA", 0.5) # Lower start for more exploration
+        target_zeta = 15.0 
         
-        if ep < annealing_len:
-            self.zeta = start_zeta + (target_zeta - start_zeta) * (ep / annealing_len)
+        # Define a warmup phase (e.g., 10% of training or fixed 300 episodes)
+        warmup_eps = min(300, annealing_len // 3)
+        
+        if ep < warmup_eps:
+            # Phase 1: Exploration Warmup (Constant low zeta)
+            self.zeta = start_zeta
+        elif ep < annealing_len:
+            # Phase 2: Gradual Annealing
+            progress = (ep - warmup_eps) / (annealing_len - warmup_eps)
+            self.zeta = start_zeta + (target_zeta - start_zeta) * (progress ** 1.5) # Power law for slower start
         else:
+            # Phase 3: Exploitation
             self.zeta = target_zeta
 
     def train(self):
@@ -266,7 +278,7 @@ class Trainer:
             # states[tid] now contains 6 elements: task, svc_backlogs, svc_cpu, mf, global_backlogs, global_cpu
             task, backlogs, cpu_allocations, mf, global_backlogs, global_cpu = states[tid]
 
-            s = self.get_lower_state(task, backlogs, cpu_allocations, global_backlogs, global_cpu)
+            s = self.get_lower_state(task, backlogs, cpu_allocations, global_backlogs, global_cpu, tid)
 
             prev_states[tid] = s
             prev_mfs[tid] = mf
@@ -308,7 +320,7 @@ class Trainer:
 
         return final_mask
 
-    def get_lower_state(self, task, backlogs, cpu_allocations, global_backlogs=None, global_cpu=None):
+    def get_lower_state(self, task, backlogs, cpu_allocations, global_backlogs=None, global_cpu=None, terminal_id=None):
         norm_d = task.total_data_size_mb / 400.0
         norm_deadline = (task.deadline - task.created_at) / 7.0
         norm_acc = task.min_accuracy / 100.0
@@ -321,9 +333,20 @@ class Trainer:
         
         # Global node loads (cross-service awareness)
         if global_backlogs is not None and global_cpu is not None:
-            norm_global_backlogs = global_backlogs / 5000.0 # Scale reflects total capacity
+            norm_global_backlogs = global_backlogs / 5000.0 
             norm_global_cpu = global_cpu / 15000.0
-            state_parts.extend([norm_global_backlogs, norm_global_cpu])
+            
+            # --- TREND ANALYSIS ---
+            # Calculate Delta (Trend) of backlogs
+            if terminal_id in self.prev_node_loads:
+                # Delta = Current - Previous
+                load_delta = (global_backlogs - self.prev_node_loads[terminal_id]) / 1000.0
+            else:
+                load_delta = np.zeros_like(global_backlogs)
+            
+            self.prev_node_loads[terminal_id] = global_backlogs.copy()
+            
+            state_parts.extend([norm_global_backlogs, norm_global_cpu, load_delta])
             
         return np.concatenate(state_parts, axis=-1)
 
@@ -350,7 +373,7 @@ class Trainer:
             task, backlogs, cpu_allocations, curr_mf, g_backlogs, g_cpu = curr_states[tid]
             curr_mfs[tid] = curr_mf
             
-            s = self.get_lower_state(task, backlogs, cpu_allocations, g_backlogs, g_cpu)
+            s = self.get_lower_state(task, backlogs, cpu_allocations, g_backlogs, g_cpu, tid)
             
             target_node_id, _ = action_dict[tid]
             target_node_idx = self.env.node_id_dict[target_node_id]
@@ -358,11 +381,18 @@ class Trainer:
             # Local service delay
             node_v_delay = v_delays.get(target_node_id, np.zeros(self.env.num_services))[task.service_id]
             
-            # Global node load (normalized) to force awareness of other services' contention
+            # Global node load (normalized)
             node_total_load = g_backlogs[target_node_idx] / 5000.0
             
-            # Composite reward: service delay + global congestion penalty
-            rw = - (float(node_v_delay) + 0.5 * node_total_load)
+            # --- Proactive Congestion Penalty ---
+            # Non-linear penalty: heavy increase when load > 0.8
+            congestion_penalty = 0.5 * node_total_load
+            if node_total_load > 0.8:
+                # Add exponential penalty for high congestion (80% to 100%)
+                congestion_penalty += 2.0 * np.exp(5.0 * (node_total_load - 0.8))
+            
+            # Composite reward: service delay + proactive congestion
+            rw = - (float(node_v_delay) + congestion_penalty)
             
             # Extra penalty if the task was dropped or failed QoS immediately
             if tid in rewards:
