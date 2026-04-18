@@ -53,6 +53,8 @@ class ComputingNode:
 
         # Solver KKT
         self.config= config
+        if type_node in ["edge", "network", "cloud"]:
+            self.delay_queue_max= config.delay_queue_max[node_id]
         self.channel_model= channel_model
         self.ema= EMA()
 
@@ -138,6 +140,7 @@ class ComputingNode:
             return True
         return False
 
+    # need reset lower above to set up zero vec for popular_services_req
     def admit_task(self, task: Task, model_idx: int):
         """
         :param task:
@@ -183,7 +186,6 @@ class ComputingNode:
         tasks_to_keep = deque()
         tasks_to_remove= []
         for t in self.queues[s_id]:
-            # Nếu thời gian chờ vượt quá deadline -> Vứt bỏ
             if t.time_consume+ t.created_at > t.deadline:
                 violate_qos += 1
                 self.backlogs[s_id] -= t.remaining_workload_gflops
@@ -199,8 +201,6 @@ class ComputingNode:
 
     def process_timeslot(self, slot_duration):
         active_svcs = [sid for sid, active in enumerate(self.placed_services) if active]
-        violate_qos= defaultdict(int)
-        count_violate_qos= 0
         processed_tasks: List[Task]= []
         # collect task in service is not deploy overdue and add deadline
         for s_id in self.service_profiles:
@@ -209,97 +209,108 @@ class ComputingNode:
                 for t in self.queues[s_id]:
                     t.queue_delay += slot_duration
                 v_qos, tasks_to_remove = self.__clear_queue_task(s_id)
-                violate_qos[s_id]+=v_qos
-                count_violate_qos+=v_qos
                 processed_tasks.extend(tasks_to_remove)
         if not active_svcs:
-            return [], 0.0, 0.0, count_violate_qos, {}, {}, {}, violate_qos
+            return {
+                "backlogs": convert_dict_array(self.backlogs),
+                "f_alloc_vec": np.zeros(len(self.service_profiles)),
+                "f1_node": 0.0,
+                "energy": 0.0,
+                "lypa_punish": sum(a*self.backlogs[sid] for sid, a in self.slot_arrival_workload.items()),
+                "processed_tasks": processed_tasks
+            }
         #
         # print(f"\n--- [NODE {self.id}] TIMESLOT LOG (Duration: {slot_duration}s) ---")
         # print(f"    Available CPU: {self.cpu_capacity} GFLOPS")
         # allocation resource gpu
-        f_alloc_vec, slot_cold_times = self._compute_optimal_resources(
+        f_alloc_vec, slot_cold_times, all_zombies = self._compute_optimal_resources(
             active_svcs
         )
+        # Update violate_qos for zombies found during min requirement estimation
+        processed_tasks.extend(all_zombies)
         # execute task with resource is allocated above
         completed_tasks, total_energy, lypa_punish = self._execute_allocation(
             active_svcs, f_alloc_vec, slot_cold_times, slot_duration
         )
         processed_tasks.extend(completed_tasks)
-        local_F1= total_energy*self.config.lypa_coef + lypa_punish
-        count_violate_qos+=sum(1 for t in completed_tasks if not t.qos_status)
-        virtual_delay, realized_delay_avg, success_qos, violation_qos= self.render(processed_tasks, violate_qos)
         self.slot_arrival_workload = {}
 
-        return processed_tasks, total_energy, local_F1, count_violate_qos, virtual_delay, realized_delay_avg, success_qos, violation_qos
+        return {
+            "backlogs": convert_dict_array(self.backlogs),
+            "f_alloc_vec": f_alloc_vec,
+            "energy": total_energy,
+            "f1_node": self.config.lypa_coef*total_energy + lypa_punish,
+            "lypa_punish": sum(a * self.backlogs[sid] for sid, a in self.slot_arrival_workload.items()),
+            "processed_tasks": processed_tasks
+        }
 
-    def render(self, tasks: List[Task], violation_qos: Dict[int, int]):
-        success_qos = defaultdict(int)
-        virtual_delay = {}
-        realized_delay_queue = defaultdict(list)
-        realized_delay_avg = {}
-
-        for task in tasks:
-            if task.qos_status:
-                success_qos[task.service_id] += 1
+    def __remove_invalid_tasks(self, sid, invalid_tasks):
+        """
+        Remove tasks that are deemed invalid (will miss deadline) from the queue and backlogs.
+        """
+        if not invalid_tasks:
+            return 0
+        
+        invalid_ids = {t.id for t in invalid_tasks}
+        new_queue = deque()
+        removed_workload = 0
+        count = 0
+        for t in self.queues[sid]:
+            if t.id in invalid_ids:
+                removed_workload += t.remaining_workload_gflops
+                t.qos_status = False
+                count += 1
             else:
-                violation_qos[task.service_id] += 1
-            realized_delay_queue[task.service_id].append(task.queue_delay)
+                new_queue.append(t)
+        
+        self.queues[sid] = new_queue
+        self.backlogs[sid] = max(0.0, self.backlogs[sid] - removed_workload)
+        return count
 
-        for sid, r_delay in realized_delay_queue.items():
-            if r_delay:
-                realized_delay_avg[sid] = sum(r_delay) / len(r_delay)
-
-        for sid in self.service_profiles:
-            # virtual_delay = backlog (GFLOPS) / cpu_allocation (GFLOPS/s) = seconds
-            q_val = self.backlogs.get(sid, 0.0)
-            f_val = self.cpu_allocations.get(sid, 0.0)
-            virtual_delay[sid] = q_val / (f_val + 1e-8)
-
-        return virtual_delay, realized_delay_avg, success_qos, violation_qos
-
-    def _calculate_QoS(self, violate_qos: int)->float:
-        return self.config.hyper_neural["OMEGA_Q1"]*math.exp(violate_qos*self.config.hyper_neural["OMEGA_Q2"])
-
-    def __min_requirement_gpu(self, sid, expect_allocation):
-        # estimate by ignore overloading cause over deadline before computing process
-
-        t_cold_start, e_cold_start=0, 0
+    def __min_requirement_gpu(self, sid):
+        """
+        Estimate f_min based on deadline, transmission delay, and max allowable queue delay.
+        """
+        t_cold_start, e_cold_start = 0, 0
         if not self.service_profiles[sid].get("omega"):
-            t_cold_start= random.uniform(self.config.cold_start_time.get("min"), self.config.cold_start_time.get("max"))
-            e_cold_start= t_cold_start*self.config.cold_start_energy_coef
-        tasks= self.queues[sid]
-        delay=0
-        min_req=0
-        is_first= True
+            t_cold_start = random.uniform(self.config.cold_start_time.get("min"), self.config.cold_start_time.get("max"))
+            e_cold_start = t_cold_start * self.config.cold_start_energy_coef
+        
+        tasks = self.queues[sid]
+        min_req = 0
+        is_first = True
+        delay_q_max = self.delay_queue_max[sid]
+        invalid_tasks= []
         for task in tasks:
             if task.is_assigned:
                 if is_first:
                     task.trace_task({"cold_start_delay": t_cold_start,
                                      "cold_start_energy": e_cold_start})
-                    is_first= False
-                expected_computing_time = self.config.delay_coef*(task.deadline - task.created_at - task.time_consume -delay)
+                    is_first = False
+                
+                # Formula: deadline - created_at - transmission_delay - delay_queue_max
+                expected_computing_time = task.deadline - task.created_at - task.transmission_delay - delay_q_max - t_cold_start
 
                 if expected_computing_time < 1e-8:
-                    min_req= self.cpu_capacity
+                    invalid_tasks.append(task)
+                    continue
+                
+                cpu_require = task.remaining_workload_gflops / expected_computing_time
+                min_req = max(min_req, cpu_require)
+                if min_req >= self.cpu_capacity:
+                    min_req = self.cpu_capacity - 1e-6
                     break
-                cpu_require= task.remaining_workload_gflops/expected_computing_time
-                min_req= max(min_req, cpu_require)
-                if min_req >self.cpu_capacity:
-                    min_req= self.cpu_capacity -1e-6
-                    break
-                delay+= task.remaining_workload_gflops/(expect_allocation + 1e-8)
-        return min_req, t_cold_start
+        return min_req, t_cold_start, invalid_tasks
 
     def _compute_optimal_resources(self, active_svcs):
         num_active = len(active_svcs)
-        total_past_expectation = sum(self.expected_gpu_allocations[sid] for sid in active_svcs)
         
         g_vec = np.zeros(num_active)
         z_vec = np.zeros(num_active)
         f_min_vec = np.zeros(num_active)
         f_max_vec = np.zeros(num_active)
         slot_cold_times={}
+        all_invalid_tasks= []
         solver= KKTSolverADMM(f_max_node= self.cpu_capacity,rho=1.0, max_iter=100)
         for i, sid in enumerate(active_svcs):
             g_vec[i] = self.backlogs.get(sid, 0.0)
@@ -310,25 +321,16 @@ class ComputingNode:
 
             f_max_vec[i] = self.cpu_capacity
             
-            # Calculate temporary local expectation for this timeslot
-            if total_past_expectation > 1e-9:
-                loc_expect = (self.expected_gpu_allocations[sid] / total_past_expectation) * (self.cpu_capacity * 0.8)
-            else:
-                loc_expect = (self.cpu_capacity * 0.8) / num_active
-                
-            f_min_vec[i], cold_times = self.__min_requirement_gpu(sid, loc_expect)
+            f_min_vec[i], cold_times, invalid_tasks = self.__min_requirement_gpu(sid)
+            self.__remove_invalid_tasks(sid, invalid_tasks)
+            all_invalid_tasks.extend(invalid_tasks)
             slot_cold_times[sid] = cold_times
         f_alloc_vec_active = solver.solve(g_vec, z_vec, f_min_vec, f_max_vec)
         f_alloc_vec = np.zeros(len(self.service_profiles))
         for i, f in enumerate(f_alloc_vec_active):
             f_alloc_vec[active_svcs[i]] = f
 
-        for sid in active_svcs:
-            self.expected_gpu_allocations[sid] = self.ema.update(
-                f_alloc_vec[sid].item(),
-                self.expected_gpu_allocations[sid]
-            )
-        return f_alloc_vec, slot_cold_times
+        return f_alloc_vec, slot_cold_times, all_invalid_tasks
 
     def _execute_allocation(self, active_svcs, f_alloc_vec, slot_cold_times, slot_duration):
         total_energy = 0.0
@@ -405,8 +407,6 @@ class ComputingNode:
 
             for t in self.queues[sid]:
                 t.queue_delay += slot_duration
-        suc= sum(1 for t in completed_tasks if t.qos_status)
-        # print(f"    => Node Total Energy: {total_energy:.4f} J | Tasks Finished: {len(completed_tasks)} rate qos= {suc/len(completed_tasks) if completed_tasks else 0}")
         return completed_tasks, total_energy, lypa_punish
 
     def get_observation_state(self, sid: int):
@@ -417,5 +417,13 @@ class ComputingNode:
 
     def get_resource_data(self):
         return [self.placed_services, self.popularity_service, self.mean_field]
+
+def convert_dict_array(d: Dict)-> np.ndarray:
+    indices = list(d.keys())
+    values = list(d.values())
+    arr = np.zeros(max(indices)+1)
+    arr[indices] = values
+    return arr
+
 
 

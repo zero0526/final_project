@@ -40,20 +40,35 @@ class RunningNorm:
 class DuelingNetwork(nn.Module):
     def __init__(self, input_dim: int, action_dim: int, hidden_sizes: Tuple[int, ...]):
         super(DuelingNetwork, self).__init__()
-        # self.norm= RunningNorm(input_dim)
-        self.value_stream = FFN(input_size=input_dim, output_size=1, hidden_sizes=hidden_sizes)
-        self.advantage_stream = FFN(input_size=input_dim, output_size=action_dim, hidden_sizes=hidden_sizes)
+        # Shared Base Feature Extractor (FedRep Base)
+        self.base = nn.Sequential(
+            nn.Linear(input_dim, hidden_sizes[0]),
+            nn.ReLU()
+        )
+        # Personalized Heads (FedRep Heads)
+        self.value_stream = nn.Sequential(
+            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_sizes[1], 1)
+        )
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_sizes[1], action_dim)
+        )
 
     def forward(self, state, pred_mf):
         x = torch.cat([state, pred_mf], dim=-1)
-        # self.norm.update(x)
-        # x=self.norm.normalize(x)
-        V = self.value_stream(x)
-        A = self.advantage_stream(x)
+        features = self.base(x)
+        V = self.value_stream(features)
+        A = self.advantage_stream(features)
 
         # Q(s, a) = V(s) + (A(s, a) - mean(A(s, a)))
         Q = V + (A - A.mean(dim=1, keepdim=True))
         return Q
+
+    def get_base_params(self):
+        return list(self.base.parameters())
 
 # ---D3QN AGENT ---
 class D3QNAgent:
@@ -81,8 +96,23 @@ class D3QNAgent:
         self.loss_fn = nn.MSELoss()
 
         self.memory = ReplayBuffer(buffer_size, state_dim, action_dim, self.device)
+        
+        # SCAFFOLD Control Variates
+        self.c_i = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
+        self.c_edge = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
+        self.grad_sum = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
+        self.initial_base_params = []
+        self.steps_in_round = 0
+        self.save_base_initial()
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask:np.ndarray= None):
+    def save_base_initial(self):
+        """Save base weights at the start of a local round for SCAFFOLD."""
+        self.initial_base_params = [p.data.clone() for p in self.eval_net.get_base_params()]
+        for g in self.grad_sum:
+            g.zero_()
+        self.steps_in_round = 0
+
+    def choose_action(self, state, prev_mf, epsilon, zeta, mask:np.ndarray= None, assigned_node_id=None):
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         mf_tensor = torch.FloatTensor(prev_mf).unsqueeze(0).to(self.device)
 
@@ -116,7 +146,8 @@ class D3QNAgent:
                 q_values[:, 0] -= 1e18
                 
             action = q_values.argmax(dim=1)
-
+        if assigned_node_id:
+            pass
         return action.item()
 
     def learn_mf(self, state, prev_mf, ground_truth_mf):
@@ -165,8 +196,18 @@ class D3QNAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
+        
+        # SCAFFOLD Gradient Correction ONLY on Base Params
+        with torch.no_grad():
+            for p, g_sum, cp_i, cp_edge in zip(self.eval_net.get_base_params(), self.grad_sum, self.c_i, self.c_edge):
+                if p.grad is not None:
+                    raw_g = p.grad.data.clone()
+                    p.grad.data = raw_g - cp_i + cp_edge
+                    g_sum += raw_g
+
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
+        self.steps_in_round += 1
 
         # ---------------- SOFT UPDATE ----------------
         self._soft_update()

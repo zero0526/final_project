@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from collections import defaultdict
+from collections import defaultdict, deque
 import os
 
 class MetricsAggregator:
@@ -25,6 +25,9 @@ class MetricsAggregator:
 
         # Per-node per-service delays (realized)
         self.episode_node_service_delays = defaultdict(lambda: defaultdict(list))
+        
+        # Offloading flow matrix: [SourceNode][TargetNode] -> count
+        self.episode_offloading_matrix = defaultdict(lambda: defaultdict(int))
 
     def add_upper(self, step_output):
         """Adds data from an upper-level step."""
@@ -118,13 +121,13 @@ class MetricsAggregator:
         # Let's just NOT reset here, and instead reset at the start of add_upper if it's a new episode.
         # Or even better, reset at the end of report_episode.
 
-    def report_episode(self, ep):
+    def report_episode(self, ep, success_counts=None, failure_counts=None):
         """Prints a summary of the current episode."""
         upper_reward = np.mean(self.episode_upper_rewards) if self.episode_upper_rewards else 0
         lower_reward = np.mean(self.episode_lower_rewards) if self.episode_lower_rewards else 0
-        total_reward = self.history["total_reward"][-1]
-        energy = self.history["total_energy"][-1]
-        qos_success_rate = self.history["qos_success_rate"][-1]
+        total_reward = self.history["total_reward"][-1] if self.history["total_reward"] else 0
+        energy = self.history["total_energy"][-1] if self.history["total_energy"] else 0
+        qos_success_rate = self.history["qos_success_rate"][-1] if self.history["qos_success_rate"] else 0
         
         print(f"\n--- Episode {ep} Summary ---")
         print(f"Avg Upper Reward: {upper_reward:.4f}")
@@ -132,32 +135,74 @@ class MetricsAggregator:
         print(f"Total Reward:     {total_reward:.2f}")
         print(f"Total Energy:     {energy:.4f} J")
         print(f"QoS Success Rate: {qos_success_rate:.2%}")
-        print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1]:.2f}")
+        print(f"Avg Remaining Tasks: {self.history['avg_remaining_tasks'][-1] if self.history['avg_remaining_tasks'] else 0:.2f}")
 
         print("\n--- Average Delay per Node and Service ---")
         if not self.episode_node_service_delays:
             print("No delay data recorded for this episode.")
         else:
-            # Find the number of services from the first node's data
-            num_services = len(next(iter(self.episode_node_service_delays.values())))
-            header = "Node ID | " + " | ".join([f"Svc {i}" for i in range(num_services)])
-            print(header)
-            print("-" * len(header))
+            self._print_per_node_table(self.episode_node_service_delays, is_delay=True)
 
-            # Sort nodes for consistent output
-            for nid in sorted(self.episode_node_service_delays.keys()):
-                delays = self.episode_node_service_delays[nid]
-                row = f"{nid:<7} | "
-                svc_delays = []
-                for sid in sorted(delays.keys()):
-                    d_list = delays[sid]
-                    avg_d = np.mean(d_list) if d_list else 0.0
-                    svc_delays.append(f"{avg_d:7.4f}")
-                print(row + " | ".join(svc_delays))
+        if success_counts:
+            print("\n--- Successful Tasks count per Node and Service ---")
+            self._print_per_node_table(success_counts)
+
+        if failure_counts:
+            print("\n--- Failed Tasks count (Dropped/Overdue) per Node and Service ---")
+            self._print_per_node_table(failure_counts)
+
+        if self.episode_offloading_matrix:
+            print("\n--- Offloading Traffic Matrix (Source -> Target) ---")
+            self._print_traffic_matrix()
+
         print("---------------------------\n")
 
         # Reset episode data after reporting
         self.reset_episode()
+
+    def _print_per_node_table(self, data_dict, is_delay=False):
+        """Helper to print per-node per-service tables."""
+        # Find the number of services
+        sample_val = next(iter(data_dict.values()))
+        num_services = len(sample_val) if isinstance(sample_val, (list, np.ndarray)) else len(sample_val)
+        
+        header = "Node ID | " + " | ".join([f"Svc {i}" for i in range(num_services)])
+        print(header)
+        print("-" * len(header))
+
+        for nid in sorted(data_dict.keys()):
+            values = data_dict[nid]
+            row = f"{nid:<7} | "
+            fmt_values = []
+            for sid in range(num_services):
+                if is_delay:
+                    val = np.mean(values[sid]) if (isinstance(values[sid], (list, deque)) and len(values[sid]) > 0) else 0.0
+                    fmt_values.append(f"{val:7.4f}")
+                else:
+                    # For counts
+                    val = values[sid]
+                    fmt_values.append(f"{int(val):7}")
+            print(row + " | ".join(fmt_values))
+
+    def _print_traffic_matrix(self):
+        """Prints the [SourceNode][TargetNode] count matrix."""
+        # Get all source nodes and target nodes encountered
+        sources = sorted(self.episode_offloading_matrix.keys())
+        all_targets = set()
+        for s in sources:
+            all_targets.update(self.episode_offloading_matrix[s].keys())
+        targets = sorted(list(all_targets), key=lambda x: (len(x), x)) # Sort targets: N1, N2, N10...
+
+        header = "Src \\ Tgt | " + " | ".join([f"{t:<4}" for t in targets])
+        print(header)
+        print("-" * len(header))
+
+        for s in sources:
+            row = f"{s:<9} | "
+            counts = []
+            for t in targets:
+                counts.append(f"{self.episode_offloading_matrix[s][t]:4}")
+            print(row + " | ".join(counts))
 
     def _moving_average(self, data, window=50):
         if len(data) < window:

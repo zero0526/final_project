@@ -59,7 +59,7 @@ class Terminal:
         task_acc = [m.get('accuracy', 0.0) for m in svc_info['models']]
         mu = np.mean(task_acc)
         sigma = 0.1
-        min_acc_required = float(min(np.random.normal(mu, sigma), max(task_acc)))
+        min_acc_required = float(min(np.random.normal(0, mu), max(task_acc)))
         # 4. create Task
         task_id = f"T_{self.id}_{abs_current_time}"
         deadline = random.gauss(svc_info.get('mean_deadline'), svc_info.get('std_deadline'))

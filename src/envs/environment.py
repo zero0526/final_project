@@ -48,6 +48,8 @@ class SixGEnvironment:
 
         self.T = cfg.hyper_neural.get('TIME_SLOT_PER_TIMEFRAME', 10)
         self.frame_F1_accumulation: deque[float]= deque(maxlen=self.T)
+        self.episode_success_counts = defaultdict(lambda: np.zeros(self.num_services))
+        self.episode_failure_counts = defaultdict(lambda: np.zeros(self.num_services))
 
     def _init_nodes(self):
         for node in self.config.topology_data.get("nodes_data"):
@@ -118,6 +120,8 @@ class SixGEnvironment:
     def reset_upper(self):
         self.time_manager.reset()
         self.frame_F1_accumulation = deque(maxlen=self.T)
+        self.episode_success_counts.clear()
+        self.episode_failure_counts.clear()
         for node in self.nodes.values():
             if node.type in ["edge", "network", "cloud"]:
                 node.reset()
@@ -145,13 +149,17 @@ class SixGEnvironment:
         for node in self.computing_nodes:
             states[node.id]= (node.placed_services, node.popularity_service)
             mean_fields[node.id]= node.mean_field
+
         self.frame_F1_accumulation = deque(maxlen=self.T)
         for nid in self.agent_node_ids:
             if nid in actions:
+                if nid in ["N10", "N8"]:
+                    # print("kkkk")
+                    pass
                 self.nodes[nid].update_placement(actions[nid])
 
         return {
-            "reward": reward*1e-10,
+            "reward": reward,
             "next_states": states,
             "mean_fields": mean_fields,
             "done": self.time_manager.is_done(),
@@ -179,13 +187,14 @@ class SixGEnvironment:
         grouped_tasks = defaultdict(list)
         energy_dist={}
         f1_dist={}
+        processed_tasks= []
         rewards=set()
         # --- Assign tasks ---
         for task, node_idx, model_idx in assigned_tasks:
             node = self.nodes[node_idx]
             is_accepted= node.admit_task(task, model_idx)
             if not is_accepted:
-                v_qos += 1
+                processed_tasks.append(task)
                 rewards.add(task.terminal_id)
             grouped_tasks[task.source_node_id].append(
                 (
@@ -202,23 +211,53 @@ class SixGEnvironment:
         success_qos_info={}
         violate_qos_info={}
         for node in self.computing_nodes:
-            completed_tasks, total_energy, local_F1, violate_qos, virtual_delay, realized_delay_avg, success_qos, violation_qos = node.process_timeslot(
-                self.time_manager.slot_duration
-            )
-            for t in completed_tasks:
-                # CHỈ PHẠT NẾU TASK BỊ LỖI QOS (Trễ hạn/Drop)
-                if not t.qos_status:
+            data = node.process_timeslot(self.time_manager.slot_duration)
+            
+            node_processed = data.get("processed_tasks", [])
+            
+            # --- Extract/Calculate node metrics ---
+            success_qos = defaultdict(int)
+            violation_qos = defaultdict(int)
+            realized_delay_queue = defaultdict(list)
+            
+            for t in node_processed:
+                if t.qos_status:
+                    success_qos[t.service_id] += 1
+                else:
+                    violation_qos[t.service_id] += 1
                     rewards.add(t.terminal_id)
-            energy_dist[node.id]= total_energy
-            f1_dist[node.id]= local_F1
-            virtual_delay_info[node.id]= self.norm_service_vec(virtual_delay)
-            realized_delay_info[node.id]= self.norm_service_vec(realized_delay_avg)
-            success_qos_info[node.id]= self.norm_service_vec(success_qos)
-            violate_qos_info[node.id]= self.norm_service_vec(violation_qos)
-            all_tasks.extend(completed_tasks)
-            # rewards[node.]= -(local_F1 + calculate_rw(self.config.hyper_neural["OMEGA_Q1"], self.config.hyper_neural["OMEGA_Q2"], violate_qos))
+                realized_delay_queue[t.service_id].append(t.queue_delay)
+                
+            # Virtual delay: backlog / (cpu_allocation + 1e-8)
+            virtual_delay = {}
+            for sid in range(self.num_services):
+                q = node.backlogs.get(sid, 0.0)
+                f = node.cpu_allocations.get(sid, 0.0)
+                virtual_delay[sid] = q / (f + 1e-8)
+            
+            realized_delay_avg = {sid: (sum(delays)/len(delays) if delays else 0.0) 
+                                 for sid, delays in realized_delay_queue.items()}
+
+            local_energy = data.get("energy", 0.0)
+            local_F1 = data.get("f1_node", 0.0)
+            
+            energy_dist[node.id] = local_energy
+            f1_dist[node.id] = local_F1
+            
+            virtual_delay_info[node.id] = self.norm_service_vec(virtual_delay)
+            realized_delay_info[node.id] = self.norm_service_vec(realized_delay_avg)
+            success_qos_info[node.id] = self.norm_service_vec(success_qos)
+            violate_qos_info[node.id] = self.norm_service_vec(violation_qos)
+            
+            # --- Track raw counts for reporting ---
+            for sid, count in success_qos.items():
+                self.episode_success_counts[node.id][sid] += count
+            for sid, count in violation_qos.items():
+                self.episode_failure_counts[node.id][sid] += count
+                
+            all_tasks.extend(node_processed)
             f1 += local_F1
-            v_qos += violate_qos
+            v_qos += sum(violation_qos.values())
 
         # --- Mean-field (O(n)) ---
         mean_fields = {}
@@ -254,13 +293,12 @@ class SixGEnvironment:
 
         self.frame_F1_accumulation.append(f1)
         # --- Reward ---
-        # Linearize QoS penalty to avoid exponential explosion
-        # Reward = -f1 - OMEGA_Q1 * v_qos (scaled up to match F1 magnitude which is ~1e7)
-        qos_penalty = self.config.hyper_neural["OMEGA_Q1"] * v_qos * 1e6
+        # Linearize QoS penalty to avoid exponential explosion (e.g., billions of reward)
+        # We use a fixed penalty per task violation
+        qos_penalty = calculate_rw(self.config.hyper_neural["OMEGA_Q1"], self.config.hyper_neural["OMEGA_Q2"], v_qos)
         reward = -f1 - qos_penalty
-
-        # Optional: Scale reward to a smaller range for DQN stability
-        reward = reward * 1e-9
+        
+        # Clip reward to avoid extreme values and normalize learning signal
         next_observe_backlog, next_observe_cpu = self.collect_backlog_resources()
         self.time_manager.tick()
         next_states={}

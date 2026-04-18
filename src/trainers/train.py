@@ -115,8 +115,15 @@ class Trainer:
                 if lower_state.get("done"):
                     break
             
+            # Federated Edge Aggregation (SCAFFOLD + HierFAVG)
+            self.edge_aggregation()
+            
             self.aggregator.store_history()
-            self.aggregator.report_episode(ep)
+            self.aggregator.report_episode(
+                ep, 
+                success_counts=self.env.episode_success_counts, 
+                failure_counts=self.env.episode_failure_counts
+            )
             
             # Update plots and display every 300 episodes
             if (ep + 1) % 300 == 0:
@@ -136,6 +143,48 @@ class Trainer:
 
             upper_state= self.env.reset_upper()
             lower_state = self.env.reset_lower()
+
+    def edge_aggregation(self):
+        lr = self.config.hyper_neural['LOWER_LR']
+        for edge_id, terminals in self.env.terminals_group.items():
+            if not terminals: continue
+            
+            t_ids = [t.id for t in terminals]
+            agents = [self.lower_agents[tid] for tid in t_ids]
+            n_agents = len(agents)
+            
+            # Aggregate y_i (current local base params) -> x^+
+            global_base_params = []
+            for i in range(len(agents[0].eval_net.get_base_params())):
+                avg_p = sum(a.eval_net.get_base_params()[i].data.clone() for a in agents) / n_agents
+                global_base_params.append(avg_p)
+                
+            # Aggregate c_i -> c_edge^+
+            c_edge_new = []
+            for i in range(len(agents[0].c_i)):
+                c_edge_new.append(sum(a.c_i[i].clone() for a in agents) / n_agents)
+                
+            # Update c_i for each agent and load new global params
+            for agent in agents:
+                local_base = agent.eval_net.get_base_params()
+                init_base = agent.initial_base_params
+                K = agent.steps_in_round if agent.steps_in_round > 0 else 1
+                
+                for i in range(len(local_base)):
+                    # Exact SCAFFOLD update: c_i^+ = c_i - c_edge + \frac{1}{K} \sum raw_gradient
+                    avg_raw_grad = agent.grad_sum[i] / K
+                    delta_c = avg_raw_grad
+                    agent.c_i[i] = agent.c_i[i] - agent.c_edge[i] + delta_c
+                    
+                    # Load glob_p
+                    local_base[i].data.copy_(global_base_params[i])
+                    # Update target net as well since base is shared
+                    target_base = agent.target_net.get_base_params()
+                    target_base[i].data.copy_(global_base_params[i])
+                
+                # Setup c_edge and initial_base for next round
+                agent.c_edge = [ce.clone() for ce in c_edge_new]
+                agent.save_base_initial()
 
     def placement_service(self, upper_state):
         all_states = upper_state.get("next_states")
@@ -207,11 +256,14 @@ class Trainer:
             prev_states[tid] = s
             prev_mfs[tid] = mf
             mask = self.get_action_mask(task)
-            action_id = self.lower_agents[tid].choose_action(s, mf, self.lower_epsilons[tid], self.zeta, mask)
+            action_id = self.lower_agents[tid].choose_action(s, mf, self.lower_epsilons[tid], self.zeta, mask, task.assigned_node_id)
 
             node_id, model_id = self.decode_lower_action_idx(action_id)
             actions.append((task, node_id, model_id))
-
+            
+            # Record offloading flow for reporting
+            self.aggregator.episode_offloading_matrix[task.source_node_id][node_id] += 1
+            
         return actions, prev_states, prev_mfs
 
     def get_action_mask(self, task):
@@ -265,7 +317,8 @@ class Trainer:
         rewards: set= lower_state.get("rewards")
         curr_mfs: Dict[str, np.ndarray] = {}
 
-        action_dict: Dict[str, Tuple[int, int]] = {action[0].terminal_id: (action[1], action[2]) for action in actions}
+        action_dict: Dict[str, Tuple[str, int]] = {action[0].terminal_id: (action[1], action[2]) for action in actions}
+        v_delays = lower_state.get("info", {}).get("virtual_delay", {})
 
         for tid, t in self.env.terminals.items():
             task, backlogs, cpu_allocations, curr_mf = curr_states[tid]
@@ -273,12 +326,17 @@ class Trainer:
             
             s = self.get_lower_state(task, backlogs, cpu_allocations)
             
-            # The penalty base
-            penalty = self.config.hyper_neural["OMEGA_Q1"] * 0.05
+            target_node_id, _ = action_dict[tid]
+            # Use localized reward: Negative of the target node's virtual delay for this service
+            node_v_delay = v_delays.get(target_node_id, np.zeros(self.env.num_services))[task.service_id]
+            
+            # Base reward is the negative delay
+            rw = - float(node_v_delay)
+            
+            # Extra penalty if the task was dropped or failed QoS immediately
             if tid in rewards:
-                rw = lower_state.get("reward") - penalty
-            else:
-                rw = lower_state.get("reward") + penalty
+                penalty = self.config.hyper_neural["OMEGA_Q1"] * 20.0 
+                rw -= penalty
                 
             self.lower_agents[tid].store_transition(
                 prev_states[tid],
@@ -293,4 +351,5 @@ class Trainer:
 
 if __name__ == "__main__":
     trainer = Trainer()
+    trainer.env.step_upper({trainer.env.invert_node_id[2]: np.array([1,1,1,0])})
     trainer.train()
