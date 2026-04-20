@@ -1,12 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from typing import Tuple
-
-from torch.distributions import Categorical
-
+from src.agents.Temprature import TemperatureScheduler
 from src.agents.ffn import FFN
 from src.agents.ReplayBuffer import ReplayBuffer
 
@@ -104,6 +101,7 @@ class D3QNAgent:
         self.grad_sum = [torch.zeros_like(p).to(self.device) for p in self.eval_net.get_base_params()]
         self.initial_base_params = []
         self.steps_in_round = 0
+        self.scheduler= TemperatureScheduler()
         self.save_base_initial()
 
     def save_base_initial(self):
@@ -136,7 +134,13 @@ class D3QNAgent:
             # Boltzmann Selection (Softmax with temperature parameter zeta)
             # P(a) = exp(zeta * Q_a) / sum(exp(zeta * Q_i))
             # We use torch.softmax on (zeta * Q) for numerical stability.
+            T = self.scheduler.T
+            zeta = 1.0 / T
+            zeta = np.clip(zeta, 0.1, 10.0)
             scaled_q = q_values * zeta
+
+            scaled_q = scaled_q - scaled_q.max(dim=1, keepdim=True)[0]
+
             probs = torch.softmax(scaled_q, dim=1).cpu().numpy().squeeze()
             
             # Weighted random selection based on Boltzmann probabilities
@@ -145,7 +149,6 @@ class D3QNAgent:
         return int(action)
 
     def learn_mf(self, state, prev_mf, ground_truth_mf):
-        # We now train MF network via Minibatch in learn() to avoid noisy Batch=1 updates
         pass
 
     def store_transition(self, state, prev_mf, curr_mf, action, reward, next_state, done):
@@ -153,22 +156,22 @@ class D3QNAgent:
 
     def learn(self):
         if len(self.memory) < self.buffer_min_size:
-            return None  # Wait until enough data is gathered for better initialization
+            return None
 
-        # Sample data
-        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones = \
+            self.memory.sample(self.batch_size)
 
         # ---------------- TRAIN MF NETWORK ----------------
         mf_input = torch.cat([states, prev_mfs], dim=-1)
         pred_curr_mfs = self.mf_net(mf_input)
         mf_loss = self.loss_fn(pred_curr_mfs, curr_mfs)
-        
+
         self.mf_optimizer.zero_grad()
         mf_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=1.0)
         self.mf_optimizer.step()
 
-        # ---------------- DOUBLE DQN LOGIC ----------------
+        # ---------------- DOUBLE DQN ----------------
         pred_mfs_detached = pred_curr_mfs.detach()
         q_eval = self.eval_net(states, pred_mfs_detached).gather(1, actions)
 
@@ -177,23 +180,24 @@ class D3QNAgent:
             next_pred_mfs = self.mf_net(next_mf_input)
 
             next_actions = self.eval_net(next_states, next_pred_mfs).argmax(dim=1, keepdim=True)
-
-            # Bước 2: Đánh giá action đó bằng Target Network (Phương trình 47)
             q_next = self.target_net(next_states, next_pred_mfs).gather(1, next_actions)
 
-            # y = r + gamma * Q_target(s', argmax Q_eval(s', a'))
             q_target = rewards + self.gamma * q_next * (1 - dones)
 
-        # ---------------- LOSS & BACKPROP ----------------
-        # Phương trình (48): L = MSE(Q_eval, y)
+        # ---------------- LOSS ----------------
         loss = self.loss_fn(q_eval, q_target)
 
         self.optimizer.zero_grad()
         loss.backward()
-        
-        # SCAFFOLD Gradient Correction ONLY on Base Params
+
+        # ---------------- SCAFFOLD ----------------
         with torch.no_grad():
-            for p, g_sum, cp_i, cp_edge in zip(self.eval_net.get_base_params(), self.grad_sum, self.c_i, self.c_edge):
+            for p, g_sum, cp_i, cp_edge in zip(
+                    self.eval_net.get_base_params(),
+                    self.grad_sum,
+                    self.c_i,
+                    self.c_edge
+            ):
                 if p.grad is not None:
                     raw_g = p.grad.data.clone()
                     p.grad.data = raw_g - cp_i + cp_edge
@@ -201,11 +205,22 @@ class D3QNAgent:
 
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
         self.optimizer.step()
+
         self.steps_in_round += 1
 
-        # ---------------- SOFT UPDATE ----------------
+        # ---------------- TARGET UPDATE ----------------
         self._soft_update()
 
+        td_error = loss.item()
+        reward_mean = rewards.mean().item()
+
+        self.scheduler.step(td_error, reward_mean)
+
+        if self.steps_in_round % 100 == 0:
+            print(f"T={self.scheduler.T:.3f}, zeta={1 / self.scheduler.T:.3f}, TD={td_error:.4f}")
+        if torch.max(td_error) > 1e6 or not torch.isfinite(td_error).all():
+            print("⚠️ Skip batch: TD exploded")
+            return None
         return loss.item()
 
     def _soft_update(self):

@@ -168,7 +168,7 @@ class SixGEnvironment:
                 self.nodes[nid].update_placement(actions[nid])
 
         return {
-            "reward": reward,
+            "reward": reward*1e-6,
             "next_states": states,
             "mean_fields": mean_fields,
             "done": self.time_manager.is_done(),
@@ -315,7 +315,7 @@ class SixGEnvironment:
         reward = -(f1 + qos_penalty) * reward_scale
         
         # Clip reward to avoid extreme outliers and focus on meaningful differences
-        reward = float(np.clip(reward, -200.0, 500.0))
+        reward = float(np.clip(reward, -500.0, 500.0))
         
         next_observe_backlog, next_observe_cpu, total_backlog, total_cpu = self.collect_backlog_resources()
         self.time_manager.tick()
@@ -388,7 +388,5 @@ def encoding(max_models, num_node, node_id, model_id):
     return vec
 
 def calculate_rw(ome_1, ome_2, vio:int):
-    # Redesigned as a strong linear penalty to avoid exponential explosion (Billions)
-    # While still providing a distinct gradient for the number of violations.
     return ome_1 * vio * 10.0 
 

@@ -21,8 +21,8 @@ class Trainer:
         self.lower_agents: Dict[str, D3QNAgent] = {}
 
         self.upper_state_dim = self.env.num_services * 2
-        # State: omega, data_size, deadline, accuracy (4) + Service Backlogs (N) + Service CPU (N) + Global Backlogs (N) + Global CPU (N)
-        self.lower_state_dim = 4 + len(self.env.computing_nodes) * 4
+        # State: omega, data_size, deadline, accuracy (4) + Service Backlogs (N) + Service CPU (N) + Global Backlogs (N) + Global CPU (N) + Load Delta (N)
+        self.lower_state_dim = 4 + len(self.env.computing_nodes) * 5
         self.upper_u_action_dim = 1 << self.env.num_services
         self.upper_action_dim = self.env.num_services
         self.lower_action_dim = len(self.env.computing_nodes) + self.env.max_models_total
@@ -84,12 +84,12 @@ class Trainer:
         for tid in self.lower_epsilons:
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay_factor)
             
-        # Refined Zeta (Inverse Temperature) schedule: Warmup + Piecewise Linear growth
+        # Temperature schedule: Warmup + Piecewise Linear growth
         annealing_len = self.config.hyper_neural.get("ANNEALING_LENGTH", 1500)
-        start_zeta = self.config.hyper_neural.get("ZETA", 0.5) # Lower start for more exploration
+        start_zeta = self.config.hyper_neural.get("ZETA", 0.5)
         target_zeta = 15.0 
         
-        # Define a warmup phase (e.g., 10% of training or fixed 300 episodes)
+        #warmup phase
         warmup_eps = min(300, annealing_len // 3)
         
         if ep < warmup_eps:
@@ -98,7 +98,7 @@ class Trainer:
         elif ep < annealing_len:
             # Phase 2: Gradual Annealing
             progress = (ep - warmup_eps) / (annealing_len - warmup_eps)
-            self.zeta = start_zeta + (target_zeta - start_zeta) * (progress ** 1.5) # Power law for slower start
+            self.zeta = start_zeta + (target_zeta - start_zeta) * (progress ** 1.5)
         else:
             # Phase 3: Exploitation
             self.zeta = target_zeta
