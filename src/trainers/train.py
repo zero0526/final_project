@@ -45,6 +45,7 @@ class Trainer:
     def __init_agents(self):
         for i in self.env.agent_node_ids:
             self.upper_agents[i] = D3QNAgent(
+                node_id= i, node_type=self.env.nodes[i].type,
                 state_dim=self.upper_state_dim,
                 action_dim=self.upper_action_dim,
                 u_action_dim= self.upper_u_action_dim,
@@ -61,6 +62,7 @@ class Trainer:
 
         for t in self.env.terminals.keys():
             self.lower_agents[t] = D3QNAgent(
+                node_id=t, node_type="Terminal",
                 state_dim=self.lower_state_dim,
                 action_dim=self.lower_action_dim,
                 u_action_dim=self.lower_u_action_dim,

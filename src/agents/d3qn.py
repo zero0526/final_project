@@ -72,7 +72,7 @@ class DuelingNetwork(nn.Module):
 
 # ---D3QN AGENT ---
 class D3QNAgent:
-    def __init__(self, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
+    def __init__(self, node_id:str, node_type: str, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
                  lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64, exclude_zero=False):
         self.action_dim = action_dim
         self.u_action_dim = u_action_dim # Store u_action_dim
@@ -81,7 +81,8 @@ class D3QNAgent:
         self.alpha = float(alpha)  # Ensure it is a scalar float
         self.batch_size = batch_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+        self.node_id= node_id
+        self.node_type = node_type
         # Evaluation Network, Target Network
         input_dim = state_dim + action_dim
         self.eval_net = DuelingNetwork(input_dim, u_action_dim, hidden_sizes).to(self.device)
@@ -104,6 +105,10 @@ class D3QNAgent:
         self.initial_base_params = []
         self.steps_in_round = 0
         self.save_base_initial()
+        
+        # Logging state
+        self.prev_loss = 0.0
+        self.learn_step_counter = 0
 
     def save_base_initial(self):
         """Save base weights at the start of a local round for SCAFFOLD."""
@@ -199,8 +204,20 @@ class D3QNAgent:
                     g_sum += raw_g
 
         torch.nn.utils.clip_grad_norm_(self.eval_net.parameters(), max_norm=1.0)
-        self.optimizer.step()
         self.steps_in_round += 1
+        self.optimizer.step()
+        
+        # ---------------- LOGGING ----------------
+        loss_val = loss.item()
+        avg_q = q_eval.mean().item()
+        loss_change = loss_val - self.prev_loss
+        self.prev_loss = loss_val
+        self.learn_step_counter += 1
+
+        # Log every 100 learning steps to avoid console flooding
+        if self.learn_step_counter % 100 == 0:
+            print(f"[Agent {self.node_id} ({self.node_type})] Update {self.learn_step_counter:5d} | "
+                  f"Avg Q: {avg_q:8.3f} | TD Loss: {loss_val:8.5f} | ΔLoss: {loss_change:9.5f}")
 
         # ---------------- SOFT UPDATE ----------------
         self._soft_update()
