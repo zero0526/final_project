@@ -4,8 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from typing import Tuple
-
-from torch.distributions import Categorical
+from configs.configs import cfg
 
 from src.agents.ffn import FFN
 from src.agents.ReplayBuffer import ReplayBuffer
@@ -73,7 +72,7 @@ class DuelingNetwork(nn.Module):
 # ---D3QN AGENT ---
 class D3QNAgent:
     def __init__(self, node_id:str, node_type: str, state_dim, action_dim, u_action_dim: int, mf_hidden_sizes: Tuple[int, ...],mf_lr:float, hidden_sizes=(128, 64),
-                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64, exclude_zero=False):
+                 lr=1e-4, gamma=0.99, alpha=0.005, buffer_size=cfg.hyper_neural["MEMORY_SIZE"], min_buffers= cfg.hyper_neural["BUFFER_MIN_SIZE"], batch_size=64, exclude_zero=False):
         self.action_dim = action_dim
         self.u_action_dim = u_action_dim # Store u_action_dim
         self.exclude_zero = exclude_zero
@@ -83,6 +82,7 @@ class D3QNAgent:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.node_id= node_id
         self.node_type = node_type
+        self.min_buffers= min_buffers[1] if node_type != "terminal" else min_buffers[0]
         # Evaluation Network, Target Network
         input_dim = state_dim + action_dim
         self.eval_net = DuelingNetwork(input_dim, u_action_dim, hidden_sizes).to(self.device)
@@ -156,7 +156,7 @@ class D3QNAgent:
         self.memory.add(state, prev_mf, curr_mf, action, reward, next_state, done)
 
     def learn(self):
-        if len(self.memory) < self.batch_size:
+        if len(self.memory) < self.min_buffers:
             return None  # dont enough data
 
         # Sample data
