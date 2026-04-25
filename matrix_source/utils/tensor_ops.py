@@ -2,23 +2,17 @@ import torch
 
 import torch
 
-def compute_batch_energy(f_alloc, processed_workload, energy_coef, placement_matrix, omega, epsilon_cold=0.5):
+def compute_batch_energy(f_alloc, processed_workload, energy_coef, newly_placed_mask, omega, epsilon_cold=0.5):
     """
     Tính toán năng lượng tiêu thụ (Computation Energy).
-    f_alloc: (M, S)
-    processed_workload: (M, S)
-    energy_coef: scalar or (M, 1)
-    placement_matrix: (M, S) - Trạng thái đặt chỗ hiện tại
-    omega: (S, 1) - Loại service (1: Continuous, 0: Occasional)
+    newly_placed_mask: (M, S) - 1 nếu service mới được đặt/kích hoạt tại node
     """
     # 1. Dynamic Energy: E = epsilon * workload * f^2
     dynamic_energy = energy_coef * processed_workload * (f_alloc ** 2)
     
-    # 2. Cold Start Energy (Chỉ cho Occasional services omega == 0 và mới được đặt f > 0)
-    # Giả định placement_matrix đã được cập nhật. Nếu placement == 1 nhưng omega == 0, 
-    # ta có thể coi là tốn thêm năng lượng khởi chạy (đơn giản hóa).
-    cold_start_mask = (placement_matrix == 1) * (omega.T == 0)
-    cold_start_energy = cold_start_mask.float() * epsilon_cold
+    # 2. Cold Start Energy (Chỉ cho Occasional services omega == 0 và mới được kích hoạt)
+    cold_start_event = newly_placed_mask * (omega.T == 0)
+    cold_start_energy = cold_start_event.float() * epsilon_cold
     
     return dynamic_energy.sum() + cold_start_energy.sum()
 
@@ -36,20 +30,15 @@ def compute_transmission_metrics(src_nodes, dst_nodes, delay_matrix, data_sizes,
     
     return trans_delays, trans_energy
 
-def calculate_qos_violations(backlog, cpu_alloc, deadlines, max_queue_delay):
+def calculate_qos_violations(backlog, cpu_alloc, deadlines, max_queue_delay, cold_start_mask, cold_start_delay=0.5):
     """
     Kiểm tra vi phạm deadline theo lô.
-    backlog: (M, S)
-    cpu_alloc: (M, S)
-    deadlines: (1, S) or (M, S)
-    max_queue_delay: (M, S)
+    cold_start_mask: (M, S) - 1 nếu task đang chịu cold start
     """
-    # Ước lượng delay hiện tại: queue_delay + comp_delay
-    # queue_delay = backlog / (cpu_alloc + 1e-6)
-    est_delay = backlog / (cpu_alloc + 1e-6)
+    # est_delay = queue_delay + computation_delay + cold_start_delay
+    computation_delay = backlog / (cpu_alloc + 1e-6)
+    est_delay = computation_delay + (cold_start_mask * cold_start_delay)
     
-    # Vi phạm nếu est_delay > (deadline - transmission - queue_max) 
-    # Hoặc đơn giản là vượt quá ngưỡng deadline
     violation_mask = est_delay > deadlines
     return violation_mask.float().sum()
 

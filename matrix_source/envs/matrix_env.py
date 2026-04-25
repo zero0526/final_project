@@ -38,6 +38,8 @@ class MatrixSixGEnvironment:
         self.backlog_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.cpu_alloc_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.prev_placement_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.newly_placed_mask = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.mean_field_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.used_resources = torch.zeros((self.num_nodes, 2), device=self.device) # [RAM, HDD]
         
@@ -56,11 +58,15 @@ class MatrixSixGEnvironment:
         # Constants
         self.lypa_coef = config.get('lypa_coef', 1e-7)
         self.energy_coef = config.get('energy_coef', 5e-10)
+        self.cold_start_delay = config.get('cold_start_delay', 0.5)
+        self.energy_cold_start = config.get('energy_cold_start', 0.5)
 
     def reset(self):
         self.backlog_matrix.zero_()
         self.cpu_alloc_matrix.zero_()
         self.placement_matrix.zero_()
+        self.prev_placement_matrix.zero_()
+        self.newly_placed_mask.zero_()
         self.mean_field_matrix.zero_()
         self.used_resources.zero_()
         self.time_manager.reset()
@@ -70,6 +76,8 @@ class MatrixSixGEnvironment:
         terminal_indices, svc_indices: Task info from WorkloadGenerator
         node_indices, model_indices: Decisions from Lower-level Agent
         """
+        # newly_placed_mask is maintained from step_upper for the entire timeframe
+
         # 1. Determine Source Nodes and Transmission Metrics
         num_tasks = len(svc_indices)
         trans_energy_total = 0.0
@@ -91,10 +99,15 @@ class MatrixSixGEnvironment:
             node_arrival_matrix.index_put_((node_indices, svc_indices), task_workloads, accumulate=True)
             self.backlog_matrix.index_put_((node_indices, svc_indices), task_workloads, accumulate=True)
 
-            # 3. Refined f_min Calculation
+            # 3. Refined f_min Calculation (With Cold Start Delay)
             task_mean_deadlines = self.service_deadlines[svc_indices, 2] 
             task_max_queue = self.max_queue_delay[node_indices, svc_indices]
-            t_rem = (task_mean_deadlines - trans_delays - task_max_queue).clamp(min=0.01)
+            
+            # Task-specific cold start delay if service is newly placed and omega=0
+            # newly_placed_mask is persistent for the timeframe
+            task_cold_start = self.newly_placed_mask[node_indices, svc_indices] & (self.service_omega[svc_indices].squeeze() == 0)
+            
+            t_rem = (task_mean_deadlines - trans_delays - task_max_queue - (task_cold_start * self.cold_start_delay)).clamp(min=0.01)
             f_req_per_task = task_workloads / t_rem
             
             f_min_matrix = torch.zeros_like(self.backlog_matrix)
@@ -105,7 +118,6 @@ class MatrixSixGEnvironment:
 
         # 4. OPTIMIZE RESOURCE ALLOCATION (ADMM)
         G = self.backlog_matrix * self.placement_matrix
-        # Z according to Eq (24): Weights for new arrivals
         Z = self.lypa_coef * self.energy_coef * self.placement_matrix * node_arrival_matrix
 
         f_max = (self.resource_specs[:, 0:1] * self.placement_matrix)
@@ -118,14 +130,17 @@ class MatrixSixGEnvironment:
         
         # QoS & Drift
         mean_deadlines = self.service_deadlines[:, 2].unsqueeze(0)
-        num_violations = ops.calculate_qos_violations(self.backlog_matrix, self.cpu_alloc_matrix, mean_deadlines, self.max_queue_delay)
+        num_violations = ops.calculate_qos_violations(
+            self.backlog_matrix, self.cpu_alloc_matrix, mean_deadlines, self.max_queue_delay,
+            cold_start_mask=self.newly_placed_mask, cold_start_delay=self.cold_start_delay
+        )
         total_drift = ops.calculate_lyapunov_drift(self.backlog_matrix, node_arrival_matrix, processed_workload)
 
         self.backlog_matrix = ops.update_backlog(self.backlog_matrix, torch.zeros_like(node_arrival_matrix), processed_workload)
         
         comp_energy = ops.compute_batch_energy(
             self.cpu_alloc_matrix, processed_workload, self.energy_coef, 
-            self.placement_matrix, self.service_omega
+            self.newly_placed_mask, self.service_omega, epsilon_cold=self.energy_cold_start
         )
         total_energy = comp_energy + trans_energy_total
         
@@ -142,42 +157,27 @@ class MatrixSixGEnvironment:
             "new_frame": self.time_manager.is_new_frame()
         }
 
-    def _calculate_energy(self, processed):
-        # E = epsilon * workload * f^2
-        # Simplified vectorized energy:
-        energy_matrix = self.energy_coef * processed * (self.cpu_alloc_matrix ** 2)
-        return energy_matrix.sum()
-
     def step_upper(self, placement_actions):
         """
         placement_actions: (M, S) - Binary matrix of desired placement.
         """
-        # 1. Reset resource usage
+        # 1. Store current as previous
+        self.prev_placement_matrix = self.placement_matrix.clone()
+        
+        # 2. Reset resource usage
         self.used_resources.zero_()
         
-        # 2. Check resource constraints (Vectorized)
-        # RAM/HDD requirements for current placement
-        # service_resource_req: (S, 2) [RAM, HDD]
-        # total_req: (M, 2) = placement_actions @ service_resource_req
+        # 3. Check resource constraints (Vectorized)
         total_req = torch.matmul(placement_actions.to(self.device), self.service_resource_req)
-        
-        # Capacity constraint: total_req <= resource_specs[:, 1:3]
-        # resource_specs: (M, 3) [CPU, RAM, HDD]
         capacities = self.resource_specs[:, 1:3]
-        
-        # valid_mask: (M,) - True if node can host the proposed services
-        # In multi-service environment, we might need a more granular check (service-by-service), 
-        # but for simplicity, if a node's total exceeds capacity, we clip or reject.
-        # Here we valid if ALL resources are within capacity.
         can_host = (total_req <= capacities).all(dim=1)
         
-        # Update placement matrix: only nodes that can host get their new placement
-        # This is a simplified logic (reject all if one fails) - can be refined to be service-specific.
+        # 4. Update placement matrix
         self.placement_matrix = placement_actions * can_host.unsqueeze(1)
         self.used_resources = total_req * can_host.unsqueeze(1)
         
-        # 3. Update Mean Field
-        # Note: adj_matrix should be passed or pre-stored.
+        # 5. Maintain newly_placed_mask for the duration of this timeframe
+        self.newly_placed_mask = (self.placement_matrix == 1) & (self.prev_placement_matrix == 0)
         
         return {
             "placement": self.placement_matrix.clone(),
