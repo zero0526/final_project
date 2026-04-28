@@ -1,6 +1,7 @@
 from src.configs.configs import cfg
-
+from trainers.train import  Trainer
 if __name__ == '__main__':
-    print('PyCharm' + cfg.topology)
+    trainer= Trainer()
+    trainer.train()
 
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
