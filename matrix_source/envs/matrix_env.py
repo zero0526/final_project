@@ -60,6 +60,7 @@ class MatrixSixGEnvironment:
         self.energy_coef = config.get('energy_coef', 5e-10)
         self.cold_start_delay = config.get('cold_start_delay', 0.5)
         self.energy_cold_start = config.get('energy_cold_start', 0.5)
+        self.immediate_fails = 0
 
     def reset(self):
         self.backlog_matrix.zero_()
@@ -69,6 +70,7 @@ class MatrixSixGEnvironment:
         self.newly_placed_mask.zero_()
         self.mean_field_matrix.zero_()
         self.used_resources.zero_()
+        self.immediate_fails = 0
         self.time_manager.reset()
 
     def step_lower(self, terminal_indices, svc_indices, node_indices, model_indices):
@@ -94,12 +96,8 @@ class MatrixSixGEnvironment:
             )
             trans_energy_total = trans_energy_tasks.sum()
 
-            # 2. Add workload (Assignment phase)
+            # 2. Refined f_min Calculation & Filter Impossible Tasks
             task_workloads = self.model_workloads[svc_indices, model_indices]
-            node_arrival_matrix.index_put_((node_indices, svc_indices), task_workloads, accumulate=True)
-            self.backlog_matrix.index_put_((node_indices, svc_indices), task_workloads, accumulate=True)
-
-            # 3. Refined f_min Calculation (With Cold Start Delay)
             task_mean_deadlines = self.service_deadlines[svc_indices, 2] 
             task_max_queue = self.max_queue_delay[node_indices, svc_indices]
             
@@ -107,13 +105,28 @@ class MatrixSixGEnvironment:
             # newly_placed_mask is persistent for the timeframe
             task_cold_start = self.newly_placed_mask[node_indices, svc_indices] & (self.service_omega[svc_indices].squeeze() == 0)
             
-            t_rem = (task_mean_deadlines - trans_delays - task_max_queue - (task_cold_start * self.cold_start_delay)).clamp(min=0.01)
-            f_req_per_task = task_workloads / t_rem
+            t_rem_raw = task_mean_deadlines - trans_delays - task_max_queue - (task_cold_start * self.cold_start_delay)
+            
+            # Các task quá sát deadline (< 1e-3) sẽ nghiễm nhiên bị đánh dấu fail
+            valid_mask = t_rem_raw >= 1e-3
+            self.immediate_fails = (~valid_mask).sum().item()
+            
+            valid_nodes = node_indices[valid_mask]
+            valid_svcs = svc_indices[valid_mask]
+            valid_workloads = task_workloads[valid_mask]
+            valid_t_rem = t_rem_raw[valid_mask]
+            
+            # 3. Add workload (Assignment phase - Only Valid Tasks)
+            node_arrival_matrix.index_put_((valid_nodes, valid_svcs), valid_workloads, accumulate=True)
+            self.backlog_matrix.index_put_((valid_nodes, valid_svcs), valid_workloads, accumulate=True)
+
+            f_req_per_task = valid_workloads / valid_t_rem
             
             f_min_matrix = torch.zeros_like(self.backlog_matrix)
-            for i in range(num_tasks):
-                f_min_matrix[node_indices[i], svc_indices[i]] = torch.max(f_min_matrix[node_indices[i], svc_indices[i]], f_req_per_task[i])
+            for n, s, f_req in zip(valid_nodes, valid_svcs, f_req_per_task):
+                f_min_matrix[n, s] = torch.max(f_min_matrix[n, s], f_req)
         else:
+            self.immediate_fails = 0
             f_min_matrix = torch.zeros_like(self.backlog_matrix)
 
         # 4. OPTIMIZE RESOURCE ALLOCATION (ADMM)
@@ -133,7 +146,7 @@ class MatrixSixGEnvironment:
         num_violations = ops.calculate_qos_violations(
             self.backlog_matrix, self.cpu_alloc_matrix, mean_deadlines, self.max_queue_delay,
             cold_start_mask=self.newly_placed_mask, cold_start_delay=self.cold_start_delay
-        )
+        ) + self.immediate_fails
         total_drift = ops.calculate_lyapunov_drift(self.backlog_matrix, node_arrival_matrix, processed_workload)
 
         self.backlog_matrix = ops.update_backlog(self.backlog_matrix, torch.zeros_like(node_arrival_matrix), processed_workload)
