@@ -1,6 +1,6 @@
 import torch
 
-class BatchResourceSolver:
+class KKTSolverADMM:
     def __init__(self, f_max_node, rho=1.0, max_iter=100, tol=1e-4):
         self.f_max_node = f_max_node
         self.rho_base = rho

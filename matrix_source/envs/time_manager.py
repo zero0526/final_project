@@ -1,6 +1,4 @@
-import torch
-
-class MatrixTimeManager:
+class TimeManager:
     """
     NHIỆM VỤ CỦA THÀNH PHẦN (TIME MANAGER):
     1. Quản lý thời gian toàn cục (Absolute Time) và đếm bước (Step Counter).
