@@ -261,7 +261,7 @@ class D3QNAgent:
         
         self.mf_optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=2.0)
         self.mf_optimizer.step()
         return loss.item()
 
