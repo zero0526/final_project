@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from matrix_source.utils.neural import _make_branch
+from matrix_source.utils.neural import make_branch, stats5
 
 class TaskGroupEncoder(nn.Module):
     """
@@ -47,9 +47,9 @@ class TaskGroupEncoder(nn.Module):
         super().__init__()
 
         # Three specialised branches, each receiving 5-dim statistics
-        self.branch_workload = _make_branch(self.STATS_DIM, branch_dim, branch_dim * 2)
-        self.branch_deadline = _make_branch(self.STATS_DIM, branch_dim, branch_dim * 2)
-        self.branch_datasize = _make_branch(self.STATS_DIM, branch_dim, branch_dim * 2)
+        self.branch_workload = make_branch(self.STATS_DIM, branch_dim, branch_dim * 2)
+        self.branch_deadline = make_branch(self.STATS_DIM, branch_dim, branch_dim * 2)
+        self.branch_datasize = make_branch(self.STATS_DIM, branch_dim, branch_dim * 2)
 
         # Context: num_tasks(1) + omega_frac_0(1) + omega_frac_1(1) = 3 dims
         context_dim = 3
@@ -72,6 +72,7 @@ class TaskGroupEncoder(nn.Module):
         svc_indices: torch.Tensor,          # (N,)  long
         tasks_min_accuracy: torch.Tensor,   # (N,)  float – [0, 1] scale
         svc_workloads: torch.Tensor,        # (|S|, M)  float – GFLOPS
+        svc_accuracy: torch.Tensor  # (|S|, M)
     ) -> torch.Tensor:
         """
         For each task, estimate the compute requirement as:
@@ -81,15 +82,24 @@ class TaskGroupEncoder(nn.Module):
 
         Returns : (N,) float
         """
-        wl_table = svc_workloads[svc_indices]               # (N, M)
-        # Minimum non-zero workload per task (lightest valid model)
-        wl_table_safe = wl_table.clone()
-        wl_table_safe[wl_table_safe <= 0] = float('inf')
-        min_wl = wl_table_safe.min(dim=1).values            # (N,)
-        min_wl = torch.where(min_wl == float('inf'),
-                             torch.zeros_like(min_wl),
-                             min_wl)
-        return min_wl * tasks_min_accuracy.clamp(min=0.0)   # (N,)
+        accepts= tasks_min_accuracy.unsqueeze(1) - svc_accuracy[svc_indices]
+        valid = accepts <= 0
+
+        num_models = valid.size(1)
+
+        model_ids = torch.arange(num_models, device=valid.device)
+
+        min_indices = torch.where(
+            valid,
+            model_ids,
+            num_models  # temporary invalid value
+        ).min(dim=1).values
+        min_indices = torch.where(
+            min_indices == num_models,
+            torch.tensor(num_models - 1, device=valid.device),
+            min_indices
+        )
+        return svc_workloads[svc_indices, min_indices]
 
     # ------------------------------------------------------------------
 
@@ -101,6 +111,7 @@ class TaskGroupEncoder(nn.Module):
         svc_indices: torch.Tensor,          # (N,)  long
         svc_omega: torch.Tensor,            # (|S|,)
         svc_workloads: torch.Tensor,        # (|S|, M)
+        svc_accuracy: torch.Tensor  # (|S|, M)
     ) -> torch.Tensor:
         """
         Returns
@@ -111,15 +122,15 @@ class TaskGroupEncoder(nn.Module):
         device = task_batch_sizes.device
 
         # ---- 1. Derived workload signal ----------------------------------
-        wl_req = self._workload_reqs(svc_indices, tasks_min_accuracy, svc_workloads)
+        wl_req = self._workload_reqs(svc_indices, tasks_min_accuracy, svc_workloads, svc_accuracy)
 
         # ---- 2. Compute 5-dim statistics for each group -----------------
-        stats_wl = _stats5(wl_req)
-        stats_dl = _stats5(task_deadlines)
-        stats_ds = _stats5(task_batch_sizes)
+        stats_wl = stats5(wl_req)
+        stats_dl = stats5(task_deadlines)
+        stats_ds = stats5(task_batch_sizes)
 
         # ---- 3. Context vector ------------------------------------------
-        num_tasks_feat = torch.log1p(torch.tensor(N, device=device, dtype=torch.float32))
+        num_tasks_feat = torch.tensor(N, device=device, dtype=torch.float32)
         omega_flags    = svc_omega[svc_indices]         # (N,)  0 or 1
         omega_frac_1   = omega_flags.mean()
         omega_frac_0   = 1.0 - omega_frac_1
