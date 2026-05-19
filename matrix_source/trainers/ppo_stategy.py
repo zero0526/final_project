@@ -37,8 +37,8 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 6}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
-        self.lower_warmup_steps = 50
-        self.upper_warmup_steps = 50
+        self.lower_warmup_steps = 60
+        self.upper_warmup_steps = 60
         self.alt_steps = 60
 
     def initialize_agents(self, trainer):
@@ -105,7 +105,7 @@ class PPOStrategy(AlgorithmStrategy):
         
         # Use stochastic (det=False) in UPPER_ONLY phase.
         # In ALTERNATING phase, both are stochastic (joint training).
-        is_det = False
+        is_det = (self.phase == 'EVAL')
         
         batch_a_ids = trainer.shared_upper_agent.choose_action_batch(
             edge_states, edge_mfs, agent_indices=instance_indices, deterministic=is_det
@@ -138,7 +138,7 @@ class PPOStrategy(AlgorithmStrategy):
         mfs = mf_terminals[t_idx]
         
         # "Freeze" lower (argmax) only during Upper-Only phase. In Alternating, both are stochastic.
-        is_det = (self.phase == 'UPPER_ONLY')
+        is_det = (self.phase == 'UPPER_ONLY' or self.phase == 'EVAL')
         
         batch_actions = trainer.shared_lower_agent.choose_action_batch(
             states, mfs, masks_batch=masks, 
@@ -274,10 +274,12 @@ class PPOStrategy(AlgorithmStrategy):
                             # Checkpoint
                             if self.lower_train_num % 10 == 0:
                                 os.makedirs('checkpoints', exist_ok=True)
-                                trainer.shared_lower_agent.save(f'checkpoints/ppo_lower_{self.lower_train_num}.pth')
+                                trainer.shared_lower_agent.save(f'{trainer.config.checkpoints}/ppo_lower_{self.lower_train_num}.pth')
 
                             # Phase Transition
                             if self.phase == 'LOWER_ONLY' and self.lower_train_num >= self.lower_warmup_steps:
+                                os.makedirs('checkpoints', exist_ok=True)
+                                trainer.shared_lower_agent.save(f'{trainer.config.checkpoints}/ppo_lower_phase1.pth')
                                 self.phase = 'UPPER_ONLY'
                                 trainer.shared_upper_agent.memory.clear()
                                 print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
@@ -305,10 +307,12 @@ class PPOStrategy(AlgorithmStrategy):
                             # Checkpoint
                             if self.upper_train_num % 10 == 0:
                                 os.makedirs('checkpoints', exist_ok=True)
-                                trainer.shared_upper_agent.save(f'checkpoints/ppo_upper_{self.upper_train_num}.pth')
+                                trainer.shared_upper_agent.save(f'{trainer.config.checkpoints}/ppo_upper_{self.upper_train_num}.pth')
 
                             # Phase Transition
                             if self.phase == 'UPPER_ONLY' and self.upper_train_num >= self.upper_warmup_steps:
+                                os.makedirs('checkpoints', exist_ok=True)
+                                trainer.shared_upper_agent.save(f'{trainer.config.checkpoints}/ppo_upper_phase2.pth')
                                 self.phase = 'ALTERNATING'
                                 trainer.shared_upper_agent.memory.clear()
                                 trainer.shared_lower_agent.memory.clear()
@@ -346,4 +350,61 @@ class PPOStrategy(AlgorithmStrategy):
             print(f"--- Curriculum Status ---")
             print(f"Phase: {self.phase} | Lower: {self.lower_train_num}/{self.lower_warmup_steps} | Upper: {self.upper_train_num}/{self.upper_warmup_steps} | Alt: {self.alt_train_num}/{self.alt_steps}")
             ep += 1
+        
+        # Save final models
+        os.makedirs('checkpoints', exist_ok=True)
+        trainer.shared_lower_agent.save(f'{trainer.config.checkpoints}/ppo_lower_phase3.pth')
+        trainer.shared_upper_agent.save(f'{trainer.config.checkpoints}/ppo_upper_phase3.pth')
         pbar.close()
+
+    def load_checkpoints(self, trainer, lower_path=None, upper_path=None):
+        """Loads checkpoints for evaluation."""
+        if lower_path and os.path.exists(lower_path):
+            trainer.shared_lower_agent.load(lower_path)
+            print(f"[PPOStrategy] Lower agent loaded from {lower_path}")
+        
+        if upper_path and os.path.exists(upper_path):
+            trainer.shared_upper_agent.load(upper_path)
+            print(f"[PPOStrategy] Upper agent loaded from {upper_path}")
+
+    def run_evaluation(self, trainer, num_episodes=5):
+        """Runs a deterministic evaluation loop."""
+        print(f"\n>>> Starting Evaluation ({num_episodes} episodes) <<<")
+        self.phase = 'EVAL'
+        max_slots = trainer.env.time_manager.max_steps
+        
+        for ep in range(num_episodes):
+            obs = trainer.env.reset()
+            obs_upper = obs['upper']
+            prev_lower_res = obs['lower']
+            self.upper_mf_ema = None 
+            current_upper_state = self.build_upper_state(trainer, obs_upper) 
+            
+            for slot in range(max_slots):
+                if trainer.env.time_manager.is_new_frame():
+                    u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                    trainer.env.step_upper(u_acts_matrix)
+
+                t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
+                if len(t_idx) > 0:
+                    n_idx, m_idx = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
+                    results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
+                    
+                    trainer.aggregator.add_lower(results)
+                    prev_lower_res = results
+                else:
+                    trainer.env.time_manager.tick()
+
+                if trainer.env.time_manager.is_new_frame():
+                    res_upper = trainer.env.collect_upper_metrics()
+                    next_upper_state = self.build_upper_state(trainer, res_upper)
+                    trainer.aggregator.add_upper(res_upper)
+                    
+                    current_upper_state = next_upper_state
+                    obs_upper = res_upper
+
+            trainer.aggregator.store_history()
+            trainer.aggregator.report_episode(ep)
+        
+        print(f"\n>>> Evaluation Complete <<<")
+
