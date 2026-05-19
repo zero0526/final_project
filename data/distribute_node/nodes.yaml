@@ -7,6 +7,18 @@ node-cfg:
     cloud: [ "N8" ]
     edge: [ "N9", "N3" ]
     network: [ "N10"]
+  atlanta_script_v1:  
+    cloud: [ "N1" ]
+    edge: [ "N6", "N7", "N8", "N11", "N12" ]
+    network: [ "N14", "N10"]
+  atlanta_script_v2:  
+    cloud: [ "N1" ]
+    edge: [ "N6", "N7", "N8", "N11", "N12", "N5" ]
+    network: [ "N14", "N10", "N2"]
+  atlanta_script_v3:  
+    cloud: [ "N1" ]
+    edge: [ "N6", "N7", "N8", "N11", "N12", "N5", "N15" ]
+    network: [ "N14", "N10", "N2", "N9"]
   ta2:
     cloud: ["N65"]
     edge: ["N7", "N15", "N18", "N42", "N62"]
