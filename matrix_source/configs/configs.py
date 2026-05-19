@@ -62,7 +62,7 @@ class BaseConfig(BaseSettings):
     topology_data: Dict[str, Any] = Field(default_factory=dict)
     cold_start_energy_coef: float= Field(default= 0.2)
     transmission_coef: float= Field(default=0.2)
-    lypa_coef: float= Field(default=1e1)
+    lypa_coef: float= Field(default=1e4)
     cold_start_time: Dict[str, float]= Field(default={"min":0.15, "max":0.85})
     avg_req: int= Field(default=20)
     neighbor_depth: int= Field(default=2)
@@ -84,6 +84,8 @@ class BaseConfig(BaseSettings):
     norm_data_size: float= Field(default=50.0)
     norm_upper_rw: float= Field(default=10000000.0)
     norm_lower_rw: float= Field(default=10000000.0)
+    zeta_lower_step: float = Field(default=0.00005)
+    zeta_upper_step: float = Field(default=0.0005)
     class Config:
         env_file = get_env_file()
         env_file_encoding = "utf-8"
@@ -96,6 +98,8 @@ cfg.hyper_neural = load_yaml(cfg.neural_cfg_path, "NEURON_NET")
 cfg.services = load_yaml(cfg.service_path, "service")
 cfg.delay_queue_max = load_yaml(cfg.delay_path, "nodes")
 cfg.normalization = load_yaml(cfg.normalization_path)
+cfg.zeta_lower_step = float(cfg.hyper_neural.get("ZETA_LOWER_STEP", 0.00005))
+cfg.zeta_upper_step = float(cfg.hyper_neural.get("ZETA_UPPER_STEP", 0.0005))
 
 
 

@@ -129,11 +129,11 @@ class Trainer:
                     )
                     
                     prev_lower_res = results
-                    self.total_lower_steps += 1 # Count samples collected
                     
                     # train lower
                     loss = self.shared_lower_agent.learn(torch.arange(self.num_terminals, device=self.device))
                     if loss is not None:
+                        self.total_lower_steps += 1 # Count samples collected
                         self.aggregator.record_td_losses(lower_losses=loss)
                 else:
                     self.env.time_manager.tick()
@@ -360,26 +360,9 @@ class Trainer:
         for tid in self.lower_epsilons: 
             self.lower_epsilons[tid] = max(self.min_epsilon, self.lower_epsilons[tid] * self.epsilon_decay)
             
-        # 2. Phased Zeta Annealing
-        num_eps = self.config.hyper_neural.get('NUMOF_TRAIN_EP', 3000)
-        
-        # Lower Zeta:
-        fraction = min(1.0, ep / self.config.hyper_neural["ANNEALING_LENGTH"])
-        if self.total_lower_steps < self.lower_start_threshold:
-            self.zeta_lower = self.zeta_initial
-        elif self.total_lower_steps < self.lower_stable_threshold:
-            # Fast increase while lower is stabilizing (20k to 50k)
-            bump_factor = min(1.0, (self.total_lower_steps - self.lower_start_threshold) / (self.lower_stable_threshold - self.lower_start_threshold))
-            target = self.zeta_initial + (self.zeta_max * 0.5 - self.zeta_initial) * bump_factor
-            self.zeta_lower = max(self.zeta_lower, target)
-        else:
-            self.zeta_lower = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
-            
-        # Upper Zeta: Only increases AFTER lower is stable and upper has enough valid samples
-        if self.total_lower_steps >= self.lower_stable_threshold:
-            self.zeta_upper = self.zeta_initial + (self.zeta_max - self.zeta_initial) * fraction
-        else:
-            self.zeta_upper = self.zeta_initial # Remains low (exploration mode)
+        # 2. Simple Linear Zeta Annealing
+        self.zeta_lower = min(self.zeta_max, self.zeta_initial + self.total_lower_steps * self.config.zeta_lower_step)
+        self.zeta_upper = min(self.zeta_max, self.zeta_initial + self.total_upper_steps * self.config.zeta_upper_step)
 
 def log_transform(reward: float) -> float:
     return reward
