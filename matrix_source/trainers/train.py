@@ -149,11 +149,11 @@ class Trainer:
                     # Phased Curriculum: Only collect and train Upper after Lower is stable
                     if self.total_lower_steps >= self.lower_stable_threshold/10:
                         self.store_upper_transitions(current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
-                        self.total_upper_steps += 1 # Approximate upper samples
 
                     # train upper
                     loss = self.shared_upper_agent.learn(torch.arange(self.num_edge_agents, device=self.device))
                     if loss is not None:
+                        self.total_upper_steps += 1 # Approximate upper samples
                         self.aggregator.record_td_losses(upper_losses=loss)
 
                     current_upper_state = next_upper_state

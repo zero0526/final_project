@@ -41,7 +41,7 @@ def default_topology_config(topology: str, config: Any) -> Dict[str, Any]:
     return {}
 
 class BaseConfig(BaseSettings):
-    topology: str= Field(default="atlanta_smaller")
+    topology: str= Field(default="atlanta_script_v1")
     device: str= Field(default= "cuda" if torch.cuda.is_available() else "cpu")
     logs: str= Field(default=str(PROJECT_ROOT / "data" / "logs"))
     plot_dir: str= Field(default=str(PROJECT_ROOT / "data" / "plots"))
@@ -62,7 +62,7 @@ class BaseConfig(BaseSettings):
     topology_data: Dict[str, Any] = Field(default_factory=dict)
     cold_start_energy_coef: float= Field(default= 0.2)
     transmission_coef: float= Field(default=0.2)
-    lypa_coef: float= Field(default=1e6)
+    lypa_coef: float= Field(default=1e1)
     cold_start_time: Dict[str, float]= Field(default={"min":0.15, "max":0.85})
     avg_req: int= Field(default=20)
     neighbor_depth: int= Field(default=2)
