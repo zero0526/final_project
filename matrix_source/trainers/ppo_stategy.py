@@ -37,9 +37,9 @@ class PPOStrategy(AlgorithmStrategy):
         # Hyperparams from user
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 6}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
-        self.lower_warmup_steps = 45
+        self.lower_warmup_steps = 50
         self.upper_warmup_steps = 50
-        self.alt_steps = 50
+        self.alt_steps = 60
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -279,6 +279,7 @@ class PPOStrategy(AlgorithmStrategy):
                             # Phase Transition
                             if self.phase == 'LOWER_ONLY' and self.lower_train_num >= self.lower_warmup_steps:
                                 self.phase = 'UPPER_ONLY'
+                                trainer.shared_upper_agent.memory.clear()
                                 print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
                             pbar.update(1)
                 else:
@@ -309,10 +310,12 @@ class PPOStrategy(AlgorithmStrategy):
                             # Phase Transition
                             if self.phase == 'UPPER_ONLY' and self.upper_train_num >= self.upper_warmup_steps:
                                 self.phase = 'ALTERNATING'
+                                trainer.shared_upper_agent.memory.clear()
+                                trainer.shared_lower_agent.memory.clear()
                                 print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
                                 # Apply Phase 3 overrides: 0.5x LR, 8000/800 buffers, 8/6 epochs
-                                trainer.shared_lower_agent.set_lr_factor(0.2)
-                                trainer.shared_upper_agent.set_lr_factor(0.2)
+                                trainer.shared_lower_agent.set_lr_factor(0.3)
+                                trainer.shared_upper_agent.set_lr_factor(0.3)
                                 trainer.shared_lower_agent.k_epochs = 8
                                 trainer.shared_upper_agent.k_epochs = 6
                                 trainer.shared_lower_agent.min_batch_size = 8000

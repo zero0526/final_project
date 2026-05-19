@@ -41,7 +41,7 @@ def default_topology_config(topology: str, config: Any) -> Dict[str, Any]:
     return {}
 
 class BaseConfig(BaseSettings):
-    topology: str= Field(default="atlanta_smaller")
+    topology: str= Field(default="atlanta_script_v1")
     device: str= Field(default= "cuda" if torch.cuda.is_available() else "cpu")
     logs: str= Field(default=str(PROJECT_ROOT / "data" / "logs"))
     plot_dir: str= Field(default=str(PROJECT_ROOT / "data" / "plots"))
