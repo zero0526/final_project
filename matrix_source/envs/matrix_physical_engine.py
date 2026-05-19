@@ -362,6 +362,7 @@ class MatrixPhysicalEngine:
         qos_penalty = self.omega_1 * torch.exp(torch.tensor(self.omega_2 * num_violations, device=self.device))
         reward = -(f1 + qos_penalty)
         obs = {
+            "total_drift": total_drift,
             "task_reqs": self.current_task_reqs.clone(),
             "backlog": self.backlog_queue.sum(dim=-1).clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()

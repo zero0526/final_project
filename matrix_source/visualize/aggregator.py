@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict, deque
 import os
+import csv
 import logging
 from matrix_source.configs.configs import cfg
 
@@ -63,6 +64,7 @@ class MetricsAggregator:
         self.episode_violations = [] # Added for clarity
         self.episode_success_qos = []
         self.episode_violate_qos = []
+        self.episode_backlog_drift = [] # Track backlog drift over time
 
         # Task Statistics Counters
         self.eps_assigned = 0
@@ -128,7 +130,10 @@ class MetricsAggregator:
             self.episode_lower_states.append(s_np.flatten())
             
         info = step_output.get("info", {})
-            
+        obs = step_output.get("obs", {})
+        if obs:
+            backlog_drift = obs.get("total_drift", 0)
+            self.episode_backlog_drift.append(backlog_drift)
         energy_dist = step_output.get("energy", {})
         if energy_dist:
             self.episode_energy.append(energy_dist)
@@ -230,6 +235,13 @@ class MetricsAggregator:
         qos_success_rate = success / (success + violate) if (success + violate) > 0 else 0
         self.history["qos_success_rate"].append(qos_success_rate)
         
+        # Completion Rate (vs Assigned)
+        total_completed = self.eps_assigned - self.eps_failed - self.last_remaining
+        completion_rate = (total_completed / self.eps_assigned) if self.eps_assigned > 0 else 0
+        self.history["completion_rate"].append(completion_rate)
+        
+        self.history["avg_backlog_drift"].append(np.mean(self.episode_backlog_drift) if self.episode_backlog_drift else 0)
+        
         self.history["avg_remaining_tasks"].append(np.mean(self.episode_remaining_tasks) if self.episode_remaining_tasks else 0)
 
         # Keep old qos_rate for backward compatibility if needed, but we focus on success rate
@@ -241,6 +253,7 @@ class MetricsAggregator:
         # Auto-plot every 50 episodes
         if self.episode_count % 50 == 0:
             self.plot_history(ep=self.episode_count)
+            self.save_history_csv()
 
     def report_episode(self, ep, success_counts=None, failure_counts=None):
         """Prints a summary of the current episode."""
@@ -413,11 +426,11 @@ class MetricsAggregator:
         episodes = range(1, len(self.history["total_reward"]) + 1)
         window = 10 # Window for smoothing
         
-        plt.figure(figsize=(24, 12))
+        plt.figure(figsize=(24, 18))
         plt.suptitle(f"Model Evolution Over Episodes (up to {len(episodes)})", fontsize=20)
         
         # Plot 1: Rewards
-        plt.subplot(2, 4, 1)
+        plt.subplot(3, 4, 1)
         plt.plot(episodes, self.history["total_reward"], alpha=0.3, color='blue', label="Raw Total")
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_reward"], window)
@@ -427,7 +440,7 @@ class MetricsAggregator:
         plt.legend()
         
         # Plot 2: Energy
-        plt.subplot(2, 4, 2)
+        plt.subplot(3, 4, 2)
         plt.plot(episodes, self.history["total_energy"], alpha=0.3, color='orange')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["total_energy"], window)
@@ -436,17 +449,17 @@ class MetricsAggregator:
         plt.xlabel("Episode")
         
         # Plot 3: QoS Success Rate
-        plt.subplot(2, 4, 3)
+        plt.subplot(3, 4, 3)
         plt.plot(episodes, self.history["qos_success_rate"], alpha=0.3, color='purple')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["qos_success_rate"], window)
             plt.plot(range(window, len(self.history["qos_success_rate"]) + 1), ma, color='purple', linewidth=2)
-        plt.ylim(0, 1.05)
-        plt.title("QoS Success Rate")
+        # plt.ylim(0, 1.05) # Removed for auto-scaling visualization of variance
+        plt.title("QoS Success Rate (vs Processed)")
         plt.xlabel("Episode")
  
         # Plot 4: Remaining Tasks
-        plt.subplot(2, 4, 4)
+        plt.subplot(3, 4, 4)
         plt.plot(episodes, self.history["avg_remaining_tasks"], alpha=0.3, color='brown')
         if len(episodes) >= window:
             ma = self._moving_average(self.history["avg_remaining_tasks"], window)
@@ -455,7 +468,7 @@ class MetricsAggregator:
         plt.xlabel("Episode")
  
         # Plot 5: MF Training Losses
-        plt.subplot(2, 4, 5)
+        plt.subplot(3, 4, 5)
         plt.plot(episodes, self.history["avg_upper_mf_loss"], alpha=0.3, color='cyan', label="Upper")
         plt.plot(episodes, self.history["avg_lower_mf_loss"], alpha=0.3, color='magenta', label="Lower")
         if len(episodes) >= window:
@@ -471,7 +484,7 @@ class MetricsAggregator:
         plt.legend()
  
         # Plot 6: TD Training Losses (Q-Network)
-        plt.subplot(2, 4, 6)
+        plt.subplot(3, 4, 6)
         plt.plot(episodes, self.history["avg_upper_td_loss"], alpha=0.3, color='teal', label="Upper")
         plt.plot(episodes, self.history["avg_lower_td_loss"], alpha=0.3, color='olive', label="Lower")
         if len(episodes) >= window:
@@ -487,7 +500,7 @@ class MetricsAggregator:
         plt.legend()
         
         # Plot 7: Upper Q-Values
-        plt.subplot(2, 4, 7)
+        plt.subplot(3, 4, 7)
         plt.plot(episodes, self.history["upper_q_min"], alpha=0.3, color='blue', label="Min")
         plt.plot(episodes, self.history["upper_q_max"], alpha=0.3, color='red', label="Max")
         plt.plot(episodes, self.history["upper_q_mean"], alpha=0.8, color='green', label="Mean")
@@ -496,11 +509,33 @@ class MetricsAggregator:
         plt.legend()
 
         # Plot 8: Lower Q-Values
-        plt.subplot(2, 4, 8)
+        plt.subplot(3, 4, 8)
         plt.plot(episodes, self.history["lower_q_min"], alpha=0.3, color='blue', label="Min")
         plt.plot(episodes, self.history["lower_q_max"], alpha=0.3, color='red', label="Max")
         plt.plot(episodes, self.history["lower_q_mean"], alpha=0.8, color='green', label="Mean")
         plt.title("Lower Q-Value Stats")
+        plt.xlabel("Episode")
+        plt.legend()
+
+        # Plot 9: Backlog Drift
+        plt.subplot(3, 4, 9)
+        plt.plot(episodes, self.history["avg_backlog_drift"], alpha=0.3, color='crimson', label="Raw Drift")
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["avg_backlog_drift"], window)
+            plt.plot(range(window, len(self.history["avg_backlog_drift"]) + 1), ma, color='crimson', label=f"MA-{window}")
+        plt.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        plt.title("Backlog Drift Evolution")
+        plt.xlabel("Episode")
+        plt.legend()
+
+        # Plot 10: Completion Rate (vs Assigned)
+        plt.subplot(3, 4, 10)
+        plt.plot(episodes, self.history["completion_rate"], alpha=0.3, color='forestgreen', label="Raw Rate")
+        if len(episodes) >= window:
+            ma = self._moving_average(self.history["completion_rate"], window)
+            plt.plot(range(window, len(self.history["completion_rate"]) + 1), ma, color='forestgreen', linewidth=2, label=f"MA-{window}")
+        # plt.ylim(0, 1.05) # Removed for auto-scaling
+        plt.title("Completion Rate (vs Assigned)")
         plt.xlabel("Episode")
         plt.legend()
         
@@ -565,3 +600,44 @@ class MetricsAggregator:
             plt.savefig(os.path.join(archive_dir, f"state_dist_ep_{ep}.png"))
             
         plt.close()
+
+    def save_history_csv(self, save_dir=cfg.logs, filename="training_metrics.csv"):
+        """Saves the entire history to a CSV file for model comparison."""
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            
+        file_path = os.path.join(save_dir, filename)
+        
+        # Determine headers from history keys
+        keys = sorted(self.history.keys())
+        num_episodes = len(self.history["total_reward"])
+        
+        try:
+            with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # Header: Episode + History Keys
+                writer.writerow(["episode"] + keys)
+                
+                # Rows: Episode 1..N
+                for i in range(num_episodes):
+                    row = [i + 1]
+                    for k in keys:
+                        # Handle potential length mismatches (shouldn't happen but for safety)
+                        if i < len(self.history[k]):
+                            val = self.history[k][i]
+                            # Format floats for readability
+                            if isinstance(val, (float, np.float32, np.float64, np.ndarray)):
+                                # Use higher precision for CSV
+                                if isinstance(val, np.ndarray):
+                                    row.append(str(val.tolist()))
+                                else:
+                                    row.append(f"{val:.8f}")
+                            else:
+                                row.append(val)
+                        else:
+                            row.append("")
+                    writer.writerow(row)
+            self.log(f"Successfully exported training history to {file_path}")
+        except Exception as e:
+            self.log(f"Error exporting CSV: {e}")
+
