@@ -1,5 +1,7 @@
 import torch
 import random
+import time
+from collections import defaultdict
 import matrix_source.utils.tensor_ops as ops
 from matrix_source.models.resource_solver import KKTSolverADMM
 
@@ -73,6 +75,11 @@ class MatrixPhysicalEngine:
         self.arrival_counts_step = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_violations = 0
         self.current_num_tasks = 0
+        
+        # Profiling
+        self.prof = defaultdict(float)
+        self.prof_counts = defaultdict(int)
+        self.profiling_step = 0
 
     def reset(self):
         self.backlog_queue.zero_()
@@ -173,6 +180,7 @@ class MatrixPhysicalEngine:
         self.cpu_alloc_matrix *= self.placement_matrix
 
     def process_arrivals(self, terminal_indices, svc_indices, node_indices, model_indices, task_batch_sizes, task_deadlines, task_accuracies):
+        t0 = time.perf_counter()
         # Update action history
         self.prev_node_indices.index_copy_(0, terminal_indices, node_indices)
         self.prev_model_indices.index_copy_(0, terminal_indices, model_indices)
@@ -302,9 +310,11 @@ class MatrixPhysicalEngine:
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
         f_min_matrix = self.f_min_queue.max(dim=-1)[0]
+        self.prof['1_process_arrivals'] += time.perf_counter() - t0
         return node_arrival_matrix, trans_energy_total, cold_delays, f_min_matrix
 
     def optimize_allocation(self, node_arrival_matrix, f_min_matrix):
+        t0 = time.perf_counter()
         current_backlog_total = self.backlog_queue.sum(dim=-1)
         G = current_backlog_total * self.placement_matrix
         G[G < 1e-3] = 0
@@ -312,8 +322,10 @@ class MatrixPhysicalEngine:
         f_max = (self.resource_specs[:, 0:1] * self.placement_matrix).to(self.device)
         f_min = f_min_matrix.clamp(max=f_max)
         self.cpu_alloc_matrix = self.solver.solve(G, Z, f_min, f_max, debug=False)
+        self.prof['2_optimize'] += time.perf_counter() - t0
 
     def execute_and_collect_metrics(self, node_arrival_matrix, trans_energy_total, cold_delays):
+        t0 = time.perf_counter()
         current_backlog_total = self.backlog_queue.sum(dim=-1)
         count_before = self.backlog_counts.clone()
         prev_cpu_alloc = self.cpu_alloc_matrix.clone()
@@ -350,6 +362,7 @@ class MatrixPhysicalEngine:
         qos_penalty = self.omega_1 * torch.exp(torch.tensor(self.omega_2 * num_violations, device=self.device))
         reward = -(f1 + qos_penalty)
         obs = {
+            "total_drift": total_drift,
             "task_reqs": self.current_task_reqs.clone(),
             "backlog": self.backlog_queue.sum(dim=-1).clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()
@@ -363,7 +376,7 @@ class MatrixPhysicalEngine:
             "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
             "arrival_matrix": self.arrival_counts_step.clone() # Return snapshot
         }
-        return {
+        res = {
             "reward": reward,
             "energy": total_energy,
             "violations": num_violations,
@@ -375,3 +388,13 @@ class MatrixPhysicalEngine:
                 "model_selection": self.prev_model_indices.clone()
             }
         }
+        self.prof['3_execute'] += time.perf_counter() - t0
+        self.profiling_step += 1
+        
+        if self.profiling_step % 500 == 0:
+            print(f"\n--- Engine Profiling (Step {self.profiling_step}) ---")
+            for k, v in sorted(self.prof.items()):
+                print(f"  {k:20s}: {v*1000/500:8.3f} ms/step")
+            self.prof.clear()
+            
+        return res
