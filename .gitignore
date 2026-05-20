@@ -160,7 +160,7 @@ venv.bak/
 # Spyder project settings
 .spyderproject
 .spyproject
-
+data/checkpoints/
 # Rope project settings
 .ropeproject
 
