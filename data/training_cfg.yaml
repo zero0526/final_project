@@ -7,11 +7,11 @@ NEURON_NET:
     NUMOF_TRAIN_EP: 6000
     NUMOF_TF_EP: 10
     TIME_SLOT_PER_TIMEFRAME: 10
-    SLOT_DURATION: 0.4
+    SLOT_DURATION: 0.35
 
     NUM_LOWER_AGENTS: 20
     OMEGA_Q1: 1000.0
-    OMEGA_Q2: 0.12
+    OMEGA_Q2: 0.1 # Reduced from 0.12 to prevent exponential explosion
     OMEGA_Q3: 5
 
     HIDDEN_MF: 50
@@ -29,6 +29,6 @@ NEURON_NET:
     ZETA_MAX: 10
     EPSILON: 0.05 # 0.01
     EPSILON_DECAY: 0.995
-    ZETA_LOWER_STEP: 0.00005
-    ZETA_UPPER_STEP: 0.0005
+    ZETA_LOWER_STEP: 0.0005 # Increased from 0.00005 for faster annealing
+    ZETA_UPPER_STEP: 0.001
 

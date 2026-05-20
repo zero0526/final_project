@@ -244,11 +244,11 @@ class D3QNAgent:
 
         return final_actions.tolist()
 
-    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids):
+    def store_transition_train_mf_batch(self, states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=None, next_masks=None):
         # MF learning update
         loss = self.learn_mf_batch(states, prev_mfs, curr_mfs, agent_ids)
         # Store in buffer
-        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids)
+        self.memory.add_batch(states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks=masks, next_masks=next_masks)
         return loss
 
     def learn_mf_batch(self, states_batch, prev_mf_batch, ground_truth_mf_batch, agent_ids):
@@ -285,8 +285,8 @@ class D3QNAgent:
         if len(target_agents) == 0:
             return None
 
-        # 2. Sample data from a diverse set of target agents (avoiding duplicates)
-        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids = \
+        # 2. Sample data: states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks, next_masks
+        states, prev_mfs, curr_mfs, actions, rewards, next_states, dones, agent_ids, masks, next_masks = \
             self.memory.sample(self.batch_size, agent_ids=target_agents)
 
         # 1. Train MF (prediction and current state)
@@ -297,7 +297,13 @@ class D3QNAgent:
 
         with torch.no_grad():
             next_pred_mfs = self.mf_net(torch.cat([next_states, curr_mfs], dim=-1), indices=agent_ids)
-            next_actions = self.eval_net(next_states, next_pred_mfs, indices=agent_ids).argmax(dim=1, keepdim=True)
+            q_next_pre = self.eval_net(next_states, next_pred_mfs, indices=agent_ids)
+            
+            # Application of NEXT-state masks for action selection in Q-target
+            if next_masks is not None:
+                q_next_pre = q_next_pre + (next_masks - 1.0) * 1e10
+            
+            next_actions = q_next_pre.argmax(dim=1, keepdim=True)
             q_next = self.target_net(next_states, next_pred_mfs, indices=agent_ids).gather(1, next_actions)
             q_target = rewards + self.gamma * q_next * (1 - dones)
 

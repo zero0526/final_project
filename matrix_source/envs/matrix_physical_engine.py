@@ -72,6 +72,8 @@ class MatrixPhysicalEngine:
             tol=config.admm_tol
         )
         self.immediate_fails = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.fail_placement = torch.zeros((self.num_nodes, self.num_services), device=self.device) # New: Penalty for wrong node
+        self.fail_deadline = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.fail_deadline = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.fail_hw = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.fail_queue = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -93,6 +95,7 @@ class MatrixPhysicalEngine:
         self.deadline_queue.zero_()
         self.f_min_queue.zero_()
         self.immediate_fails.zero_()
+        self.fail_placement.zero_()
         self.fail_deadline.zero_()
         self.fail_hw.zero_()
         self.fail_queue.zero_()
@@ -142,6 +145,7 @@ class MatrixPhysicalEngine:
         self.reward_global_accumulator = 0.0
         self.current_num_tasks = 0
         self.immediate_fails.zero_()
+        self.fail_placement.zero_()
         self.fail_deadline.zero_()
         self.fail_hw.zero_()
         self.fail_queue.zero_()
@@ -248,6 +252,14 @@ class MatrixPhysicalEngine:
         rand_vals = torch.rand(task_cold_start.shape, device=self.device)
         cold_delays = task_cold_start.float() * (rand_vals * (self.cold_start_delay_max - self.cold_start_delay_min) + self.cold_start_delay_min)
         
+        # Placement check: Are tasks being sent to valid nodes?
+        placement_mask = self.placement_matrix[node_indices, svc_indices] > 0
+        if (~placement_mask).any():
+            fn_p = node_indices[~placement_mask]
+            fs_p = svc_indices[~placement_mask]
+            self.immediate_fails.index_put_((fn_p, fs_p), torch.ones_like(fs_p, dtype=torch.float), accumulate=True)
+            self.fail_placement.index_put_((fn_p, fs_p), torch.ones_like(fs_p, dtype=torch.float), accumulate=True)
+
         # Deadline calculation
         t_rem_raw = task_deadlines - trans_delays
         t_q_rem = t_rem_raw - task_max_queue
@@ -388,7 +400,11 @@ class MatrixPhysicalEngine:
         f1 = total_drift + self.lypa_coef * total_energy
         self.reward_global_accumulator += f1.item()
         
-        qos_penalty = self.omega_1 * torch.exp(torch.tensor(self.omega_2 * num_violations, device=self.device))
+        # Refined QoS penalty: Use a smaller factor or linear penalty for violations
+        # Original: omega_1 * exp(omega_2 * num_violations) -> 1000 * exp(0.12 * 800) = Infinity
+        # New: omega_1 * (num_violations^1.5) or smaller exp
+        qos_penalty = self.omega_1 * torch.pow(torch.tensor(num_violations, device=self.device), 1.2)
+        
         reward = -(f1 + qos_penalty)
         obs = {
             "total_drift": total_drift,
@@ -408,6 +424,7 @@ class MatrixPhysicalEngine:
                 "deadline": self.fail_deadline.sum().item(),
                 "hardware": self.fail_hw.sum().item(),
                 "queue_full": self.fail_queue.sum().item(),
+                "invalid_placement": self.fail_placement.sum().item(),
                 "hw_deficit_per_svc": self.service_hw_deficit.cpu().numpy(),
                 "hw_fail_count_per_svc": self.service_hw_fail_count.cpu().numpy()
             }
