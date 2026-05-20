@@ -98,8 +98,8 @@ cfg.hyper_neural = load_yaml(cfg.neural_cfg_path, "NEURON_NET")
 cfg.services = load_yaml(cfg.service_path, "service")
 cfg.delay_queue_max = load_yaml(cfg.delay_path, "nodes")
 cfg.normalization = load_yaml(cfg.normalization_path)
-cfg.zeta_lower_step = float(cfg.hyper_neural.get("ZETA_LOWER_STEP", 0.00005))
-cfg.zeta_upper_step = float(cfg.hyper_neural.get("ZETA_UPPER_STEP", 0.0005))
+cfg.zeta_lower_step = float(cfg.hyper_neural.get("ZETA_LOWER_STEP", 0.00001))
+cfg.zeta_upper_step = float(cfg.hyper_neural.get("ZETA_UPPER_STEP", 0.0001))
 
 
 
