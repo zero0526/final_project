@@ -72,6 +72,12 @@ class MatrixPhysicalEngine:
             tol=config.admm_tol
         )
         self.immediate_fails = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.fail_deadline = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.fail_hw = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.fail_queue = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.service_hw_deficit = torch.zeros(self.num_services, device=self.device)
+        self.service_hw_fail_count = torch.zeros(self.num_services, device=self.device)
+        
         self.arrival_counts_step = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_violations = 0
         self.current_num_tasks = 0
@@ -87,6 +93,11 @@ class MatrixPhysicalEngine:
         self.deadline_queue.zero_()
         self.f_min_queue.zero_()
         self.immediate_fails.zero_()
+        self.fail_deadline.zero_()
+        self.fail_hw.zero_()
+        self.fail_queue.zero_()
+        self.service_hw_deficit.zero_()
+        self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
         self.prev_placement_matrix.zero_()
         self.newly_placed_mask.zero_()
@@ -131,6 +142,11 @@ class MatrixPhysicalEngine:
         self.reward_global_accumulator = 0.0
         self.current_num_tasks = 0
         self.immediate_fails.zero_()
+        self.fail_deadline.zero_()
+        self.fail_hw.zero_()
+        self.fail_queue.zero_()
+        self.service_hw_deficit.zero_()
+        self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
         return res
 
@@ -189,6 +205,11 @@ class MatrixPhysicalEngine:
         node_arrival_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         f_min_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.immediate_fails.zero_()
+        self.fail_deadline.zero_()
+        self.fail_hw.zero_()
+        self.fail_queue.zero_()
+        self.service_hw_deficit.zero_()
+        self.service_hw_fail_count.zero_()
         self.arrival_counts_step.zero_()
         self.arrival_counts_step.index_put_((node_indices, svc_indices), torch.ones_like(svc_indices, dtype=torch.float), accumulate=True)
         self.current_task_reqs.zero_()
@@ -228,14 +249,17 @@ class MatrixPhysicalEngine:
         cold_delays = task_cold_start.float() * (rand_vals * (self.cold_start_delay_max - self.cold_start_delay_min) + self.cold_start_delay_min)
         
         # Deadline calculation
-        t_rem_raw = task_deadlines - trans_delays - cold_delays
+        t_rem_raw = task_deadlines - trans_delays
         t_q_rem = t_rem_raw - task_max_queue
         
         valid_mask = t_rem_raw >= 1e-4
         # Initialize immediate fails with tasks failing initial checks
         fails_idx = (~valid_mask)
         if fails_idx.any():
-            self.immediate_fails.index_put_((node_indices[fails_idx], svc_indices[fails_idx]), torch.ones_like(svc_indices[fails_idx], dtype=torch.float), accumulate=True)
+            fn = node_indices[fails_idx]
+            fs = svc_indices[fails_idx]
+            self.immediate_fails.index_put_((fn, fs), torch.ones_like(fs, dtype=torch.float), accumulate=True)
+            self.fail_deadline.index_put_((fn, fs), torch.ones_like(fs, dtype=torch.float), accumulate=True)
         
         if valid_mask.any():
             vn = node_indices[valid_mask]
@@ -254,11 +278,15 @@ class MatrixPhysicalEngine:
             # 1. Các task không đủ phần cứng
             fail_hw_mask = ~hw_mask
             if fail_hw_mask.any():
-                self.immediate_fails.index_put_(
-                    (vn[fail_hw_mask], vs[fail_hw_mask]), 
-                    torch.ones_like(vs[fail_hw_mask], dtype=torch.float), 
-                    accumulate=True
-                )
+                fhn = vn[fail_hw_mask]
+                fhs = vs[fail_hw_mask]
+                self.immediate_fails.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
+                self.fail_hw.index_put_((fhn, fhs), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
+                
+                # Deficit Analysis
+                deficit = (vw[fail_hw_mask] / node_max_f[vn][fail_hw_mask]) - vq[fail_hw_mask]
+                self.service_hw_deficit.index_put_((fhs,), deficit, accumulate=True)
+                self.service_hw_fail_count.index_put_((fhs,), torch.ones_like(fhs, dtype=torch.float), accumulate=True)
 
             # 2. Xử lý các task hợp lệ bằng Batching trên CPU (Bỏ qua sync GPU chậm)
             valid_hw_mask = hw_mask
@@ -306,6 +334,7 @@ class MatrixPhysicalEngine:
                     f_n = torch.tensor(fail_n, device=self.device)
                     f_s = torch.tensor(fail_s, device=self.device)
                     self.immediate_fails.index_put_((f_n, f_s), torch.ones_like(f_s, dtype=torch.float), accumulate=True)
+                    self.fail_queue.index_put_((f_n, f_s), torch.ones_like(f_s, dtype=torch.float), accumulate=True)
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
@@ -374,7 +403,14 @@ class MatrixPhysicalEngine:
             "remaining": int(self.backlog_counts.sum().item()),
             "success_qos": {i: success_qos_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
             "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
-            "arrival_matrix": self.arrival_counts_step.clone() # Return snapshot
+            "arrival_matrix": self.arrival_counts_step.clone(),
+            "fail_reasons": {
+                "deadline": self.fail_deadline.sum().item(),
+                "hardware": self.fail_hw.sum().item(),
+                "queue_full": self.fail_queue.sum().item(),
+                "hw_deficit_per_svc": self.service_hw_deficit.cpu().numpy(),
+                "hw_fail_count_per_svc": self.service_hw_fail_count.cpu().numpy()
+            }
         }
         res = {
             "reward": reward,
@@ -390,6 +426,9 @@ class MatrixPhysicalEngine:
         }
         self.prof['3_execute'] += time.perf_counter() - t0
         self.profiling_step += 1
+        
+        # Reset newly_placed_mask after the first slot of the timeframe
+        self.newly_placed_mask.zero_()
         
         if self.profiling_step % 500 == 0:
             print(f"\n--- Engine Profiling (Step {self.profiling_step}) ---")

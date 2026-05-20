@@ -106,6 +106,10 @@ class MetricsAggregator:
         self.eps_f_alloc = []
         self.eps_arrivals = []
         self.eps_backlog = []
+        
+        self.episode_fail_reasons = {"deadline": 0, "hardware": 0, "queue_full": 0}
+        self.eps_hw_deficit = None # Will initialize based on num_services
+        self.eps_hw_fail_count = None
 
     def add_upper(self, step_output, mf_loss=None, state=None):
         """Adds data from an upper-level step."""
@@ -157,6 +161,21 @@ class MetricsAggregator:
         self.eps_assigned += info.get("num_tasks", 0)
         self.eps_failed += info.get("immediate_fails", 0) + info.get("expired_count", 0)
         self.last_remaining = info.get("remaining", 0)
+        
+        # Track failure reasons
+        reasons = info.get("fail_reasons", {})
+        for k in self.episode_fail_reasons:
+            self.episode_fail_reasons[k] += reasons.get(k, 0)
+            
+        # Per-service hardware deficit
+        hw_def = reasons.get("hw_deficit_per_svc")
+        hw_cnt = reasons.get("hw_fail_count_per_svc")
+        if hw_def is not None:
+            if self.eps_hw_deficit is None:
+                self.eps_hw_deficit = np.zeros_like(hw_def)
+                self.eps_hw_fail_count = np.zeros_like(hw_cnt)
+            self.eps_hw_deficit += hw_def
+            self.eps_hw_fail_count += hw_cnt
 
     def add_step_matrices(self, f_alloc, arrivals, backlog):
         """Accumulates (Node x Service) matrices for averaging at end of episode."""
@@ -319,6 +338,20 @@ class MetricsAggregator:
             self.log("-" * 50)
             self.log(f" Completion Rate (vs Assigned): {completion_rate:.2f}%")
             self.log(f" QoS Success Rate (vs Proc):   {qos_rate:.2f}%")
+            self.log(f" --- Immediate Failure Reasons ---")
+            self.log(f"  * Deadline Violations: {self.episode_fail_reasons['deadline']}")
+            self.log(f"  * Hardware Limits   : {self.episode_fail_reasons['hardware']}")
+            self.log(f"  * Queue Full        : {self.episode_fail_reasons['queue_full']}")
+            
+            if self.eps_hw_fail_count is not None and np.sum(self.eps_hw_fail_count) > 0:
+                self.log(f"\n--- Hardware Failure Analysis (Time Deficit) ---")
+                self.log(f"{'Svc ID':<10} | {'Fail Count':<12} | {'Avg Deficit (s)':<15}")
+                self.log("-" * 45)
+                for i in range(len(self.eps_hw_deficit)):
+                    if self.eps_hw_fail_count[i] > 0:
+                        avg_def = self.eps_hw_deficit[i] / self.eps_hw_fail_count[i]
+                        self.log(f"{i:<10} | {self.eps_hw_fail_count[i]:<12.0f} | {avg_def:<15.4f}")
+            
             self.log("="*50 + "\n")
 
         self.log("---------------------------\n")

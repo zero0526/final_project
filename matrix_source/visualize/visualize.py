@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 # ====== Đọc file JSON ======
 if __name__=="__main__":
-    path= "D:\\source_code\\final_project\\data\\atlanta_smaller_nodes_config.json"
+    path= "D:\\source_code\\final_project\\data\\atlanta_script_v1_nodes_config.json"
     with open(path, "r") as f:
         data = json.load(f)
 
