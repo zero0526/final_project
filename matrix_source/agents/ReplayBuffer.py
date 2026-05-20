@@ -2,7 +2,7 @@ import torch
 import numpy as np
 
 class ReplayBuffer:
-    def __init__(self, max_size,node_type, state_dim, action_dim, device="cpu"):
+    def __init__(self, max_size,node_type, state_dim, action_dim,mask_dim, device="cpu"):
         self.max_size = max_size
         self.ptr = 0
         self.size = 0
@@ -19,8 +19,8 @@ class ReplayBuffer:
         self.done = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
         # Tracking which agent generated the transition
         self.agent_id = torch.zeros((max_size, 1), dtype=torch.int64, device=device)
-        self.mask = torch.zeros((max_size, action_dim), dtype=torch.float32, device=device) # Mask for current state action selection
-        self.next_mask = torch.zeros((max_size, action_dim), dtype=torch.float32, device=device) # Mask for next state (Bellman target)
+        self.mask = torch.zeros((max_size, mask_dim), dtype=torch.float32, device=device) # Mask for current state action selection
+        self.next_mask = torch.zeros((max_size, mask_dim), dtype=torch.float32, device=device) # Mask for next state (Bellman target)
 
     def _to_tensor(self, x, dtype):
         if torch.is_tensor(x):
@@ -92,12 +92,12 @@ class ReplayBuffer:
         return self.size
 
 class MultiAgentReplayBuffer:
-    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim, device="cpu"):
+    def __init__(self, num_agents, node_type, max_size_per_agent, state_dim, action_dim, mask_dim, device="cpu"):
         self.num_agents = num_agents
         self.device = device
         self.node_type = node_type
         self.buffers = [
-            ReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim, device)
+            ReplayBuffer(max_size_per_agent, node_type, state_dim, action_dim,mask_dim, device)
             for _ in range(num_agents)
         ]
         self.buffer_sizes = torch.zeros(num_agents, dtype=torch.long, device=device)

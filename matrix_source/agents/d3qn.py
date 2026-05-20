@@ -160,7 +160,7 @@ class D3QNAgent:
         self.loss_fn = nn.SmoothL1Loss() # Huber Loss is more robust to large reward scales
         
         # Each agent instance gets its own partitioned buffer to prevent "noise" and ensure fair training
-        self.memory = MultiAgentReplayBuffer(num_instances,node_type, buffer_size, state_dim, action_dim, self.device)
+        self.memory = MultiAgentReplayBuffer(num_instances,node_type, buffer_size, state_dim, action_dim, u_action_dim, self.device)
 
         # Logging
         self.prev_loss = 0.0
@@ -172,13 +172,14 @@ class D3QNAgent:
         actions = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
+            epsilon,
             zeta, 
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
             agent_indices=idx_tensor
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states_batch, prev_mfs_batch, zeta, masks_batch=None, agent_indices=None):
+    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None):
         batch_size = states_batch.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -238,9 +239,21 @@ class D3QNAgent:
                 if self.exclude_zero and self.u_action_dim > 1:
                     q_values[:, 0] -= 1e10
                 
-                # zeta factor controls the exploration temperature
-                probs = torch.softmax(q_values * zeta, dim=1)
-                final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
+                # Hybrid Exploration: Epsilon-Greedy + Boltzmann
+                # 1. Boltzmann probs
+                probs_boltzmann = torch.softmax(q_values * zeta, dim=1)
+                
+                # 2. Random exploration mask
+                random_probs = torch.ones_like(q_values)
+                if masks_batch is not None:
+                    m = masks_batch[indices]
+                    random_probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                else:
+                    random_probs = random_probs / self.u_action_dim
+                
+                # 3. Combine: Prob = (1-eps) * Boltzmann + eps * Random
+                final_probs = (1.0 - epsilon) * probs_boltzmann + epsilon * random_probs
+                final_actions[indices] = torch.multinomial(final_probs, 1).squeeze(1)
 
         return final_actions.tolist()
 
