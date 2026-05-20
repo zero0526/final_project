@@ -16,6 +16,7 @@ class ReplayBuffer:
         self.action = torch.zeros((max_size, 1), dtype=torch.int64, device=device)
         self.reward = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
         self.next_state = torch.zeros((max_size, state_dim), dtype=torch.float32, device=device)
+        self.done = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
         # Tracking which agent generated the transition
         self.agent_id = torch.zeros((max_size, 1), dtype=torch.int64, device=device)
         self.mask = torch.zeros((max_size, action_dim), dtype=torch.float32, device=device) # Mask for current state action selection
