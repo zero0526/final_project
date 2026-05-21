@@ -8,19 +8,30 @@ import os
 def compute_gae(rewards, next_values, values, dones, agent_ids, gamma, lmbda):
     """
     Generalized Advantage Estimation (GAE)
-    Separated for easier inspection and algorithm flexibility.
+    Vectorized mask calculation to avoid CPU-GPU syncs in the loop.
     """
+    device = rewards.device
+    num_steps = rewards.size(0)
+    
     deltas = rewards + gamma * next_values * (1 - dones) - values
     advantages = torch.zeros_like(deltas)
     
-    advantage = 0
-    # Identify agent boundaries to prevent advantage bleed in multi-agent batch
-    for t in reversed(range(len(deltas))):
-        if t < len(deltas) - 1 and agent_ids[t] != agent_ids[t+1]:
-            advantage = 0
+    # Pre-calculate combined masks for resets (dones OR agent boundaries)
+    # boundary_mask[t] = 0 if agent_ids[t] != agent_ids[t+1] else 1
+    masks = (1 - dones) * (gamma * lmbda)
+    boundary_mask = torch.ones(num_steps, device=device)
+    if num_steps > 1:
+        boundary_mask[:-1] = (agent_ids[:-1] == agent_ids[1:]).float()
+    
+    combined_mask = masks * boundary_mask
+    
+    curr_advantage = 0
+    # The loop is still needed for GAE, but we avoid indexing agent_ids and if-checks.
+    # By using pre-calculated combined_mask, we minimize syncs.
+    for t in reversed(range(num_steps)):
+        curr_advantage = deltas[t] + curr_advantage * (combined_mask[t] if t < num_steps - 1 else 0)
+        advantages[t] = curr_advantage
         
-        advantage = deltas[t] + gamma * lmbda * (1 - dones[t]) * advantage
-        advantages[t] = advantage
     return advantages
 
 class PPOStrategy(AlgorithmStrategy):
@@ -35,11 +46,12 @@ class PPOStrategy(AlgorithmStrategy):
         self.mf_ema_alpha = 0.7
         
         # Hyperparams from user
-        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 6}
-        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 4}
-        self.lower_warmup_steps = 2
-        self.upper_warmup_steps = 2
-        self.alt_steps = 100
+        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
+        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
+        self.lower_warmup_steps = 32
+        self.upper_warmup_steps = 32
+        self.cycle_num = 1
+        self.current_phase_updates = 0
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -87,13 +99,9 @@ class PPOStrategy(AlgorithmStrategy):
             print(f"[Curriculum] Initial skip: LOWER_ONLY -> UPPER_ONLY")
             
         if self.phase == 'UPPER_ONLY' and self.upper_warmup_steps == 0:
-            self.phase = 'ALTERNATING'
-            print(f"[Curriculum] Initial skip: UPPER_ONLY -> ALTERNATING")
-            # Apply Alternating Phase defaults immediately
-            trainer.shared_lower_agent.set_lr_factor(1.0)
-            trainer.shared_upper_agent.set_lr_factor(1.0)
-            trainer.shared_lower_agent.k_epochs = 8
-            trainer.shared_upper_agent.k_epochs = 6
+            # Under new strategy, if both are 0 it might just loop or stop.
+            # We'll stick to the initialization defaults.
+            pass
 
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
@@ -269,11 +277,21 @@ class PPOStrategy(AlgorithmStrategy):
         max_slots = trainer.env.time_manager.max_steps
         ep = 0
 
-        pbar = tqdm(total=self.lower_warmup_steps + self.upper_warmup_steps + self.alt_steps, desc="Overall Training Progress")
+        # Calculate initial estimated total updates for the progress bar
+        # Cycles: 32+32, 16+16, 8+8, 4+4 = 120 total
+        total_est = 0
+        l_ws, u_ws = self.lower_warmup_steps, self.upper_warmup_steps
+        while l_ws >= 4 or u_ws >= 4:
+            total_est += l_ws + u_ws
+            l_ws //= 2
+            u_ws //= 2
+        
+        pbar = tqdm(total=total_est, desc="Sequential Refinement Progress")
         
         while True:
-            if self.phase == 'ALTERNATING' and self.alt_train_num >= self.alt_steps:
-                print(f"\n[Curriculum] Phase 3 Complete. Training Finished.")
+            # Termination check: Both steps < 4 after a full cycle completes
+            if self.lower_warmup_steps < 4 and self.upper_warmup_steps < 4:
+                print(f"\n[Curriculum] Training Finished. Final Steps: L={self.lower_warmup_steps}, U={self.upper_warmup_steps}")
                 break
                 
             obs = trainer.env.reset()
@@ -302,11 +320,12 @@ class PPOStrategy(AlgorithmStrategy):
                     prev_lower_res = results
                     trainer.total_lower_steps += 1 
                     
-                    # 1. Train Lower Level (ONLY in Phase 1)
+                    # 1. Train Lower Level (ONLY in Phase LOWER_ONLY)
                     if self.phase == 'LOWER_ONLY':
                         loss = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
                         if loss is not None:
                             self.lower_train_num += 1
+                            self.current_phase_updates += 1
                             trainer.aggregator.record_td_losses(lower_losses=loss)
                             
                             # Checkpoint
@@ -314,10 +333,11 @@ class PPOStrategy(AlgorithmStrategy):
                                 os.makedirs('checkpoints', exist_ok=True)
                                 trainer.shared_lower_agent.save(f'checkpoints/ppo_lower_{self.lower_train_num}.pth')
 
-                            # Phase Transition
-                            if self.phase == 'LOWER_ONLY' and self.lower_train_num >= self.lower_warmup_steps:
+                            # Phase Transition: LOWER_ONLY -> UPPER_ONLY
+                            if self.current_phase_updates >= self.lower_warmup_steps:
                                 self.phase = 'UPPER_ONLY'
-                                print(f"\n[Curriculum] Phase 1 Complete. Switching to {self.phase}")
+                                self.current_phase_updates = 0
+                                print(f"\n[Cycle {self.cycle_num}] LOWER Phase Complete. Switching to {self.phase}")
                             pbar.update(1)
                 else:
                     trainer.env.time_manager.tick()
@@ -331,12 +351,12 @@ class PPOStrategy(AlgorithmStrategy):
                     self.store_upper_transitions(trainer, current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
                     trainer.total_upper_steps += 1 
 
-                    # 2. Train Upper Level (ONLY in Phase 2)
+                    # 2. Train Upper Level (ONLY in Phase UPPER_ONLY)
                     if self.phase == 'UPPER_ONLY':
                         loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
                         if loss is not None:
-                            print("trainning uppper")
                             self.upper_train_num += 1
+                            self.current_phase_updates += 1
                             trainer.aggregator.record_td_losses(upper_losses=loss)
                             
                             # Checkpoint
@@ -344,34 +364,21 @@ class PPOStrategy(AlgorithmStrategy):
                                 os.makedirs('checkpoints', exist_ok=True)
                                 trainer.shared_upper_agent.save(f'checkpoints/ppo_upper_{self.upper_train_num}.pth')
 
-                            # Phase Transition
-                            if self.phase == 'UPPER_ONLY' and self.upper_train_num >= self.upper_warmup_steps:
-                                self.phase = 'ALTERNATING'
-                                print(f"\n[Curriculum] Phase 2 Complete. Switching to {self.phase}")
-                                # Apply Phase 3 overrides: 0.5x LR, 8000/800 buffers, 8/6 epochs
-                                trainer.shared_lower_agent.set_lr_factor(1)
-                                trainer.shared_upper_agent.set_lr_factor(1)
-                                trainer.shared_lower_agent.k_epochs = 8
-                                trainer.shared_upper_agent.k_epochs = 6
-                                trainer.shared_lower_agent.min_batch_size = 8000
-                                trainer.shared_upper_agent.min_batch_size = 800
+                            # Phase Transition: UPPER_ONLY -> LOWER_ONLY (and Decant steps)
+                            if self.current_phase_updates >= self.upper_warmup_steps:
+                                print(f"\n[Cycle {self.cycle_num}] UPPER Phase Complete.")
+                                # Decay steps after full cycle
+                                self.lower_warmup_steps //= 2
+                                self.upper_warmup_steps //= 2
+                                self.cycle_num += 1
+                                self.phase = 'LOWER_ONLY' if (self.lower_warmup_steps >= 1 or self.upper_warmup_steps >= 1) else 'FINISHED'
+                                self.current_phase_updates = 0
+                                
+                                if self.phase != 'FINISHED':
+                                    print(f"--- Starting Cycle {self.cycle_num} | New Targets: L={self.lower_warmup_steps}, U={self.upper_warmup_steps} ---")
+                                    # Optional: Reset buffers for on-policy consistency between cycles? 
+                                    # PPOAgent.learn already clears buffers.
                             pbar.update(1)
-
-                    # 3. Concurrent Joint Training (Phase 3)
-                    if self.phase == 'ALTERNATING':
-                        # Gated update: wait until both have collected enough Phase 3 samples
-                        if (all(s.size >= 8000 for s in trainer.shared_lower_agent.memory.buffers) and
-                            all(s.size >= 800 for s in trainer.shared_upper_agent.memory.buffers)):
-                            
-                            print(f"\n[Phase 3] Concurrent Update Triggered (L: {trainer.shared_lower_agent.memory.total_size}, U: {trainer.shared_upper_agent.memory.total_size})")
-                            loss_l = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
-                            loss_u = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
-                            
-                            if loss_l is not None and loss_u is not None:
-                                self.alt_train_num += 1
-                                trainer.aggregator.record_td_losses(lower_losses=loss_l, upper_losses=loss_u)
-                                pbar.update(1)
-                                if self.alt_train_num >= self.alt_steps: break
 
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
@@ -379,6 +386,6 @@ class PPOStrategy(AlgorithmStrategy):
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
             print(f"--- Curriculum Status ---")
-            print(f"Phase: {self.phase} | Lower: {self.lower_train_num}/{self.lower_warmup_steps} | Upper: {self.upper_train_num}/{self.upper_warmup_steps} | Alt: {self.alt_train_num}/{self.alt_steps}")
+            print(f"Cycle: {self.cycle_num} | Phase: {self.phase} | Phase Progress: {self.current_phase_updates}/{self.lower_warmup_steps if self.phase=='LOWER_ONLY' else self.upper_warmup_steps}")
             ep += 1
         pbar.close()

@@ -145,13 +145,19 @@ class MetricsAggregator:
         violations = step_output.get("violations", 0)
         self.episode_violations.append(violations)
 
-        success_qos = info.get("success_qos", {})
-        if success_qos:
-            self.episode_success_qos.append(sum(np.sum(v) for v in success_qos.values()))
+        success_qos = info.get("success_qos")
+        if success_qos is not None:
+            if isinstance(success_qos, dict):
+                self.episode_success_qos.append(sum(np.sum(v) for v in success_qos.values()))
+            else:
+                self.episode_success_qos.append(float(np.sum(success_qos)))
             
-        violate_qos = info.get("violate_qos", {})
-        if violate_qos:
-            self.episode_violate_qos.append(sum(np.sum(v) for v in violate_qos.values()))
+        violate_qos = info.get("violate_qos")
+        if violate_qos is not None:
+            if isinstance(violate_qos, dict):
+                self.episode_violate_qos.append(sum(np.sum(v) for v in violate_qos.values()))
+            else:
+                self.episode_violate_qos.append(float(np.sum(violate_qos)))
             
         # Accumulate task stats
         self.eps_assigned += info.get("num_tasks", 0)

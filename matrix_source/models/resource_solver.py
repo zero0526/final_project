@@ -83,16 +83,18 @@ class KKTSolverADMM:
             u = u + (f - z)
 
             # 4. Residual and Objective Tracking
-            res_r = torch.norm(f - z, dim=1).max().item()
-            res_s = torch.norm(rho * (z - z_prev), dim=1).max().item()
-            
-            if debug and (i + 1 in checkpoints):
-                # Calculate Current Objective: Maximize sum(G*z - Z*z^2)
-                obj_val = (G * z - Z * (z**2)).sum().item()
-                print(f"  [Checkpoint {i+1:3d}] Objective: {obj_val:12.4f} | Prim Res: {res_r:.2e} | Dual Res: {res_s:.2e}")
+            # Optim: Avoid .item() (CPU sync) in every iteration. Only check every 10 steps.
+            if i % 10 == 0 or i == max_it - 1:
+                res_r = torch.norm(f - z, dim=1).max().item()
+                res_s = torch.norm(rho * (z - z_prev), dim=1).max().item()
+                
+                if debug and (any(i + 1 == cp for cp in checkpoints)):
+                    # Calculate Current Objective: Maximize sum(G*z - Z*z^2)
+                    obj_val = (G * z - Z * (z**2)).sum().item()
+                    print(f"  [Checkpoint {i+1:3d}] Objective: {obj_val:12.4f} | Prim Res: {res_r:.2e} | Dual Res: {res_s:.2e}")
 
-            if not debug and (res_r < self.tol and res_s < self.tol):
-                break
+                if not debug and (res_r < self.tol and res_s < self.tol):
+                    break
         
         if debug:
             final_obj = (G * z - Z * (z**2)).sum().item()

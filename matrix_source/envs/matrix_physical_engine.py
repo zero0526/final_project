@@ -260,52 +260,48 @@ class MatrixPhysicalEngine:
                     accumulate=True
                 )
 
-            # 2. Xử lý các task hợp lệ bằng Batching trên CPU (Bỏ qua sync GPU chậm)
+            # 2. Xử lý các task hợp lệ hoàn toàn trên GPU (Vectorized)
             valid_hw_mask = hw_mask
             if valid_hw_mask.any():
-                # Chuyển dữ liệu sang List của Python (chạy trên RAM)
-                sv_n = vn[valid_hw_mask].tolist()
-                sv_s = vs[valid_hw_mask].tolist()
-                sv_w = vw[valid_hw_mask].tolist()
-                sv_t = vt[valid_hw_mask].tolist()
-                sv_fmin = p_f_min_all[valid_hw_mask].tolist()
+                vn_v = vn[valid_hw_mask]
+                vs_v = vs[valid_hw_mask]
+                vw_v = vw[valid_hw_mask]
+                vt_v = vt[valid_hw_mask]
+                vfmin_v = p_f_min_all[valid_hw_mask]
                 
-                # Fetch pointers về RAM 1 lần duy nhất thay vì item() mỗi vòng
-                local_counts = self.backlog_counts.cpu().numpy()
+                # Calculate offsets for each task within its (node, service) group in this batch
+                flat_idx = vn_v * self.num_services + vs_v
+                offsets = ops.get_running_counts(flat_idx)
                 
-                batch_n, batch_s, batch_k = [], [], []
-                batch_w, batch_t, batch_fmin = [], [], []
-                fail_n, fail_s = [], []
+                # Target pointers in the backlog queue
+                target_ptrs = self.backlog_counts[vn_v, vs_v] + offsets
                 
-                for n, s, w, t, fmin in zip(sv_n, sv_s, sv_w, sv_t, sv_fmin):
-                    ptr = local_counts[n, s]
-                    if ptr < self.max_K:
-                        batch_n.append(n)
-                        batch_s.append(s)
-                        batch_k.append(ptr)
-                        batch_w.append(w)
-                        batch_t.append(t)
-                        batch_fmin.append(fmin)
-                        local_counts[n, s] += 1
-                    else:
-                        fail_n.append(n)
-                        fail_s.append(s)
+                # Filter tasks that fit into max_K
+                can_fit_mask = target_ptrs < self.max_K
                 
-                # Cập nhật hàng loạt (Bulk update) vào GPU
-                if batch_n:
-                    b_n = torch.tensor(batch_n, device=self.device)
-                    b_s = torch.tensor(batch_s, device=self.device)
-                    b_k = torch.tensor(batch_k, device=self.device)
+                if can_fit_mask.any():
+                    fit_vn = vn_v[can_fit_mask]
+                    fit_vs = vs_v[can_fit_mask]
+                    fit_ptrs = target_ptrs[can_fit_mask]
                     
-                    self.backlog_queue[b_n, b_s, b_k] = torch.tensor(batch_w, dtype=self.backlog_queue.dtype, device=self.device)
-                    self.deadline_queue[b_n, b_s, b_k] = torch.tensor(batch_t, dtype=self.deadline_queue.dtype, device=self.device)
-                    self.f_min_queue[b_n, b_s, b_k] = torch.tensor(batch_fmin, dtype=self.f_min_queue.dtype, device=self.device)
-                    self.backlog_counts.copy_(torch.from_numpy(local_counts).to(self.device))
+                    # Bulk update to GPU queues
+                    self.backlog_queue[fit_vn, fit_vs, fit_ptrs] = vw_v[can_fit_mask]
+                    self.deadline_queue[fit_vn, fit_vs, fit_ptrs] = vt_v[can_fit_mask]
+                    self.f_min_queue[fit_vn, fit_vs, fit_ptrs] = vfmin_v[can_fit_mask]
+                    
+                    # Update backlog_counts by the number of tasks added per (node, service)
+                    added_per_group = torch.zeros_like(self.backlog_counts, dtype=torch.long)
+                    added_per_group.index_put_((fit_vn, fit_vs), torch.ones_like(fit_vn, dtype=torch.long), accumulate=True)
+                    self.backlog_counts += added_per_group
                 
-                if fail_n:
-                    f_n = torch.tensor(fail_n, device=self.device)
-                    f_s = torch.tensor(fail_s, device=self.device)
-                    self.immediate_fails.index_put_((f_n, f_s), torch.ones_like(f_s, dtype=torch.float), accumulate=True)
+                # Handle overflows (tasks that exceeded max_K)
+                overflow_mask = ~can_fit_mask
+                if overflow_mask.any():
+                    self.immediate_fails.index_put_(
+                        (vn_v[overflow_mask], vs_v[overflow_mask]), 
+                        torch.ones_like(vs_v[overflow_mask], dtype=torch.float), 
+                        accumulate=True
+                    )
             
             node_arrival_matrix.index_put_((vn, vs), vw, accumulate=True)
             
@@ -342,11 +338,8 @@ class MatrixPhysicalEngine:
         self.backlog_counts = (self.backlog_queue > 1e-6).sum(dim=-1)
         
         violate_step_tensor = expired_counts_tensor + self.immediate_fails
-        num_violations = int(violate_step_tensor.sum().item())
         
         # Success count calculation: before + arrivals - current - failed
-        # Careful: arrivals_counts_step only includes those that ENTERED or were IMMEDIATELY FAILED.
-        # So count_before + arrivals_counts_step is the total tasks we dealt with.
         success_qos_tensor = (count_before + self.arrival_counts_step - self.backlog_counts - violate_step_tensor).clamp(min=0)
         
         total_drift = ops.calculate_lyapunov_drift(current_backlog_total, node_arrival_matrix, self.cpu_alloc_matrix * self.slot_duration)
@@ -357,29 +350,35 @@ class MatrixPhysicalEngine:
         total_energy = comp_energy + trans_energy_total
         
         f1 = total_drift + self.lypa_coef * total_energy
-        self.reward_global_accumulator += f1.item()
         
-        qos_penalty = self.omega_1 * torch.exp(torch.tensor(self.omega_2 * num_violations, device=self.device))
+        # Calculate Reward on GPU without pulling values to CPU intermediate
+        num_violations_tot = violate_step_tensor.sum() # Keep as tensor
+        qos_penalty = self.omega_1 * torch.exp(self.omega_2 * num_violations_tot)
         reward = -(f1 + qos_penalty)
+        
+        self.reward_global_accumulator += f1 # Keep accumulator as tensor/float sum
+        
         obs = {
             "total_drift": total_drift,
             "task_reqs": self.current_task_reqs.clone(),
             "backlog": self.backlog_queue.sum(dim=-1).clone(),
             "cpu_alloc": self.cpu_alloc_matrix.clone()
         }
+        
+        # Pull to CPU in batch if info is requested
         info = {
             "num_tasks": self.current_num_tasks,
-            "immediate_fails": int(self.immediate_fails.sum().item()),
-            "expired_count": int(violate_step_tensor.sum().item() - self.immediate_fails.sum().item()),
-            "remaining": int(self.backlog_counts.sum().item()),
-            "success_qos": {i: success_qos_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
-            "violate_qos": {i: violate_step_tensor[i].cpu().numpy() for i in range(self.num_nodes)},
-            "arrival_matrix": self.arrival_counts_step.clone() # Return snapshot
+            "immediate_fails": int(self.immediate_fails.sum()), # Single sync
+            "expired_count": int(violate_step_tensor.sum() - self.immediate_fails.sum()), # Single sync
+            "remaining": int(self.backlog_counts.sum()), # Single sync
+            "success_qos": success_qos_tensor.cpu().numpy(), # Batched CPU move
+            "violate_qos": violate_step_tensor.cpu().numpy(), # Batched CPU move
+            "arrival_matrix": self.arrival_counts_step.clone() 
         }
         res = {
             "reward": reward,
             "energy": total_energy,
-            "violations": num_violations,
+            "violations": num_violations_tot.item(),
             "obs": obs,
             "info": info,
             "mean_field": self._calc_terminal_mean_field(),

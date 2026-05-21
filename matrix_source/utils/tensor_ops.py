@@ -115,3 +115,36 @@ def compute_batch_energy(f_alloc, processed, epsilon_comp, cold_delays, epsilon_
     comp_energy = epsilon_comp * (f_alloc ** 2) * processed
     cold_energy = cold_delays*epsilon_cold
     return comp_energy.sum() + cold_energy.sum()
+
+def get_running_counts(labels):
+    """
+    Computes a running count (offset) for each label in the input tensor.
+    Example: [0, 1, 0, 0, 1, 2] -> [0, 0, 1, 2, 1, 0]
+    """
+    if labels.numel() == 0:
+        return torch.empty_like(labels)
+        
+    sort_idx = torch.argsort(labels)
+    sorted_labels = labels[sort_idx]
+    
+    # Identify where labels change using a shift-comparison
+    transitions = torch.zeros_like(sorted_labels, dtype=torch.long)
+    transitions[0] = 1
+    transitions[1:] = (sorted_labels[1:] != sorted_labels[:-1]).long()
+    
+    # first_occurrences contains the first index of each new label in the sorted array
+    first_occurrences_idx = torch.where(transitions == 1)[0]
+    
+    # counts per label
+    counts = torch.diff(torch.cat([first_occurrences_idx, torch.tensor([len(labels)], device=labels.device)]))
+    
+    # repeat the first occurrence index to match the scale of sorted_labels
+    repeated_first = first_occurrences_idx.repeat_interleave(counts)
+    
+    # calculate offsets in the sorted array
+    sorted_offsets = torch.arange(len(labels), device=labels.device) - repeated_first
+    
+    # Map back to original order
+    offsets = torch.zeros_like(sorted_offsets)
+    offsets[sort_idx] = sorted_offsets
+    return offsets
