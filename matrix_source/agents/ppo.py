@@ -129,7 +129,7 @@ class MFNetwork(nn.Module):
 
 class PPOAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim, 
-                 mf_hidden_sizes, mf_lr, buffer_min_size, hidden_sizes=(128, 64), 
+                 mf_hidden_sizes, mf_lr, buffer_min_size, entropy_coef_start= 0.2,entropy_coef_end= 0.1,total_train_steps= 100,hidden_sizes=(128, 64),
                  lr=3e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64, 
                  lam=0.95, clip_eps=0.2, k_epochs=5, entropy_coef=0.01,
                  exclude_zero=False, num_instances=1, device=None):
@@ -151,6 +151,9 @@ class PPOAgent:
         self.exclude_zero = exclude_zero
         
         # PPO Hyperparameters
+        self.entropy_coef_start = entropy_coef_start
+        self.entropy_coef_end = entropy_coef_end
+        self.total_train_steps= total_train_steps
         self.gamma = gamma
         self.lmbda = lam
         self.eps_clip = clip_eps
@@ -384,3 +387,10 @@ class PPOAgent:
             for param_group in opt.param_groups:
                 param_group['lr'] *= factor
         print(f"[{self.node_type}] Learning rate scaled by {factor}. New Actor LR: {self.optimizer_actor.param_groups[0]['lr']:.6f}")
+
+    def update_entropy_coef(self, step: int):
+        T = self.total_train_steps
+
+        # c_e(t) = c_start + (c_end - c_start) * min(t / T, 1.0)
+        progress = min(step / T, 1.0)
+        self.entropy_coef = self.entropy_coef_start + (self.entropy_coef_end - self.entropy_coef_start) * progress

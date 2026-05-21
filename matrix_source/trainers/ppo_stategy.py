@@ -4,6 +4,8 @@ from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.utils.math_utils import to_binary
 from tqdm import tqdm
 import os
+import numpy as np
+from datetime import datetime
 
 def compute_gae(rewards, next_values, values, dones, agent_ids, gamma, lmbda):
     """
@@ -37,7 +39,6 @@ def compute_gae(rewards, next_values, values, dones, agent_ids, gamma, lmbda):
 class PPOStrategy(AlgorithmStrategy):
     def __init__(self):
         super().__init__()
-        self.phase = 'LOWER_ONLY' # 'LOWER_ONLY', 'UPPER_ONLY', 'ALTERNATING'
         self.lower_train_num = 0
         self.upper_train_num = 0
         self.alt_train_num = 0
@@ -45,13 +46,19 @@ class PPOStrategy(AlgorithmStrategy):
         self.upper_mf_ema = None
         self.mf_ema_alpha = 0.7
         
-        # Hyperparams from user
+        # Hyperparams from user (Strategy: Fixed 100 Cycles)
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-        self.lower_warmup_steps = 32
-        self.upper_warmup_steps = 32
+        
+        self.upper_warmup_steps = 5 # "upper train đúng 6 epoc"
+        self.lower_warmup_steps = 15 # "lower thì 5 epoch"
+        self.max_cycles = 20
+        
+        self.phase = 'LOWER_ONLY'
         self.cycle_num = 1
         self.current_phase_updates = 0
+        self.entropy_decay_rate = 0.99
+        self.is_evaluating = False
 
     def initialize_agents(self, trainer):
         # 1. Upper Agent
@@ -63,6 +70,9 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.upper_cfg['min_size'],
+            entropy_coef_start=0.04,
+            entropy_coef_end=0.003,
+            total_train_steps=100,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
@@ -83,6 +93,9 @@ class PPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.lower_cfg['min_size'],
+            entropy_coef_start= 0.015,
+            entropy_coef_end=  0.001,
+            total_train_steps= 300,
             hidden_sizes=tuple(trainer.config.hyper_neural['AGENT_HIDDEN_LAYER']),
             lr=float(trainer.config.hyper_neural['LOWER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
@@ -106,14 +119,7 @@ class PPOStrategy(AlgorithmStrategy):
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
         
-        # 1. Random actions in Lower-Only phase
-        if self.phase == 'LOWER_ONLY':
-            act_matrix[trainer.edge_node_ids] = torch.randint(0, 2, (len(trainer.edge_node_ids), trainer.num_services), device=trainer.device).float()
-            for nid in trainer.env.static_matrices.get("cloud_ids", []):
-                act_matrix[nid] = torch.ones(trainer.num_services, device=trainer.device)
-            return act_matrix
-            
-        # 2. Get Observed Mean Field and Update EMA (Upper only)
+        # 1. Get Observed Mean Field and Update EMA
         mf_global = obs_upper.get('mean_fields', torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
         if self.upper_mf_ema is None:
             self.upper_mf_ema = mf_global.clone()
@@ -124,9 +130,8 @@ class PPOStrategy(AlgorithmStrategy):
         edge_mfs = self.upper_mf_ema[trainer.edge_node_ids]
         instance_indices = torch.tensor([trainer.node_to_instance[nid] for nid in trainer.edge_node_ids], device=trainer.device)
         
-        # Use stochastic (det=False) in UPPER_ONLY phase.
-        # In ALTERNATING phase, both are stochastic (joint training).
-        is_det = False
+        # Use is_evaluating flag to determine if we should use argmax
+        is_det = self.is_evaluating
         
         batch_a_ids = trainer.shared_upper_agent.choose_action_batch(
             edge_states, edge_mfs, agent_indices=instance_indices, deterministic=is_det
@@ -183,8 +188,8 @@ class PPOStrategy(AlgorithmStrategy):
         masks = self.calculate_lower_masks(trainer, t_idx, s_idx, tasks_min_accuracy)
         mfs = mf_terminals[t_idx]
         
-        # "Freeze" lower (argmax) only during Upper-Only phase. In Alternating, both are stochastic.
-        is_det = (self.phase == 'UPPER_ONLY')
+        # Use is_evaluating flag to determine if we should use argmax
+        is_det = self.is_evaluating
         
         batch_actions = trainer.shared_lower_agent.choose_action_batch(
             states, mfs, masks_batch=masks, 
@@ -215,11 +220,11 @@ class PPOStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_lower_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         
-        # 3. Handle MF training and transition storage (only if NOT frozen)
+        # 3. Handle MF training and transition storage (only if NOT frozen and NOT evaluating)
         avg_mf_loss = None
         is_frozen = (self.phase == 'UPPER_ONLY')
         
-        if not is_frozen:
+        if not is_frozen and not self.is_evaluating:
             done = torch.tensor([next_res["new_frame"]]*len(t_idx), dtype=torch.float32, device=trainer.device)
             c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
             rewards = torch.full((len(t_idx),), norm_rew, dtype=torch.float32, device=trainer.device)
@@ -240,13 +245,14 @@ class PPOStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_upper_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         
-        # 2. Handle MF training and transition storage (if NOT frozen)
+        # 2. Handle MF training and transition storage (if NOT frozen and NOT evaluating)
         avg_mf_loss = None
         is_frozen = (self.phase == 'LOWER_ONLY')
         
-        edge_states = s_all[trainer.edge_node_ids]
+        # Safely extract edge_states for metric recording
+        edge_states = s_all[trainer.edge_node_ids] if s_all is not None else None
         
-        if not is_frozen:
+        if not is_frozen and not self.is_evaluating:
             edge_next_states = ns_all[trainer.edge_node_ids]
             dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32, device=trainer.device)
 
@@ -271,29 +277,25 @@ class PPOStrategy(AlgorithmStrategy):
             )
             
         # 3. ALWAYS record metrics!
-        trainer.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=edge_states[0] if len(edge_states) > 0 else None)
+        agg_state = edge_states[0] if (edge_states is not None and len(edge_states) > 0) else None
+        trainer.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=agg_state)
+        
+        # If evaluating, return step metrics
+        if self.is_evaluating:
+            return {
+                'reward': next_res['reward_global'],
+                'backlog': next_res['obs']['backlog'].sum().item(),
+                'energy': next_res['info'].get('energy', 0.0) # Assume energy is in info
+            }
+        return None
 
     def run_training(self, trainer):
         max_slots = trainer.env.time_manager.max_steps
         ep = 0
 
-        # Calculate initial estimated total updates for the progress bar
-        # Cycles: 32+32, 16+16, 8+8, 4+4 = 120 total
-        total_est = 0
-        l_ws, u_ws = self.lower_warmup_steps, self.upper_warmup_steps
-        while l_ws >= 4 or u_ws >= 4:
-            total_est += l_ws + u_ws
-            l_ws //= 2
-            u_ws //= 2
+        pbar = tqdm(total=self.max_cycles, desc="Sequential Refinement Progress")
         
-        pbar = tqdm(total=total_est, desc="Sequential Refinement Progress")
-        
-        while True:
-            # Termination check: Both steps < 4 after a full cycle completes
-            if self.lower_warmup_steps < 4 and self.upper_warmup_steps < 4:
-                print(f"\n[Curriculum] Training Finished. Final Steps: L={self.lower_warmup_steps}, U={self.upper_warmup_steps}")
-                break
-                
+        while self.cycle_num <= self.max_cycles:
             obs = trainer.env.reset()
             obs_upper = obs['upper']
             prev_lower_res = obs['lower']
@@ -318,16 +320,17 @@ class PPOStrategy(AlgorithmStrategy):
                     )
                     
                     prev_lower_res = results
-                    trainer.total_lower_steps += 1 
-                    
+
                     # 1. Train Lower Level (ONLY in Phase LOWER_ONLY)
                     if self.phase == 'LOWER_ONLY':
                         loss = trainer.shared_lower_agent.learn(torch.arange(trainer.num_terminals, device=trainer.device))
                         if loss is not None:
+                            trainer.total_lower_steps += 1
                             self.lower_train_num += 1
                             self.current_phase_updates += 1
+                            trainer.shared_lower_agent.update_entropy_coef(trainer.total_lower_steps)
                             trainer.aggregator.record_td_losses(lower_losses=loss)
-                            
+
                             # Checkpoint
                             if self.lower_train_num % 10 == 0:
                                 os.makedirs('checkpoints', exist_ok=True)
@@ -337,8 +340,7 @@ class PPOStrategy(AlgorithmStrategy):
                             if self.current_phase_updates >= self.lower_warmup_steps:
                                 self.phase = 'UPPER_ONLY'
                                 self.current_phase_updates = 0
-                                print(f"\n[Cycle {self.cycle_num}] LOWER Phase Complete. Switching to {self.phase}")
-                            pbar.update(1)
+                                print(f"\n[Cycle {self.cycle_num}] LOWER Phase Complete. Switching to UPPER training.")
                 else:
                     trainer.env.time_manager.tick()
 
@@ -347,16 +349,17 @@ class PPOStrategy(AlgorithmStrategy):
                     next_upper_state = self.build_upper_state(trainer, res_upper)
                     trainer.aggregator.add_upper(res_upper)
                     is_ep_done = (slot == max_slots - 1)
-                    
+
                     self.store_upper_transitions(trainer, current_upper_state, next_upper_state, obs_upper, res_upper, u_acts_matrix, is_ep_done)
-                    trainer.total_upper_steps += 1 
 
                     # 2. Train Upper Level (ONLY in Phase UPPER_ONLY)
                     if self.phase == 'UPPER_ONLY':
                         loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
                         if loss is not None:
+                            trainer.total_upper_steps += 1
                             self.upper_train_num += 1
                             self.current_phase_updates += 1
+                            trainer.shared_upper_agent.update_entropy_coef(trainer.total_upper_steps)
                             trainer.aggregator.record_td_losses(upper_losses=loss)
                             
                             # Checkpoint
@@ -364,21 +367,17 @@ class PPOStrategy(AlgorithmStrategy):
                                 os.makedirs('checkpoints', exist_ok=True)
                                 trainer.shared_upper_agent.save(f'checkpoints/ppo_upper_{self.upper_train_num}.pth')
 
-                            # Phase Transition: UPPER_ONLY -> LOWER_ONLY (and Decant steps)
+                            # Phase Transition: UPPER_ONLY -> LOWER_ONLY (Cycle End)
                             if self.current_phase_updates >= self.upper_warmup_steps:
-                                print(f"\n[Cycle {self.cycle_num}] UPPER Phase Complete.")
-                                # Decay steps after full cycle
-                                self.lower_warmup_steps //= 2
-                                self.upper_warmup_steps //= 2
-                                self.cycle_num += 1
-                                self.phase = 'LOWER_ONLY' if (self.lower_warmup_steps >= 1 or self.upper_warmup_steps >= 1) else 'FINISHED'
+                                self.phase = 'LOWER_ONLY'
                                 self.current_phase_updates = 0
                                 
-                                if self.phase != 'FINISHED':
-                                    print(f"--- Starting Cycle {self.cycle_num} | New Targets: L={self.lower_warmup_steps}, U={self.upper_warmup_steps} ---")
-                                    # Optional: Reset buffers for on-policy consistency between cycles? 
-                                    # PPOAgent.learn already clears buffers.
-                            pbar.update(1)
+                                # End of a full Lower-Upper pair cycle
+                                # Decay entropy for both agents
+
+                                pbar.update(1)
+                                print(f"\n[Cycle {self.cycle_num}] FULL Cycle Complete. New Entropy Coef: {trainer.shared_lower_agent.entropy_coef:.6f}")
+                                self.cycle_num += 1
 
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
@@ -389,3 +388,98 @@ class PPOStrategy(AlgorithmStrategy):
             print(f"Cycle: {self.cycle_num} | Phase: {self.phase} | Phase Progress: {self.current_phase_updates}/{self.lower_warmup_steps if self.phase=='LOWER_ONLY' else self.upper_warmup_steps}")
             ep += 1
         pbar.close()
+        
+        # --- Start Post-Training Evaluation ---
+        self.run_evaluation(trainer, num_episodes=5)
+
+    def run_evaluation(self, trainer, num_episodes=5):
+        print(f"\n--- Starting Post-Training Evaluation ({num_episodes} Episodes) ---")
+        self.is_evaluating = True
+        max_slots = trainer.env.time_manager.max_steps
+        
+        eval_metrics = {
+            'rewards': [],
+            'backlogs': [],
+            'energies': [],
+            'success_rates': []
+        }
+        
+        for ep in range(num_episodes):
+            obs = trainer.env.reset()
+            obs_upper = obs['upper']
+            prev_lower_res = obs['lower']
+            current_upper_state = self.build_upper_state(trainer, obs_upper)
+            
+            ep_reward = 0
+            ep_backlog = []
+            ep_energy = 0
+            
+            for slot in range(max_slots):
+                if trainer.env.time_manager.is_new_frame():
+                    u_acts_matrix = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                    trainer.env.step_upper(u_acts_matrix)
+
+                t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
+                if len(t_idx) > 0:
+                    n_idx, m_idx, masks = self.get_lower_actions(trainer, prev_lower_res, t_idx, s_idx, tasks_min_accuracy, task_deadlines, batch_sizes)
+                    results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, n_idx, m_idx, task_deadlines, tasks_min_accuracy)
+                    
+                    # Record lower metrics
+                    self.store_lower_transitions(trainer, prev_lower_res, results, t_idx, s_idx, n_idx, m_idx, masks)
+                    
+                    # Record upper metrics 
+                    # Use current_upper_state if available, results otherwise
+                    self.store_upper_transitions(trainer, current_upper_state, None, obs_upper, results, u_acts_matrix, (slot == max_slots - 1))
+                    
+                    ep_reward += results['reward_global']
+                    ep_backlog.append(results['obs']['backlog'].sum().item())
+                    ep_energy += results.get('energy', results['info'].get('energy', 0.0))
+                    
+                    prev_lower_res = results
+                else:
+                    trainer.env.time_manager.tick()
+
+                if trainer.env.time_manager.is_new_frame():
+                    res_upper = trainer.env.collect_upper_metrics()
+                    obs_upper = res_upper
+                    current_upper_state = self.build_upper_state(trainer, res_upper)
+            
+            eval_metrics['rewards'].append(ep_reward)
+            eval_metrics['backlogs'].append(np.mean(ep_backlog) if ep_backlog else 0)
+            eval_metrics['energies'].append(ep_energy)
+            
+            print(f"Eval Episode {ep+1}: Reward={ep_reward:.2f}, Avg Backlog={eval_metrics['backlogs'][-1]:.2f}")
+
+        # Generate Report
+        self.generate_report(eval_metrics)
+        self.is_evaluating = False
+
+    def generate_report(self, metrics):
+        report_path = f"evaluation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        
+        avg_reward = np.mean(metrics['rewards'])
+        avg_backlog = np.mean(metrics['backlogs'])
+        avg_energy = np.mean(metrics['energies'])
+        
+        content = f"""# Post-Training Evaluation Report
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Summary of Deterministic Execution (5 Episodes)
+| Metric | Average Value |
+| :--- | :--- |
+| **Total Reward** | {avg_reward:.4f} |
+| **Mean Backlog** | {avg_backlog:.4f} |
+| **Total Energy** | {avg_energy:.4f} |
+
+## Details per Episode
+"""
+        for i in range(len(metrics['rewards'])):
+            content += f"- Episode {i+1}: Reward={metrics['rewards'][i]:.2f}, Backlog={metrics['backlogs'][i]:.2f}, Energy={metrics['energies'][i]:.2f}\n"
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        
+        print(f"\n[Evaluation] Report generated: {report_path}")
+        print("="*40)
+        print(content)
+        print("="*40)

@@ -293,6 +293,16 @@ class MASAC(AlgorithmStrategy):
                     metrics = trainer.shared_lower_agent.train_step(trainer.shared_lower_agent.memory, batch_size=batch_size)
                     if metrics:
                         self.lower_train_num += 1
+                        
+                        # Record metrics for visualization
+                        trainer.aggregator.record_q_stats(
+                            "Terminal_Group", 
+                            q_min=metrics.get("q_min", 0.0), # SAC usually reports mean, fallback
+                            q_max=metrics.get("q_max", 0.0), 
+                            q_mean=metrics.get("q_mean", 0.0)
+                        )
+                        trainer.aggregator.record_td_losses(lower_losses=metrics.get("critic_loss", 0.0))
+
                         # Save checkpoint randomly or per interval
                         if self.lower_train_num % 1000 == 0:
                             os.makedirs('checkpoints', exist_ok=True)

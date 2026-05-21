@@ -353,7 +353,7 @@ class MatrixPhysicalEngine:
         
         # Calculate Reward on GPU without pulling values to CPU intermediate
         num_violations_tot = violate_step_tensor.sum() # Keep as tensor
-        qos_penalty = self.omega_1 * torch.exp(self.omega_2 * num_violations_tot)
+        qos_penalty = 19000*self.omega_1 * torch.exp(self.omega_2 * num_violations_tot)
         reward = -(f1 + qos_penalty)
         
         self.reward_global_accumulator += f1 # Keep accumulator as tensor/float sum

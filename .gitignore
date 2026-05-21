@@ -6,6 +6,7 @@ data/checkpoints
 # C extensions
 *.so
 data/logs
+checkpoints
 # Distribution / packaging
 .Python
 build/
