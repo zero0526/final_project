@@ -67,7 +67,6 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             buffer_min_size=self.upper_cfg['min_size'],
-             total_train_steps=30,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],

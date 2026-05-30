@@ -149,7 +149,7 @@ class MFNetwork(nn.Module):
 class PPOAgent:
     def __init__(self, node_id, node_type, state_dim, action_dim, u_action_dim,
                  mf_hidden_sizes, mf_lr, buffer_min_size,
-                 total_train_steps=100, hidden_sizes=(128, 64),
+                 hidden_sizes=(128, 64),
                  lr=1e-4,critic_lr=5e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
                  lam=0.95, clip_eps=0.4, k_epochs=5, entropy_coef=0.05,
                  exclude_zero=False, num_instances=1, device=None):
