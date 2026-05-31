@@ -1,9 +1,10 @@
 import torch
 from matrix_source.agents.ppo import PPOAgent
-from matrix_source.agents.residual_routing import ResidualRoutingAgent
+from matrix_source.agents.residual_k_step_v2 import ResidualRoutingAgent
 
 from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.trainers.train import log_transform
+from matrix_source.visualize.kstep_monitor import KStepMonitor
 from matrix_source.utils.math_utils import to_binary
 from tqdm import tqdm
 
@@ -108,6 +109,14 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
 
         if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
             self.phase = 'UPPER_ONLY'
+
+        # standalone K-step diagnostics monitor
+        self.kstep_monitor = KStepMonitor(
+            save_dir   = trainer.config.plot_dir,
+            name       = "residual_ppo",
+            plot_every = 5,
+            window     = 10
+        )
 
     # ==========================================
     # UPPER LEVEL FUNCTIONS (GIỮ NGUYÊN TOÀN BỘ)
@@ -348,6 +357,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                                 self.lower_train_num += 1
                                 self.current_phase_updates += 1
                                 trainer.aggregator.record_td_losses(lower_losses=loss)
+                                self.kstep_monitor.record(trainer.shared_lower_agent)
                                 if self.current_phase_updates >= self.lower_warmup_steps:
                                     self.phase = 'UPPER_ONLY'
                                     self.current_phase_updates = 0

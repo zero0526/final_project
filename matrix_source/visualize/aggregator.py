@@ -87,6 +87,7 @@ class MetricsAggregator:
         self.eps_hw_fail_count = None
         self.episode_fail_reasons = {'deadline': 0, 'hardware': 0, 'queue_full': 0, 'invalid_placement': 0}
 
+
     def add_upper(self, step_output, mf_loss=0, state=None):
         if isinstance(step_output, dict):
             self.episode_upper_rewards.append(step_output.get("reward_global", 0))
