@@ -1,6 +1,6 @@
 import torch
 from matrix_source.agents.ppo import PPOAgent
-from matrix_source.agents.residual_routing import ResidualRoutingAgent
+from matrix_source.agents.residual_k_step_v2 import ResidualRoutingAgent
 
 from matrix_source.trainers.strategies import AlgorithmStrategy
 from matrix_source.trainers.train import log_transform
