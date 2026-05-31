@@ -9,6 +9,6 @@ from matrix_source.configs.configs import cfg
 cfg.hyper_neural["NUM_LOWER_AGENTS"]= 20
 
 if __name__ == '__main__':
-    strategy = PPOStrategy()
+    strategy = ResidualRoutingPPOStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()
