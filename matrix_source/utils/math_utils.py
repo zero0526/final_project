@@ -1,5 +1,6 @@
 import numpy as np
 import torch.nn.functional as F
+import torch
 
 def to_binary(action_id, dim):
     """
@@ -42,5 +43,29 @@ def compute_kl(prop_logits, delta_logits, mask=None):
 
     kl = (p * (log_p - log_q)).sum(dim=-1).mean()
     return kl
+
+def compute_gae(rewards, next_values, values, dones, agent_ids, gamma, lmbda):
+    """Generalized Advantage Estimation. Vectorized mask."""
+    device = rewards.device
+    num_steps = rewards.size(0)
+
+    deltas = rewards + gamma * next_values * (1 - dones) - values
+    advantages = torch.zeros_like(deltas)
+
+    masks = (1 - dones) * (gamma * lmbda)
+    boundary_mask = torch.ones(num_steps, device=device)
+    if num_steps > 1:
+        boundary_mask[:-1] = (agent_ids[:-1] == agent_ids[1:]).float()
+
+    combined_mask = masks * boundary_mask
+
+    curr_advantage = 0
+    for t in reversed(range(num_steps)):
+        curr_advantage = deltas[t] + curr_advantage * (
+            combined_mask[t] if t < num_steps - 1 else 0
+        )
+        advantages[t] = curr_advantage
+
+    return advantages
 
 

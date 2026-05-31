@@ -50,6 +50,7 @@ class MatrixPhysicalEngine:
         
         self.cpu_alloc_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.placement_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
+        self.wait_time_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.prev_placement_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
         self.newly_placed_mask = torch.zeros((self.num_nodes, self.num_services), dtype=torch.bool, device=self.device)
         self.used_resources = torch.zeros((self.num_nodes, 4), device=self.device)
@@ -105,6 +106,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue.zero_()
         self.backlog_counts.zero_()
         self.deadline_queue.zero_()
+        self.wait_time_queue.zero_()
         self.f_min_queue.zero_()
         self.immediate_fails.zero_()
         self.fail_placement.zero_()
@@ -381,6 +383,7 @@ class MatrixPhysicalEngine:
                     vq_n, vq_s, vq_k = v_hw_n[valid_queue_mask], v_hw_s[valid_queue_mask], absolute_ks[valid_queue_mask]
                     self.backlog_queue[vq_n, vq_s, vq_k] = v_hw_w[valid_queue_mask]
                     self.deadline_queue[vq_n, vq_s, vq_k] = v_hw_t[valid_queue_mask]
+                    self.wait_time_queue[vq_n, vq_s, vq_k] = trans_delays[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     self.f_min_queue[vq_n, vq_s, vq_k] = v_hw_fmin[valid_queue_mask]
                     self.terminal_queue[vq_n, vq_s, vq_k] = terminal_indices[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     
@@ -429,15 +432,17 @@ class MatrixPhysicalEngine:
         # Terminal -> source node mapping (num_terminals,)
         src_node_mapping = torch.argmax(self.terminal_to_node_map, dim=1).long()
         
-        self.backlog_queue, actual_processed, local_processed = ops.deplete_float_queue(
-            self.backlog_queue, self.deadline_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
-        )
-        
-        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids = ops.age_and_clean_dual_queue(
-            self.backlog_queue, self.deadline_queue, self.slot_duration, self.f_min_queue, self.terminal_queue
+        self.backlog_queue, actual_processed, local_processed, success_delays = ops.deplete_float_queue(
+            self.backlog_queue, self.deadline_queue, self.wait_time_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
         )
 
-        self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1]
+        self.wait_time_queue += self.slot_duration
+        
+        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids = ops.age_and_clean_dual_queue(
+            self.backlog_queue, self.deadline_queue, self.slot_duration, self.f_min_queue, self.terminal_queue, self.wait_time_queue
+        )
+
+        self.f_min_queue, self.terminal_queue, self.wait_time_queue = processed_aux[0], processed_aux[1], processed_aux[2]
         
         if failed_terminal_ids is not None and len(failed_terminal_ids) > 0:
             self.terminal_fail_counts.index_put_((failed_terminal_ids.long(), failed_svc_ids.long()), torch.ones_like(failed_terminal_ids, dtype=torch.float), accumulate=True)
@@ -508,7 +513,8 @@ class MatrixPhysicalEngine:
                 "expired": expired_counts_tensor.sum(),
                 "hw_deficit_per_svc": self.service_hw_deficit,
                 "hw_fail_count_per_svc": self.service_hw_fail_count
-            }
+            },
+            "avg_resolution_time_success": float(success_delays.mean()) if success_delays.numel() > 0 else 0.0
         }
         res = {
             "pre_reward": -total_energy,

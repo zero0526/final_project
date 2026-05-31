@@ -125,3 +125,40 @@ class MF(nn.Module):
     def forward(self, x, indices=None):
         x = torch.nn.functional.silu(self.norm(self.l1(x, indices), indices))
         return torch.sigmoid(self.l2(x, indices))
+
+class MultiInstanceGRUCell(nn.Module):
+    """Instance-specific GRU Cell."""
+
+    def __init__(self, num_instances, input_size, hidden_size):
+        super().__init__()
+        self.num_instances = num_instances
+        self.hidden_size = hidden_size
+        self.weight_ih = nn.Parameter(torch.Tensor(num_instances, input_size, 3 * hidden_size))
+        self.weight_hh = nn.Parameter(torch.Tensor(num_instances, hidden_size, 3 * hidden_size))
+        self.bias_ih = nn.Parameter(torch.Tensor(num_instances, 3 * hidden_size))
+        self.bias_hh = nn.Parameter(torch.Tensor(num_instances, 3 * hidden_size))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for i in range(self.num_instances):
+            nn.init.orthogonal_(self.weight_ih[i])
+            nn.init.orthogonal_(self.weight_hh[i])
+            nn.init.zeros_(self.bias_ih[i])
+            nn.init.zeros_(self.bias_hh[i])
+
+    def forward(self, x, hx, indices=None):
+        if indices is None:
+            indices = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        w_ih = self.weight_ih[indices]
+        w_hh = self.weight_hh[indices]
+        b_ih = self.bias_ih[indices]
+        b_hh = self.bias_hh[indices]
+        gi = torch.bmm(x.unsqueeze(1), w_ih).squeeze(1) + b_ih
+        gh = torch.bmm(hx.unsqueeze(1), w_hh).squeeze(1) + b_hh
+        i_r, i_i, i_n = gi.chunk(3, dim=-1)
+        h_r, h_i, h_n = gh.chunk(3, dim=-1)
+        reset_gate = torch.sigmoid(i_r + h_r)
+        input_gate = torch.sigmoid(i_i + h_i)
+        new_gate = torch.tanh(i_n + reset_gate * h_n)
+        hy = new_gate + input_gate * (hx - new_gate)
+        return hy

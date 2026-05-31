@@ -67,11 +67,11 @@ class MatrixSixGEnvironment:
         self.prof['step_lower'] += time.perf_counter() - t0
         self.step_count += 1
         
-        if self.step_count % 1000 == 0:
-            print(f"\n<<< Env Profiling (Step {self.step_count}) >>>")
-            for k, v in sorted(self.prof.items()):
-                print(f"  {k:20s}: {v*1000/1000:8.3f} ms/call")
-            self.prof.clear()
+        # if self.step_count % 1000 == 0:
+        #     print(f"\n<<< Env Profiling (Step {self.step_count}) >>>")
+        #     for k, v in sorted(self.prof.items()):
+        #         print(f"  {k:20s}: {v*1000/1000:8.3f} ms/call")
+        #     self.prof.clear()
 
         return {
             "pre_reward":results["pre_reward"],

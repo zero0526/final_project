@@ -9,6 +9,6 @@ from matrix_source.configs.configs import cfg
 cfg.hyper_neural["NUM_LOWER_AGENTS"]= 40
 
 if __name__ == '__main__':
-    strategy = GRUPPOSCAFFOLDREPStrategy()
+    strategy = PPOStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()

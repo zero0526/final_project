@@ -18,7 +18,7 @@ def compute_transmission_metrics(src_nodes, dst_nodes, delay_matrix, data_sizes,
 # 2. HIGH-PRECISION FLOAT QUEUE OPERATIONS (3D)
 # ==========================================
 
-def deplete_float_queue(backlog, deadline, terminal_queue, src_node_mapping, cpu_alloc, slot_duration):
+def deplete_float_queue(backlog, deadline, wait_time_queue, terminal_queue, src_node_mapping, cpu_alloc, slot_duration):
     f = cpu_alloc.unsqueeze(-1) + 1e-9  # (M, S, 1)
     num_nodes = backlog.shape[0]
 
@@ -54,8 +54,11 @@ def deplete_float_queue(backlog, deadline, terminal_queue, src_node_mapping, cpu
     local_processed_total = (workload_delta * is_local_mask.float()).sum(dim=-1)
     actual_processed_total = workload_delta.sum(dim=-1)
 
+    # 7. Tính toán Delay của các task thành công
+    success_delays = wait_time_queue[success_mask] + time_to_finish[success_mask]
+
     # KHÔNG CÒN TRẢ VỀ violation_mask NỮA
-    return new_backlog, actual_processed_total, local_processed_total
+    return new_backlog, actual_processed_total, local_processed_total, success_delays
 
 
 def age_and_clean_dual_queue(backlog, deadline, slot_duration, *aux_queues):
