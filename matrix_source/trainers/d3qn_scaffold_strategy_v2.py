@@ -276,10 +276,21 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
                 # Fix 4: Do NOT hard-sync target net here — that breaks Polyak averaging.
                 # _soft_update() (alpha=0.005) is the only target-net update path.
                 if phase < 3:
+                    # ✅ FIX 2: Aggregate Backbone weights
                     bone_params = list(agent.eval_net.backbone.parameters())
                     for p in bone_params:
                         cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
                         p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
+                    
+                    # ✅ FIX 3: Aggregate MF network weights per cluster
+                    # Only aggregate MF when backbone is still training
+                    mf_params = list(agent.mf_net.parameters())
+                    for p in mf_params:
+                        cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
+                        p.data[t_ids] = cluster_mean.expand(
+                            len(terminal_ids), 
+                            *cluster_mean.shape[1:]
+                        )
 
                 # Step 3: Aggregate backbone control variates -> new c_b_global
                 c_b_local_slices = agent.get_c_b_local(t_ids)

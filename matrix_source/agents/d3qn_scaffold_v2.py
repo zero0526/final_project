@@ -432,7 +432,7 @@ class D3QNAgentV2:
                             )
                             self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
 
-                self.steps_in_round[unique_ids] += 1
+                    self.steps_in_round[unique_ids] += 1
 
         # Clip and step
         if phase < 3:
@@ -444,7 +444,9 @@ class D3QNAgentV2:
         self.head_optimizer.step()
 
         self.learn_step_counter += 1
-        # self._soft_update()
+        # ✅ THÊM: Soft-update MỖI 3 bước local training
+        if self.learn_step_counter % 3 == 0:
+            self._soft_update()
 
         if self.logs_q:
             return {
@@ -497,10 +499,25 @@ class D3QNAgentV2:
 
             for i in range(len(self.c_b_local)):
                 K = steps.view(-1, *([1] * (self.grad_b_sum[i].dim() - 1)))
+                
+                # Tính delta_c
+                delta_c = self.grad_b_sum[i][active_ids] / K
+                
+                # ✅ CLIP 1: Clip delta_c để tránh giá trị cực đoan
+                delta_c = torch.clamp(delta_c, min=-1.0, max=1.0)
+                
+                # Update local control variate
                 self.c_b_local[i][active_ids] = (
                     self.c_b_local[i][active_ids]
                     - self.c_b_global[i][active_ids]
-                    + self.grad_b_sum[i][active_ids] / K
+                    + delta_c
+                )
+                
+                # ✅ CLIP 2: Clip final c_b_local để tránh blow-up
+                self.c_b_local[i][active_ids] = torch.clamp(
+                    self.c_b_local[i][active_ids], 
+                    min=-5.0, 
+                    max=5.0
                 )
 
     # ── Soft update & IO ──────────────────────────────────────────────────────
