@@ -204,7 +204,7 @@ class SequentialGRU_PPOAgent:
                  mf_action_dim, mf_hidden_sizes, mf_lr, action_dim=32,
                  hidden_dim=128, critic_hidden=(256, 128), lr=3e-4,
                  clip_eps=0.2, k_epochs=5, entropy_coef=0.01,
-                 num_instances=1, device=None):
+                 num_instances=1, zeta= 0.6, zeta_decay_rate = 0.99, max_zeta = 5, device=None):
 
         self.agent_id = agent_id
         self.node_type = node_type
@@ -237,7 +237,9 @@ class SequentialGRU_PPOAgent:
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
         self.entropy_decay_rate = 0.99          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
         self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
-
+        self.zeta= zeta
+        self.zeta_decay_rate = zeta_decay_rate
+        self.max_zeta = max_zeta
     # ──────────────────────────────────────────────────
     # INFERENCE (GIỮ NGUYÊN)
     # ──────────────────────────────────────────────────

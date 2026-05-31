@@ -141,7 +141,9 @@ class MFSACAgent:
         self.num_instances = num_instances
         self.logs_q = logs_q
         self.exclude_zero = exclude_zero
-        
+        self.zeta= 0.6
+        self.zeta_decay_rate = 0.99
+        self.max_zeta = 5
         hidden_dim = hidden_sizes[0]
 
         if dist_type == "gaussian":

@@ -188,6 +188,9 @@ class PPOSCAFFOLDREPAgent:
         self.entropy_coef = entropy_coef
         self.entropy_decay_rate = 0.99
         self.min_entropy_coef = 0.001
+        self.zeta= 0.6
+        self.zeta_decay_rate = 0.99
+        self.max_zeta = 5
 
         self.gamma = gamma
         self.lmbda = lam
@@ -251,6 +254,7 @@ class PPOSCAFFOLDREPAgent:
         with torch.no_grad():
             pred_mfs = self.mf_net(torch.cat([states, mfs], dim=-1), group_indices=group_indices)
             logits = self.actor(states, pred_mfs, indices=agent_indices)
+            logits = logits * self.zeta
             values = self.critic(states, pred_mfs, agent_indices=agent_indices)
 
             if masks_batch is not None:
@@ -427,7 +431,7 @@ class PPOSCAFFOLDREPAgent:
                 self.bone_optimizer.zero_grad()
 
                 # --- Actor Update (PPO) ---
-                log_probs, entropy = self.actor.evaluate(b_states, b_pred_mfs, b_actions, masks=b_masks, indices=b_agent_ids, exclude_zero=self.exclude_zero, zeta=zeta)
+                log_probs, entropy = self.actor.evaluate(b_states, b_pred_mfs, b_actions, masks=b_masks, indices=b_agent_ids, exclude_zero=self.exclude_zero, zeta=self.zeta)
                 ratio = torch.exp(log_probs - b_old_log_probs)
                 
                 surr1 = ratio * b_advantages
@@ -467,7 +471,7 @@ class PPOSCAFFOLDREPAgent:
 
         # 4. Simplified Entropy Decay
         self.entropy_coef = max(self.entropy_coef * self.entropy_decay_rate, self.min_entropy_coef)
-
+        self.zeta = min(self.zeta * 1/self.zeta_decay_rate, self.max_zeta)
         self.memory.clear()
         self.learn_step_counter += 1
         return total_v_loss / total_batches if total_batches > 0 else 0.0

@@ -66,6 +66,7 @@ class Trainer:
         self.num_edge_agents = len(self.edge_node_ids)
         # 2. Strategy Injection
         self.strategy = strategy if strategy is not None else PPOStrategy()
+        self.aggregator.name = self.strategy.__class__.__name__
         self.strategy.initialize_agents(self)
 
     def train(self):

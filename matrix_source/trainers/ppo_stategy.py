@@ -61,6 +61,7 @@ class PPOStrategy(AlgorithmStrategy):
             9: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             10: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             11: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            12: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             13: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             14: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             15: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},

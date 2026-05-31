@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import numpy as np
 from matrix_source.agents.buffer.policy_replay_buffer import MultiAgentPolicyBuffer
+from matrix_source.visualize.metric_tracking import PPOTracker
 
 
 class MultiInstanceLinear(nn.Module):
@@ -175,7 +176,9 @@ class PPOAgent:
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
         self.entropy_decay_rate = 0.99          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
         self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
-
+        self.zeta= 0.6
+        self.zeta_decay_rate = 0.99
+        self.max_zeta = 5
         # PPO Hyperparameters
         self.gamma = gamma
         self.lmbda = lam
@@ -201,6 +204,7 @@ class PPOAgent:
         self.memory = MultiAgentPolicyBuffer(num_instances, buffer_size, state_dim, self.action_dim, self.u_action_dim,
                                              self.device)
         self.learn_step_counter = 0
+        self.tracker = PPOTracker(name=f"ppo_{self.node_type.lower()}")
 
     def choose_action(self, state, prev_mf, epsilon, mask=None, agent_idx=0, zeta=1.0):
         # Single agent usage
@@ -246,8 +250,8 @@ class PPOAgent:
                 logits = logits.masked_fill(zero_mask, -1e9)
 
             # Apply zeta (temperature scaling)
-            # if zeta != 1.0:
-            #     logits = logits * zeta
+            if zeta != 1.0:
+                logits = logits * self.zeta
 
             # 4. Sample actions
             if deterministic:
@@ -294,7 +298,7 @@ class PPOAgent:
         data = self.memory.get_all_ready(min_size=self.min_batch_size, agent_ids_pool=agents_ids)
         if data is None:
             return None
-
+        self.zeta = min(self.zeta * 1/self.zeta_decay_rate, self.max_zeta)
         self.entropy_coef = max(self.entropy_coef * self.entropy_decay_rate, self.min_entropy_coef)
         # ============================================================
 
@@ -305,6 +309,10 @@ class PPOAgent:
         old_values = old_values.squeeze(-1)
         rewards = rewards.squeeze(-1)
         dones = dones.squeeze(-1)
+
+        # Track rewards
+        reward_mean = rewards.mean().item()
+        reward_std = rewards.std().item()
 
         dataset_size = states.shape[0]
 
@@ -324,6 +332,8 @@ class PPOAgent:
         # 2. PPO Mini-batch Update Epochs
         epoch_v_loss = 0
         total_batches = 0
+        total_entropy = 0
+        total_max_prob = 0
 
         for _ in range(self.k_epochs):
             indices = np.random.permutation(dataset_size)
@@ -350,9 +360,20 @@ class PPOAgent:
                 log_probs, entropy = self.actor.evaluate(
                     batch_states, batch_pred_mfs, batch_actions, masks=batch_masks,
                     indices=batch_agent_ids, exclude_zero=self.exclude_zero,
-                    zeta=zeta
+                    zeta=self.zeta
                 )
                 values = self.critic(batch_states, batch_pred_mfs, indices=batch_agent_ids)
+
+                # Calculate Max Probability for tracking
+                with torch.no_grad():
+                    batch_logits = self.actor(batch_states, batch_pred_mfs, indices=batch_agent_ids)
+                    if batch_masks is not None:
+                        batch_logits = batch_logits.masked_fill(batch_masks == 0, -1e9)
+                    probs = F.softmax(batch_logits * self.zeta, dim=-1)
+                    max_prob = probs.max(dim=-1)[0].mean().item()
+                    total_max_prob += max_prob
+                
+                total_entropy += entropy.mean().item()
 
                 ratio = torch.exp(log_probs - batch_old_log_probs)
 
@@ -376,9 +397,28 @@ class PPOAgent:
                 total_batches += 1
 
         self.learn_step_counter += 1
+        
+        # Record Metrics
+        avg_entropy = total_entropy / total_batches if total_batches > 0 else 0
+        avg_max_prob = total_max_prob / total_batches if total_batches > 0 else 0
+        # Normalized Entropy: H / log(|A|)
+        # Note: log is natural log in numpy/torch by default
+        log_dim = np.log(max(self.u_action_dim, 2)) 
+        norm_entropy = avg_entropy / log_dim if log_dim > 0 else 0
+        
+        self.tracker.record(
+            reward_mean=reward_mean,
+            reward_std=reward_std,
+            entropy=avg_entropy,
+            norm_entropy=norm_entropy,
+            zeta=self.zeta,
+            alpha=self.entropy_coef,
+            max_prob=avg_max_prob
+        )
 
         log_freq = 10 if self.node_type == "Edge_Group" else 100
         if self.learn_step_counter % log_freq == 0:
+            self.tracker.plot() # Save Plot
             avg_v_loss = epoch_v_loss / total_batches if total_batches > 0 else 0
             avg_v = old_values.mean().item()
             print(

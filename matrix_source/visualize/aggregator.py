@@ -8,9 +8,10 @@ from matrix_source.configs.configs import cfg
 import torch
 
 class MetricsAggregator:
-    def __init__(self):
+    def __init__(self, name="metrics"):
         self.history = defaultdict(list)
         self.episode_count = 0
+        self.name = name
         self._setup_logger()
         self.reset_episode()
 
@@ -302,7 +303,8 @@ class MetricsAggregator:
             ax.grid(True)
             
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.savefig(os.path.join(cfg.plot_dir, f"training_progress_{ep if ep else 'latest'}.png"))
+        filename = f"{self.name.lower()}_progress_training.png"
+        plt.savefig(os.path.join(cfg.plot_dir, filename))
         plt.close()
 
     def save_history_csv(self):
