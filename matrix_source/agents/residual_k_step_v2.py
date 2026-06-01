@@ -208,6 +208,7 @@ class ResidualRoutingAgent:
         self.entropy_decay_rate = 0.99
         self.min_entropy_coef = 0.001
 
+
         TASK_DIM = 4
         GENERAL_TASK_DIM = 7
 

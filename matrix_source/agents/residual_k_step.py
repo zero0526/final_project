@@ -1,5 +1,5 @@
 """
-Residual Routing PPO Agent
+Residual Routing PPO Agent  (K-step Equilibrium Refinement)
 ============================================================
 Multi-agent PPO với kiến trúc:
   Proposal → K-step Histogram-aware Refinement → Equilibrium
@@ -10,7 +10,19 @@ Architecture:
   - RefineActor   : Residual correction δ(a^k, h^k)  (shared, MultiInstance, init≈0)
   - Critic        : State value V(s)  (shared, MultiInstance)
 
-Tracked diagnostics: last_residual, proposal_load_var
+K-step update rule:
+  a^(k+1) = P(s) + α · R(a^(k), h(a^(k)))
+
+Forward:  K iterations searching equilibrium
+Backward: gradient only through final step  (DEQ-style)
+
+Interface tương thích hoàn toàn với PPOAgent:
+  choose_action_batch(states, mfs, masks_batch, agent_indices, deterministic, zeta)
+  store_transition_train_mf_batch(...)
+  learn(agents_ids, zeta)
+  save(path) / load(path)
+
+Tracked diagnostics: last_residual, proposal_load_var, equilibrium_load_var
 """
 
 import torch
@@ -18,10 +30,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
+import numpy as np
+from matrix_source.utils import math_utils
 
+# ── K-step equilibrium refinement iterations ──
+K_REFINE_STEPS = 3
+
+from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm
 from matrix_source.agents.buffer.rollout_buffer import MultiAgentRolloutBuffer
-from matrix_source.agents.residual_net import ResidualCritic, RefineActor, ProposalActor, MFNetwork
-
 
 
 def compute_overload(h, weights):
@@ -29,13 +45,125 @@ def compute_overload(h, weights):
     overload = (h - h_weighted_mean) / (h_weighted_mean + 1e-8)
     return overload
 
+
+class MFNetwork(nn.Module):
+    """Predict current mean field từ (state || prev_mf).
+    Output: sigmoid -> [0,1]^mf_dim.
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, hidden_sizes, num_instances: int = 1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        self.fc1 = MultiInstanceLinear(num_instances, input_dim, h1)
+        self.norm = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.out = MultiInstanceLinear(num_instances, h2, output_dim)
+
+    def forward(self, x, indices=None):
+        x = F.silu(self.norm(self.fc1(x, indices), indices))
+        x = F.silu(self.fc2(x, indices))
+        return torch.sigmoid(self.out(x, indices))
+
+
+class ProposalActor(nn.Module):
+    """(task || svc || mf) → logits"""
+
+    def __init__(self, task_state, service_state, mf_dim, action_dim,
+                 hidden_sizes, num_instances=1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        in_dim = task_state + service_state + mf_dim
+        self.fc1 = MultiInstanceLinear(num_instances, in_dim, h1)
+        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
+        self.logits = MultiInstanceLinear(num_instances, h2, action_dim)
+
+    def forward(self, task, svc, mf, indices=None):
+        x = torch.cat([task, svc, mf], dim=-1)
+        x = F.silu(self.norm1(self.fc1(x, indices), indices))
+        x = F.silu(self.norm2(self.fc2(x, indices), indices))
+        return self.logits(x, indices)
+
+    def evaluate(self, task, svc, mf, action, masks=None,
+                 indices=None, residual_logits=None, exclude_zero=False):
+        logits = self.forward(task, svc, mf, indices)
+        if residual_logits is not None:
+            logits = logits + residual_logits
+        if masks is not None:
+            logits = logits.masked_fill(masks == 0, -1e9)
+        if exclude_zero and logits.shape[-1] > 1:
+            logits[:, 0] = -1e9
+        dist = Categorical(logits=logits)
+        return dist.log_prob(action), dist.entropy()
+
+
+class RefineActor(nn.Module):
+    """(task || svc || mf || proposal || hist || overload) → δlogits"""
+
+    def __init__(self, task_state, service_state, mf_dim,
+                 proposal_dim, action_dim,
+                 hidden_sizes, num_instances=1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        M = service_state // 2  # service_state = 2*M
+        hist_dim = 2 * M  # histogram + overload
+        in_dim = task_state + service_state + mf_dim + proposal_dim + hist_dim
+
+        self.fc1 = MultiInstanceLinear(num_instances, in_dim, h1)
+        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
+        self.logits = MultiInstanceLinear(num_instances, h2, action_dim)
+
+        nn.init.zeros_(self.logits.weight)
+        nn.init.zeros_(self.logits.bias)
+
+    def forward(self, task, svc, mf, current_logits,
+                histogram, overload, indices=None):
+        """current_logits: logits at step k (caller decides whether to .detach())"""
+        x = torch.cat([
+            task, svc, mf,
+            current_logits,
+            histogram, overload,
+        ], dim=-1)
+        x = F.silu(self.norm1(self.fc1(x, indices), indices))
+        x = F.silu(self.norm2(self.fc2(x, indices), indices))
+        return self.logits(x, indices)
+
+
+class ResidualCritic(nn.Module):
+    """(general_task || svc || mf) → V(s)"""
+
+    def __init__(self, general_task_states, service_states,
+                 mf_dim, hidden_sizes, num_instances=1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        in_dim = general_task_states + service_states + mf_dim
+        self.fc1 = MultiInstanceLinear(num_instances, in_dim, h1)
+        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
+        self.v = MultiInstanceLinear(num_instances, h2, 1)
+
+    def forward(self, general_task, svc, mf, indices=None):
+        x = torch.cat([general_task, svc, mf], dim=-1)
+        x = F.silu(self.norm1(self.fc1(x, indices), indices))
+        x = F.silu(self.norm2(self.fc2(x, indices), indices))
+        return self.v(x, indices).squeeze(-1)
+
+
+# ============================================================
+# AGENT
+# ============================================================
+
 class ResidualRoutingAgent:
     def __init__(self, agent_id, node_type,
                  service_state_dim, mf_dim, proposal_dim,
                  action_dim, u_action_dim,
                  mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64), lr=3e-4,
-                 gamma=0.99, alpha=0.2,
+                 gamma=0.99, alpha=0.1,
                  buffer_size=100_000, batch_size=128,
                  lam=0.95, clip_eps=0.2, k_epochs=5,
                  entropy_coef=0.05, exclude_zero=False,
@@ -105,7 +233,7 @@ class ResidualRoutingAgent:
             general_task_states=GENERAL_TASK_DIM,
             service_states=service_state_dim,
             mf_dim=mf_dim,
-            hist_dim=self.M,
+            hist_dim=self.M,          # FIX: equilibrium h* added to Critic
             hidden_sizes=hidden_sizes,
             num_instances=num_instances,
         ).to(self.device)
@@ -132,9 +260,15 @@ class ResidualRoutingAgent:
         self.last_residual: float = 0.0
         self.proposal_load_var: float = 0.0
         self.equilibrium_load_var: float = 0.0
+        self.inference_counter: int = 0
+
+        # Traces for visualization (captured during inference)
+        self.residual_trace: list[float] = []
+        self.load_var_trace: list[float] = []
+        self.hist_change_trace: list[float] = []
 
     def choose_action(self, state, prev_mf, mask=None, agent_idx=0,
-                      task_state=None, deterministic=False, zeta=1.0):
+                      task_state=None, deterministic=False, zeta=1.0, temp=1.0):
         """
         Args:
             state:      (2*M,) service state
@@ -160,7 +294,7 @@ class ResidualRoutingAgent:
         if mask is not None and not isinstance(mask, list):
             mask = [mask]
 
-        actions, log_probs, values= self.choose_action_batch(
+        actions, log_probs, values = self.choose_action_batch(
             service_states=state,
             prev_mfs=prev_mf,
             task_states=task_state,
@@ -168,6 +302,7 @@ class ResidualRoutingAgent:
             agent_indices=idx_t,
             deterministic=deterministic,
             zeta=zeta,
+            temp=temp,
         )
 
         return actions[0], log_probs[0], values[0]
@@ -211,7 +346,7 @@ class ResidualRoutingAgent:
 
     def choose_action_batch(self, service_states, prev_mfs, task_states,
                             masks_batch=None, agent_indices=None,
-                            deterministic=False, phrase:str="Proposal", zeta=1.0):
+                            deterministic=False, zeta=1.0, temp=1.0):
         B = service_states.shape[0]
         device = self.device
 
@@ -254,7 +389,13 @@ class ResidualRoutingAgent:
                 masks_exp = None
 
             # ═══ 3. PROPOSAL (1 pass cho TẤT CẢ tasks) ═══
-            prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp)
+            # FIX: Apply temperature scaling (1.5 -> 1.0) to encourage global exploration
+            prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp) / temp
+
+            # ═══ 4. K-STEP EQUILIBRIUM REFINEMENT ═══
+            self.residual_trace = []
+            self.load_var_trace = []
+            self.hist_change_trace = []
 
             # Track proposal load variance (before refinement)
             h_prop, _ = self._compute_hist_and_overload(
@@ -262,35 +403,89 @@ class ResidualRoutingAgent:
             )
             self.proposal_load_var = h_prop.var(dim=1).mean().item()
 
-            # ═══ 4. ONE-SHOT REFINEMENT (Chỉ làm 1 lần duy nhất) ═══
-            h_node, overload = self._compute_hist_and_overload(
-                prop_logits.detach(),  # PHẢI DETACH ở đây để Proposal mù tắc nghẽn
-                masks_exp, service_states, batch_idx, B, total_tasks,
-            )
-            if phrase == "Proposal":
-                delta_logits = torch.zeros_like(prop_logits)
-            else:
-                delta_logits = self.refine(
-                    tasks_cat, svc_exp, mf_exp,
-                    prop_logits.detach(),  # Refine nhận Prior đã đóng băng
-                    h_node[batch_idx],
-                    overload[batch_idx],
-                    indices=idx_exp,
+            # All K steps — no_grad at inference
+            current_logits = prop_logits
+            h_node = h_prop  # initialise for the critic call below
+            prev_h = h_prop
+
+            for k in range(K_REFINE_STEPS):
+                h_node, overload = self._compute_hist_and_overload(
+                    current_logits, masks_exp, service_states, batch_idx, B, total_tasks,
                 )
 
-            # Equilibrium load variance (sau khi refine)
-            self.equilibrium_load_var = h_node.var(dim=1).mean().item()
+                # Trace: Load Variance at each step
+                self.load_var_trace.append(h_node.var(dim=1).mean().item())
+                # Trace: Histogram change from previous step
+                if k > 0:
+                    self.hist_change_trace.append((h_node - prev_h).norm(dim=-1).mean().item())
+                prev_h = h_node
 
-            # ═══ 5. FUSION (Cộng trực tiếp) ═══
-            final_logits = prop_logits + self.alpha * delta_logits
+                hist_exp = h_node[batch_idx]
+                over_exp = overload[batch_idx]
 
+                delta = self.refine(
+                    tasks_cat, svc_exp, mf_exp,
+                    current_logits.detach(),
+                    hist_exp, over_exp,
+                    indices=idx_exp,
+                )
+                # FIX: Damped fixed-point iteration for contraction control
+                # z_{k+1} = (1-alpha)*z_k + alpha*(P + R(z_k))
+                target_logits = prop_logits + delta
+
+                # Trace: Z-residual (how much logit changes this step)
+                self.residual_trace.append((target_logits - current_logits).norm(dim=-1).mean().item())
+
+                current_logits = (1 - self.alpha) * current_logits + self.alpha * target_logits
+
+            # Final step to ensure hist_change_trace has enough points if possible
+            # (Matches KStepMonitor expectations)
+            if K_REFINE_STEPS > 0 and len(self.hist_change_trace) == 0:
+                 # If K=1, hist_change is 0
+                 self.hist_change_trace.append(0.0)
+
+            # Compute one extra refine call to measure true fp residual
+            h_fp, overload_fp = self._compute_hist_and_overload(
+                current_logits, masks_exp, service_states, batch_idx, B, total_tasks,
+            )
+            # FIX: residual should be based on the operator F(z) = P + R(z)
+            delta_fp = self.refine(
+                tasks_cat, svc_exp, mf_exp,
+                current_logits.detach(),
+                h_fp[batch_idx], overload_fp[batch_idx],
+                indices=idx_exp,
+            )
+            # True residual: ||F(z) - z||
+            fp_residual = (prop_logits + delta_fp - current_logits).norm(dim=-1).mean()
+            self.last_residual = fp_residual.item()
+
+            # Equilibrium histogram h* and load variance
+            h_star = h_node  # (B, M) — equilibrium histogram
+            self.equilibrium_load_var = h_star.var(dim=1).mean().item()
+
+            # ═══ 5. FUSION — final_logits = current equilibrium ═══
+            final_logits = current_logits
             if masks_exp is not None:
                 final_logits = final_logits.masked_fill(masks_exp == 0, -1e9)
             if self.exclude_zero and self.u_action_dim > 1:
                 final_logits[:, 0] = -1e9
             final_logits = self._sanitize_logits(final_logits)
 
-            # ═══ 6. SAMPLE ═══
+            # ═══ 7. DIAGNOSTICS (Periodic) ═══
+            self.inference_counter += 1
+            if self.inference_counter % 100 == 0:
+                # To show the 'progress', we can calculate the residual after Step 1 as well
+                with torch.no_grad():
+                    # Residual after first step (k=0)
+                    h_init, o_init = self._compute_hist_and_overload(prop_logits, masks_exp, service_states, batch_idx, B, total_tasks)
+                    d_init = self.refine(tasks_cat, svc_exp, mf_exp, prop_logits, h_init[batch_idx], o_init[batch_idx], indices=idx_exp)
+                    res_init = (prop_logits + d_init - prop_logits).norm(dim=-1).mean().item()
+
+                print(
+                    f"[INFER] Step {self.inference_counter:5d} | "
+                    f"Refinement convergence: {res_init:.4f} → {self.last_residual:.6f} | "
+                    f"LoadVar: {self.proposal_load_var:.4f} → {self.equilibrium_load_var:.4f}"
+                )
             if deterministic:
                 actions_cat = final_logits.argmax(dim=-1)
                 log_probs_cat = torch.zeros(total_tasks, device=device)
@@ -299,26 +494,29 @@ class ResidualRoutingAgent:
                 actions_cat = dist.sample()
                 log_probs_cat = dist.log_prob(actions_cat)
 
-            # Trả về format List[Tensor] gốc
+            # Trả về format List[Tensor] gốc bằng .split() và unbind()
             task_lens_list = task_lens.cpu().tolist()
             all_actions = list(actions_cat.split(task_lens_list))
 
-            # ═══ LƯU Ý QUAN TRỌNG: PHẢI LÀ SUM, KHÔNG PHẢI MEAN ═══
-            # PPO ratio cần exp(SUM log_pi_new - SUM log_pi_old).
-            # Tuyệt đối KHÔNG chia cho task_lens.
+            # FIX: store JOINT log-prob (sum, not mean) — matches PPO ratio theory
             sum_lp = torch.zeros(B, device=device).scatter_add_(0, batch_idx, log_probs_cat)
-            all_log_probs = list(sum_lp.unbind())
+            all_log_probs = list(sum_lp.unbind())  # joint: sum_i log pi_i
 
-            all_values = self.critic(general_task, service_states, pred_mfs, h_node, indices=agent_indices)
+            # ═══ 7. CRITIC — V(s, h*) ═══
+            # FIX: pass h_star so critic sees the equilibrium population state
+            h_star_per_agent = h_star  # (B, M)
+            all_values = self.critic(
+                general_task, service_states, pred_mfs, h_star_per_agent,
+                indices=agent_indices
+            )
 
             # ═══ 8. LOG INFERENCE ═══
             if not hasattr(self, '_infer_logged'):
                 self._infer_logged = 0
             if self._infer_logged < 3:
-                print(f"  [INFER] h_node[0]: {[f'{x:.2f}' for x in h_node[0].tolist()]}")
+                print(f"  [INFER] h_star[0]: {[f'{x:.2f}' for x in h_star[0].tolist()]}")
                 print(f"  [INFER] overload[0]: {[f'{x:.3f}' for x in overload[0].tolist()]}")
-                print(f"  [INFER] |Δz|: {delta_logits.abs().mean():.6f}")
-                print(f"  [INFER] residual: {self.last_residual:.6f} | "
+                print(f"  [INFER] fp_residual: {self.last_residual:.6f} | "
                       f"load_var proposal→equil: {self.proposal_load_var:.4f}→{self.equilibrium_load_var:.4f}")
                 self._infer_logged += 1
 
@@ -365,7 +563,11 @@ class ResidualRoutingAgent:
             h_node:  (B_batch, M) — histogram load per model type
             overload: (B_batch, M) — normalised overload
         """
-        logits_for_hist = logits.detach()
+        # FIX: detach only when called from no_grad contexts (inference / warm-up);
+        # the caller is responsible for passing detached logits in those contexts.
+        # Here we keep whatever grad-mode the caller sets so the final step in
+        # learn() can propagate gradients through h(z).
+        logits_for_hist = logits
         if masks_exp is not None:
             logits_for_hist = logits_for_hist.masked_fill(masks_exp == 0, -1e9)
 
@@ -375,11 +577,15 @@ class ResidualRoutingAgent:
         h_node = torch.zeros(B_batch, self.M, device=self.device)
         h_node.scatter_add_(0, batch_idx.unsqueeze(1).expand(-1, self.M), probs_M)
 
-        f_v = svc_batch[:, :self.M]
-        capacity_dist = f_v / (f_v.sum(dim=1, keepdim=True) + 1e-8)
-        load_ratio = h_node / (capacity_dist + 1e-8)
-        mean_load_ratio = (load_ratio * capacity_dist).sum(dim=1, keepdim=True)
-        overload = (load_ratio - mean_load_ratio) / (mean_load_ratio + 1e-8)
+        # FIX: Normalize histogram by task count so distribution is invariant to N
+        task_counts = torch.zeros(B_batch, 1, device=self.device).scatter_add_(
+            0, batch_idx.unsqueeze(1), torch.ones(total_n, 1, device=self.device)
+        )
+        h_node = h_node / (task_counts + 1e-8)
+
+        f_v = svc_batch[:, :self.M]  # (B_batch, M)
+        h_weighted_mean = (h_node * f_v).sum(dim=1, keepdim=True) / (f_v.sum(dim=1, keepdim=True) + 1e-8)
+        overload = (h_node - h_weighted_mean) / (h_weighted_mean + 1e-8)
 
         return h_node, overload
 
@@ -458,7 +664,39 @@ class ResidualRoutingAgent:
             offset += n_i
         return task_states
 
-    def learn(self, phrase: str, agents_ids=None, zeta=1.0):
+    def _estimate_h_star(self, general_task, service_states, mf_states,
+                         task_states_list, agent_indices, steps=3):
+        """No-grad helper to estimate h* for GAE bootstrapping."""
+        B = service_states.shape[0]
+        device = self.device
+
+        with torch.no_grad():
+            task_lens = torch.tensor([t.shape[0] for t in task_states_list], device=device)
+            total_tasks = int(task_lens.sum().item())
+            batch_idx = torch.repeat_interleave(torch.arange(B, device=device), task_lens)
+
+            tasks_cat = torch.cat(task_states_list, dim=0).to(device).float()
+            svc_exp = service_states[batch_idx]
+            mf_exp = mf_states[batch_idx]
+            idx_exp = agent_indices[batch_idx]
+
+            prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp)
+
+            current_logits = prop_logits
+            for _ in range(steps):
+                h, o = self._compute_hist_and_overload(
+                    current_logits, None, service_states, batch_idx, B, total_tasks
+                )
+                delta = self.refine(tasks_cat, svc_exp, mf_exp, current_logits,
+                                     h[batch_idx], o[batch_idx], indices=idx_exp)
+                current_logits = (1 - self.alpha) * current_logits + self.alpha * (prop_logits + delta)
+
+            h_star, _ = self._compute_hist_and_overload(
+                current_logits, None, service_states, batch_idx, B, total_tasks
+            )
+        return h_star
+
+    def learn(self, agents_ids=None, zeta=1.0, temp=1.0):
         from matrix_source.trainers.ppo_stategy import compute_gae
 
         if agents_ids is not None:
@@ -478,31 +716,6 @@ class ResidualRoutingAgent:
          prev_mfs, curr_mfs, rewards, next_service_states, dones,
          old_log_probs, old_values, masks, agent_ids) = data
 
-        # ENTROPY SCHEDULE THEO PHASE
-        if phrase == "Proposal":
-            # PHASE 1: Giữ nguyên entropy cao để tạo "Bản đồ mềm"
-            current_ent_coef = self.initial_entropy_coef
-
-        elif phrase == "Refine":
-            # PHASE 2: Bắt đầu giảm nhẹ (Refine không xài entropy, nhưng ta chuẩn bị cho Phase 3)
-            self.entropy_coef = max(
-                self.entropy_coef * self.entropy_decay_rate,
-                self.min_entropy_coef,
-            )
-            current_ent_coef = self.entropy_coef
-
-        elif phrase == "Decouple":
-            # PHASE 3: Giảm tiếp (Proposal bắt đầu chắc chắn hơn)
-            self.entropy_coef = max(
-                self.entropy_coef * self.entropy_decay_rate,
-                self.min_entropy_coef,
-            )
-            current_ent_coef = self.entropy_coef
-
-        elif phrase == "Exploit":
-            # PHASE 4: Ép entropy xuống sát 0 (Chuyển sang xác định)
-            current_ent_coef = self.min_entropy_coef * 0.1
-
         service_states = service_states.to(self.device).float()
         prev_mfs = prev_mfs.to(self.device).float()
         agent_ids = agent_ids.to(self.device).long()
@@ -519,20 +732,21 @@ class ResidualRoutingAgent:
         dataset_size = service_states.shape[0]
         total_tasks_flat = task_batch_cat.shape[0]
 
+        # Reconstruct variable-length task states
         task_states_list = self._unpack_task_batch(task_batch_cat, task_lens)
         general_tasks = self.tasks_to_general(task_states_list).to(self.device)
 
-        # ═══ 2. PRE-COMPUTE GAE (no grad) ═══
-        # ═══ 2. PRE-COMPUTE GAE (no grad) ═══
+        # ═══ 2. PRE-COMPUTE (no grad) ═══
         with torch.no_grad():
-            mf_in_next = torch.cat([general_tasks, next_service_states, curr_mfs.to(self.device)], dim=-1)
-            next_mf = self.mf_net(mf_in_next, indices=agent_ids)
+            # GAE
+            mf_in = torch.cat([general_tasks, next_service_states, curr_mfs.to(self.device)], dim=-1)
+            next_mf = self.mf_net(mf_in, indices=agent_ids)
 
-            # FIX: Tạo tensor 0 giả lập cho histogram của trạng thái tiếp theo
-            h_next_dummy = torch.zeros((dataset_size, self.M), device=self.device)
-
-            # Truyền đủ 4 tham số cho Critic
-            next_val = self.critic(general_tasks, next_service_states, next_mf, h_next_dummy, indices=agent_ids)
+            # FIX: Estimate h* for next states for proper bootstrap rather than using zeros
+            h_next_star = self._estimate_h_star(
+                general_tasks, next_service_states, next_mf, task_states_list, agent_ids, steps=3
+            )
+            next_val = self.critic(general_tasks, next_service_states, next_mf, h_next_star, indices=agent_ids)
 
             advantages = compute_gae(
                 rewards, next_val, old_values, dones, agent_ids,
@@ -542,26 +756,37 @@ class ResidualRoutingAgent:
             if advantages.numel() > 1:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+            # MF for entire dataset once
             mf_in_all = torch.cat([general_tasks, service_states, prev_mfs], dim=-1)
             detached_mfs_all = self.mf_net(mf_in_all, indices=agent_ids).detach()
 
-        # Pre-process masks
+        # Pre-process masks → single tensor or None
         if masks is not None and any(m is not None for m in masks):
+            # Find first non-None to check dim
             first_valid = next(m for m in masks if m is not None)
             if first_valid.dim() == 1:
-                clean_masks = [m if m is not None else torch.zeros_like(first_valid) for m in masks]
+                # Replace None entries with zeros
+                clean_masks = [
+                    m if m is not None else torch.zeros_like(first_valid)
+                    for m in masks
+                ]
                 all_masks = torch.stack(clean_masks).to(self.device)
             else:
                 all_masks = torch.cat([m for m in masks if m is not None], dim=0).to(self.device)
         else:
             all_masks = None
 
+        # Pre-compute flat index slicing (once, outside loop)
         task_offsets = torch.zeros(dataset_size, dtype=torch.long, device=self.device)
         task_offsets[1:] = task_lens.cumsum(0)[:-1]
         all_flat_idx = torch.arange(total_tasks_flat, device=self.device)
 
-        # ═══ 3. PPO TRAINING LOOP ═══
-        epoch_metrics = {'v': 0.0, 'p': 0.0, 'r': 0.0, 'ent': 0.0}
+        # ═══ 3. PPO TRAINING LOOP (vectorized) ═══
+        epoch_metrics = {
+            'v': 0.0, 'p': 0.0, 'ent': 0.0, 'kl': 0.0,
+            'fp_res': 0.0, 'delta': 0.0, 'shift': 0.0, 'hist_s': 0.0,
+            'lv_p': 0.0, 'lv_s': 0.0, 'ov_p': 0.0, 'ov_s': 0.0
+        }
         total_batches = 0
 
         for _ in range(self.k_epochs):
@@ -573,6 +798,7 @@ class ResidualRoutingAgent:
 
                 # ── Slice mini-batch ──
                 b_svc = service_states[idx]
+                b_prev = prev_mfs[idx]
                 b_old_lp = old_log_probs[idx]
                 b_adv = advantages[idx]
                 b_ret = returns[idx]
@@ -581,136 +807,148 @@ class ResidualRoutingAgent:
                 b_mf = detached_mfs_all[idx]
                 b_t_lens = task_lens[idx]
 
-                segments = [all_flat_idx[task_offsets[i]:task_offsets[i] + task_lens[i]] for i in idx]
+                # Flat indices for this mini-batch
+                segments = [
+                    all_flat_idx[task_offsets[i]:task_offsets[i] + task_lens[i]]
+                    for i in idx
+                ]
                 flat_indices = torch.cat(segments)
 
                 t_cat = task_batch_cat[flat_indices]
                 act_cat = actions_cat[flat_indices]
                 total_n = t_cat.shape[0]
 
-                batch_idx = torch.repeat_interleave(torch.arange(B_sub, device=self.device), b_t_lens)
+                # Task → agent mapping within mini-batch
+                batch_idx = torch.repeat_interleave(
+                    torch.arange(B_sub, device=self.device), b_t_lens,
+                )
+
                 svc_exp = b_svc[batch_idx]
                 mf_exp = b_mf[batch_idx]
                 aids_exp = b_aids[batch_idx]
                 masks_exp = all_masks[idx][batch_idx] if all_masks is not None else None
 
-                # ══════════════════════════════════════════════════════
-                # FORWARD PASS ONE-SHOT (Đồng nhất cho mọi Phase)
-                # ══════════════════════════════════════════════════════
+                # ── PROPOSAL (1 forward pass) ──
+                # FIX: apply temperature scaling
+                prop_logits = self.proposal(t_cat, svc_exp, mf_exp, indices=aids_exp) / temp
 
-                # 1. Luôn tính Proposal (Có gradient)
-                prop_logits = self.proposal(t_cat, svc_exp, mf_exp, indices=aids_exp)
+                # ── K-STEP EQUILIBRIUM REFINEMENT ──
+                # FIX: proposal is anchor (detached). Refine is the sole fixed-point solver.
+                # Fixed-point equation: z* = P + R(z*, h(z*))
+                # Warm-up: K-1 steps without gradient (find approximate z*)
+                prop_logits_detached = prop_logits.detach()
 
-                # 2. Luôn tính trạng thái môi trường h* từ Prior (Detach để Proposal mù)
+                with torch.no_grad():
+                    current_logits = prop_logits_detached
+
+                    for _ in range(K_REFINE_STEPS - 1):
+                        h_node, overload = self._compute_hist_and_overload(
+                            current_logits, masks_exp, b_svc, batch_idx, B_sub, total_n,
+                        )
+                        delta = self.refine(
+                            t_cat, svc_exp, mf_exp,
+                            current_logits,            # no extra detach — already no_grad
+                            h_node[batch_idx], overload[batch_idx],
+                            indices=aids_exp,
+                        )
+                        # FIX: Damped fixed-point update z_{k+1} = (1-alpha)z_k + alpha*(P+R)
+                        target_z = prop_logits_detached + delta
+                        current_logits = (1 - self.alpha) * current_logits + self.alpha * target_z
+
+                    # Proposal load stats
+                    h_prop, over_prop = self._compute_hist_and_overload(
+                        prop_logits_detached, masks_exp, b_svc, batch_idx, B_sub, total_n,
+                    )
+                    self.proposal_load_var = h_prop.var(dim=1).mean().item()
+                    prop_over_val = over_prop.abs().mean().item()
+
+                # ── Final step: OPEN GRADIENT through h(z) and refine ──
+                # We use prop_logits (with grad) and current_logits (near equilibrium)
+                # to compute the final step. This allows PropActor to see h and delta.
                 h_node, overload = self._compute_hist_and_overload(
-                    prop_logits.detach(), masks_exp, b_svc, batch_idx, B_sub, total_n,
+                    current_logits, masks_exp, b_svc, batch_idx, B_sub, total_n,
+                )
+                hist_exp = h_node[batch_idx]
+                over_exp = overload[batch_idx]
+
+                # Equilibrium load variance
+                h_star = h_node  # (B_sub, M)
+                self.equilibrium_load_var = h_star.var(dim=1).mean().item()
+
+                # Gradient flows through refine.
+                # FIX: remove .detach() from current_logits branch so operator learns dR/dz.
+                # We still use the warm-up equilibrium as the anchor for h.
+                delta_logits = self.refine(
+                    t_cat, svc_exp, mf_exp,
+                    current_logits,            # FIX: branch ∂R/∂z enabled
+                    hist_exp, over_exp,       # FIX: branch ∂R/∂h enabled
+                    indices=aids_exp,
                 )
 
-                # 3. Tính Refine tùy theo PHASE
-                if phrase == "Proposal":
-                    # PHASE 1: Tắt hoàn toàn Refine
-                    delta_logits = torch.zeros_like(prop_logits)
-                else:
-                    # PHASE 2 & 3: Bật Refine
-                    delta_logits = self.refine(
-                        t_cat, svc_exp, mf_exp,
-                        prop_logits.detach(),  # Refine luôn thấy Prior đóng băng
-                        h_node[batch_idx], overload[batch_idx],
-                        indices=aids_exp,
-                    )
+                # FIX: fixed-point residual loss must have gradient flowing into RefineActor
+                # We use (P_detach + R(z, h) - z_detach)^2 to force R to find the equilibrium.
+                fp_residual = (prop_logits_detached + delta_logits - current_logits.detach()).pow(2).mean()
+                self.last_residual = fp_residual.item()
 
-                # 4. Fusion logits
-                final_logits = prop_logits + self.alpha * delta_logits
+                # ── FUSION — final equilibrium logits ──
+                # PropActor learns through P directly AND through the damped R branch.
+                final_logits = (1 - self.alpha) * current_logits + self.alpha * (prop_logits + delta_logits)
                 if masks_exp is not None:
                     final_logits = final_logits.masked_fill(masks_exp == 0, -1e9)
                 if self.exclude_zero and self.u_action_dim > 1:
                     final_logits[:, 0] = -1e9
                 final_logits = self._sanitize_logits(final_logits)
 
-                # ══════════════════════════════════════════
-                # TÍNH LOSS TÙY THEO PHASE (Stop-Gradient Trick)
-                # ══════════════════════════════════════════
-                loss_proposal=0.0
-                loss_refine=0.0
-                if phrase == "Proposal":
-                    # --- PHASE 1 ---
-                    dist_final = Categorical(logits=final_logits)
-                    lp_all = dist_final.log_prob(act_cat)
-                    sum_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, lp_all)
-                    new_lp = sum_lp
+                # ── LOG PROBS & ENTROPY ──
+                dist = Categorical(logits=final_logits)
+                lp_all = dist.log_prob(act_cat)  # (total_n,)
 
-                    ratio = torch.exp(new_lp - b_old_lp)
-                    surr1 = ratio * b_adv
-                    surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
+                # FIX: Entropy penalty only on Proposal to separate exploration from solving
+                prop_dist = Categorical(logits=prop_logits)
+                prop_entropy_all = prop_dist.entropy()
 
-                    # DÙNG current_ent_coef Ở ĐÂY
-                    loss_proposal = -torch.min(surr1, surr2).mean() - current_ent_coef * dist_final.entropy().mean()
-                    loss_refine = 0.0
+                # FIX: JOINT log-prob (sum, not mean) to match PPO ratio theory
+                # r = exp(sum log π_i - sum log π_i^old)
+                sum_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, lp_all)
+                new_lp = sum_lp  # joint: Σ log π_i
 
-                elif phrase == "Refine" :
-                    # --- PHASE 2: Proposal đóng băng, chỉ học Refine ---
-                    with torch.no_grad():
-                        # Tính log prob chỉ để lấy Entropy cho logging, không để train
-                        dist_final = Categorical(logits=final_logits)
+                sum_ent = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, prop_entropy_all)
+                ent_m = sum_ent / b_t_lens.float()  # mean entropy per agent (for the loss coef)
 
-                    # Refine branch
-                    z_for_R = prop_logits.detach() + self.alpha * delta_logits
-                    dist_R = Categorical(logits=self._sanitize_logits(z_for_R))
-                    lp_R = dist_R.log_prob(act_cat)
-                    sum_lp_R = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, lp_R)
+                # ── K-STEP DETAILED DIAGNOSTICS ──
+                with torch.no_grad():
+                    delta_norm = delta_logits.norm(dim=-1).mean().item()
+                    logit_shift = (final_logits - prop_logits).norm(dim=-1).mean().item()
+                    hist_shift = (h_star - h_prop).abs().mean().item()
+                    star_over_val = over_exp.abs().mean().item()
 
-                    ratio_R = torch.exp(sum_lp_R - b_old_lp)
-                    surr1_R = ratio_R * b_adv
-                    surr2_R = torch.clamp(ratio_R, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
+                # ── PPO CLIPPING ──
+                ratio = torch.exp(new_lp - b_old_lp)  # both are joint sums
+                surr1 = ratio * b_adv
+                surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
 
-                    loss_refine = -torch.min(surr1_R, surr2_R).mean()  # Không cần entropy cho Refine
+                # FIX: KL Monitoring for update stability
+                with torch.no_grad():
+                    approx_kl = (b_old_lp - new_lp).mean()
 
-                elif phrase == "Decouple" or phrase=="Exploit":
-                    # Nhánh Proposal
-                    z_for_P = prop_logits + self.alpha * delta_logits.detach()
-                    dist_P = Categorical(logits=self._sanitize_logits(z_for_P))
-                    lp_P = dist_P.log_prob(act_cat)
-                    sum_lp_P = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, lp_P)
+                actor_loss = (
+                    -torch.min(surr1, surr2).mean()
+                    - self.entropy_coef * ent_m.mean()
+                    + 0.01 * fp_residual          # FIX: RefineActor now learns to minimize fixed-point error
+                )
 
-                    # PPO Loss cho Proposal
-                    ratio_P = torch.exp(sum_lp_P - b_old_lp)
-                    surr1_P = ratio_P * b_adv
-                    surr2_P = torch.clamp(ratio_P, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
+                # ── ACTOR UPDATE ──
+                self.optimizer_proposal.zero_grad(set_to_none=True)
+                self.optimizer_refine.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.proposal.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.refine.parameters(), 0.5)
+                self.optimizer_proposal.step()
+                self.optimizer_refine.step()
 
-                    # DÙNG current_ent_coef Ở ĐÂY
-                    loss_proposal = -torch.min(surr1_P, surr2_P).mean() - current_ent_coef * dist_P.entropy().mean()
-
-                    # Nhánh Refine (Vẫn KHÔNG có entropy)
-                    z_for_R = prop_logits.detach() + self.alpha * delta_logits
-                    dist_R = Categorical(logits=self._sanitize_logits(z_for_R))
-                    lp_R = dist_R.log_prob(act_cat)
-                    sum_lp_R = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx, lp_R)
-
-                    ratio_R = torch.exp(sum_lp_R - b_old_lp)
-                    surr1_R = ratio_R * b_adv
-                    surr2_R = torch.clamp(ratio_R, 1 - self.eps_clip, 1 + self.eps_clip) * b_adv
-                    loss_refine = -torch.min(surr1_R, surr2_R).mean()
-
-                # ══════════════════════════════════════════
-                # BACKPROPAGATION THEO PHASE
-                # ══════════════════════════════════════════
-
-                # 1. Update Proposal (nếu có loss)
-                if loss_proposal != 0.0:
-                    self.optimizer_proposal.zero_grad(set_to_none=True)
-                    loss_proposal.backward()
-                    torch.nn.utils.clip_grad_norm_(self.proposal.parameters(), 0.5)
-                    self.optimizer_proposal.step()
-
-                # 2. Update Refine (nếu có loss)
-                if loss_refine != 0.0:
-                    self.optimizer_refine.zero_grad(set_to_none=True)
-                    loss_refine.backward()
-                    torch.nn.utils.clip_grad_norm_(self.refine.parameters(), 0.5)
-                    self.optimizer_refine.step()
-
-                # 3. Update Critic (Luôn update ở mọi Phase)
-                h_star_b = h_node.detach()  # Ngắt gradient cho Critic
+                # ── CRITIC UPDATE — V(s, h*) ──
+                # FIX: Critic observes equilibrium histogram h* (detached for stability)
+                h_star_b = h_star.detach()
                 c_vals = self.critic(b_gen, b_svc, b_mf, h_star_b, indices=b_aids)
                 c_loss = F.mse_loss(c_vals, b_ret)
 
@@ -721,8 +959,20 @@ class ResidualRoutingAgent:
 
                 # ── Metrics ──
                 epoch_metrics['v'] += c_loss.item()
-                epoch_metrics['p'] += loss_proposal.item() if isinstance(loss_proposal, torch.Tensor) else loss_proposal
-                epoch_metrics['r'] += loss_refine.item() if isinstance(loss_refine, torch.Tensor) else loss_refine
+                epoch_metrics['p'] += actor_loss.item()
+                epoch_metrics['ent'] += ent_m.mean().item()
+                epoch_metrics['kl'] += approx_kl.item()
+
+                # K-step specific
+                epoch_metrics['fp_res'] += self.last_residual
+                epoch_metrics['delta']  += delta_norm
+                epoch_metrics['shift']  += logit_shift
+                epoch_metrics['hist_s'] += hist_shift
+                epoch_metrics['lv_p']   += self.proposal_load_var
+                epoch_metrics['lv_s']   += self.equilibrium_load_var
+                epoch_metrics['ov_p']   += prop_over_val
+                epoch_metrics['ov_s']   += star_over_val
+
                 total_batches += 1
 
         self.learn_step_counter += 1
@@ -731,14 +981,26 @@ class ResidualRoutingAgent:
         if self.learn_step_counter % log_freq == 0 and total_batches > 0:
             n = total_batches
             print(
-                f"[{self.node_type}][{phrase}] Step {self.learn_step_counter:5d} | "
+                f"[{self.node_type}] Step {self.learn_step_counter:5d} | "
                 f"V: {epoch_metrics['v'] / n:.5f} | "
-                f"Loss_P: {epoch_metrics['p'] / n:.5f} | "
-                f"Loss_R: {epoch_metrics['r'] / n:.5f}"
+                f"P: {epoch_metrics['p'] / n:.5f} | "
+                f"Ent: {epoch_metrics['ent'] / n:.4f} | "
+                f"KL: {epoch_metrics['kl'] / n:.6f}"
+            )
+            # Detailed K-step Equilibrium Diagnostics
+            print(
+                f"  > [KSTEP] res={epoch_metrics['fp_res']/n:.4f} | "
+                f"delta={epoch_metrics['delta']/n:.4f} | "
+                f"shift={epoch_metrics['shift']/n:.4f} | "
+                f"hist={epoch_metrics['hist_s']/n:.5f} | "
+                f"lv={epoch_metrics['lv_p']/n:.4f}->{epoch_metrics['lv_s']/n:.4f} | "
+                f"over={epoch_metrics['ov_p']/n:.4f}->{epoch_metrics['ov_s']/n:.4f} | "
+                f"Temp={temp:.2f}"
             )
 
         self.memory.clear()
         return epoch_metrics['v'] / total_batches if total_batches > 0 else 0.0
+
     # ----------------------------------------------------------
     # ④ Checkpoint
     # ----------------------------------------------------------
