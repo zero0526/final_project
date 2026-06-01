@@ -65,7 +65,21 @@ class PPOStrategy(AlgorithmStrategy):
             13: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             14: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
             15: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
-            16: {'lower': 8,  'upper': 8,  'zeta': 1.0, 'det': True}
+            16: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            17: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            18: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            19: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            20: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            21: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            22: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            23: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            24: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            25: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            26: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            27: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            28: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            29: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False},
+            30: {'lower': 8, 'upper': 8, 'zeta': 1.0, 'det': False}
         }
         
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
