@@ -30,31 +30,43 @@ def compute_gae(rewards, next_values, values, dones, agent_ids, gamma, lmbda):
 class ResidualRoutingPPOStrategy(AlgorithmStrategy):
     def __init__(self):
         super().__init__()
-        self.lower_train_num = 0
+        
+        # ═══ 1. UPPER LEVEL STATE MANAGEMENT ═══
+        self.upper_is_training = False     # Đảo ngược: Lower ưu tiên học ổn định trước
         self.upper_train_num = 0
-        self.alt_train_num = 0
-        self.alt_next = 'UPPER'
+        self.upper_warmup_steps = 3       # Số lần Upper cần học để đưa ra chiến lược mới
+        
+        # ═══ 2. LOWER LEVEL 4-PHASE CURRICULUM ═══
+        self.lower_phrase = 'Proposal'
+        self.lower_phrase_step_counts = {'Proposal': 0, 'Refine': 0, 'Decouple': 0, 'Exploit': 0}
+        
+        # Tối ưu hóa cho alpha=0.2: Refine hội tụ nhanh hơn, không cần quá nhiều bước
+        self.lower_phrase_limits = {
+            'Proposal': 50,     # Học Prior mềm
+            'Refine': 80,      # Đủ để gradient thoát khỏi zeros, bắt đầu xuất hiện Delta-Z
+            'Decouple': 300,    # Giai đoạn chính, hai mạng học tách biệt
+            'Exploit': 100       # Tổng 530 updates/cycle. Đủ để ép entropy xuống 0
+        }
+
+        self.lower_train_num = 0
+        self.lower_collect_size = 4096
+        
+        # ═══ 3. SHARED VARIABLES ═══
+        self.cycle_num = 1
+        self.max_cycles = 30
         self.upper_mf_ema = None
         self.lower_mf_prev = None
         self.mf_ema_alpha = 0.7
-
-        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
-        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
-
-        self.upper_warmup_steps = 5  
-        self.lower_warmup_steps = 15  
-        self.max_cycles = 20
-
-        self.phase = 'LOWER_ONLY'
-        self.cycle_num = 1
-        self.current_phase_updates = 0
-        self.entropy_decay_rate = 0.99
         self.is_evaluating = False
-        self.lower_collect_size= 4096
-        self.lower_batch_size= 128
-        self.lower_train_epochs= 4
-        self.model_workloads= None
+        self.model_workloads = None
 
+        # Configs
+        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
+        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 4}
+
+    # ==========================================
+    # AGENTS INITIALIZATION
+    # ==========================================
     def initialize_agents(self, trainer):
         # ==========================================
         # 1. UPPER AGENT (GIỮ NGUYÊN 100%)
@@ -81,12 +93,11 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
         # 2. LOWER AGENT
         # ==========================================
         lower_mf_dim = trainer.num_nodes + trainer.max_models
-
         trainer.shared_lower_agent = ResidualRoutingAgent(
             agent_id=-1, node_type="Terminal_Group",
             service_state_dim=trainer.num_nodes * 2,
             proposal_dim=trainer.num_nodes * trainer.max_models,
-            mf_dim=trainer.num_nodes + trainer.max_models,
+            mf_dim=lower_mf_dim,
             action_dim=trainer.lower_action_dim,
             u_action_dim=trainer.lower_u_action_dim,
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
@@ -102,13 +113,9 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
         )
 
         if self.lower_mf_prev is None:
-            # lower_mf_prev: (num_services, num_nodes, mf_dim)
             self.lower_mf_prev = torch.zeros(
                 trainer.num_services, trainer.num_nodes, lower_mf_dim, device=trainer.device
             )
-
-        if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
-            self.phase = 'UPPER_ONLY'
 
         # standalone K-step diagnostics monitor
         self.kstep_monitor = KStepMonitor(
@@ -119,7 +126,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
         )
 
     # ==========================================
-    # UPPER LEVEL FUNCTIONS (GIỮ NGUYÊN TOÀN BỘ)
+    # UPPER LEVEL FUNCTIONS
     # ==========================================
     def get_upper_actions(self, trainer, current_upper_state, obs_upper):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
@@ -148,7 +155,8 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_upper_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         avg_mf_loss = 0.0
-        is_frozen = (self.phase == 'LOWER_ONLY')
+        is_frozen = not self.upper_is_training # Sửa logic kiểm tra: Frozen nếu NOT training
+        
         edge_states = s_all[trainer.edge_node_ids] if s_all is not None else None
 
         if not is_frozen and not self.is_evaluating:
@@ -179,33 +187,18 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
     # ==========================================
     def _get_service_mask(self, trainer, s_idx):
         """Lấy mask cho 1 service cụ thể across all nodes"""
-        # Node mask (M,)
         mask_v = trainer.env.engine.placement_matrix[:, s_idx].float()
-        # Action mask (M * K)
         mask_a = mask_v.repeat_interleave(trainer.max_models)
         return mask_v, mask_a
 
     def _build_service_observation(self, trainer, s_idx, obs_lower):
-        """
-        Build service_state (2M) for a specific service.
-        f = CPU capacity normalized
-        Q = task backlog normalized
-        """
-        # Capacity f (M,)
-        f = (obs_lower["obs"]['cpu_alloc'][:, s_idx] * 
-             trainer.env.engine.placement_matrix[:, s_idx]).float()
+        f = (obs_lower["obs"]['cpu_alloc'][:, s_idx] * trainer.env.engine.placement_matrix[:, s_idx]).float()
         f = f / trainer.config.norm_gflop
-
-        # Backlog Q (M,)
         q = obs_lower["obs"]['backlog'][:, s_idx].float()
         q = q / trainer.config.norm_data_size
-
-        return torch.cat([f, q])  # (2M)
+        return torch.cat([f, q])
 
     def _compute_node_wise_mfs(self, trainer, t_idx, s_idx, n_idx, m_idx, src_node_indices):
-        """
-        Tính toán Mean Field cho từng service, loại trừ nhóm task đến từ node đang xét.
-        """
         B = len(t_idx)
         mf_dim = trainer.num_nodes + trainer.max_models
         device = trainer.device
@@ -235,8 +228,20 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
             node_wise_mfs,
             torch.zeros_like(node_wise_mfs)
         )
-        
         return node_wise_mfs 
+
+    def _advance_lower_phrase(self):
+        phrases = ['Proposal', 'Refine', 'Decouple', 'Exploit']
+        curr_idx = phrases.index(self.lower_phrase)
+        if curr_idx < len(phrases) - 1:
+            self.lower_phrase = phrases[curr_idx + 1]
+            print(f"  >>> Advancing Lower Phase to: {self.lower_phrase}")
+
+    def _reset_lower_curriculum(self):
+        self.lower_phrase = 'Proposal'
+        for k in self.lower_phrase_step_counts:
+            self.lower_phrase_step_counts[k] = 0
+        print(f"  >>> Resetting Lower Curriculum to Phase: {self.lower_phrase}")
 
     # ==========================================
     # MAIN TRAINING LOOP
@@ -261,13 +266,11 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
                 
                 if len(t_idx) > 0:
-                    # ── 2. Grouping by (Edge, Service) ──
                     n_src = torch.argmax(trainer.env.engine.terminal_to_node_map[t_idx], dim=1)
                     pairs = torch.stack([n_src, s_idx], dim=-1)
                     unique_pairs, pair_idx = torch.unique(pairs, dim=0, return_inverse=True)
                     B = unique_pairs.shape[0]
 
-                    # ── 3. Data Preparation ──
                     b_agent_idx = unique_pairs[:, 0]
                     b_svc_ids   = unique_pairs[:, 1]
                     
@@ -276,9 +279,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     for i in range(B):
                         v, s = int(b_agent_idx[i]), int(b_svc_ids[i])
                         tasks_in_group = obs_lower["obs"]['task_reqs'][t_idx[pair_idx == i]].clone()
-                        # data_size
                         tasks_in_group[:, 0] /= trainer.config.norm_data_size
-                        # accuracy
                         tasks_in_group[:, 2] /= 100.0
 
                         b_task_states.append(tasks_in_group)
@@ -290,13 +291,18 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     b_svc_states = torch.stack(b_svc_states)
                     b_prev_mfs   = torch.stack(b_prev_mfs)
 
-                    # ── 4. Inference ──
+                    # ── 4. Inference LOWER ──
+                    current_lower_phrase = self.lower_phrase if not self.upper_is_training else "Proposal"
+                    is_det = self.is_evaluating or (not self.upper_is_training and self.lower_phrase == 'Exploit')
+                    
                     a_ids_list, lp_list, values = trainer.shared_lower_agent.choose_action_batch(
                         service_states = b_svc_states,
                         prev_mfs       = b_prev_mfs,
                         task_states    = b_task_states,
                         masks_batch    = b_masks,
                         agent_indices  = b_agent_idx,
+                        phrase         = current_lower_phrase,
+                        deterministic  = is_det
                     )
 
                     # ── 5. Environment Step ──
@@ -310,8 +316,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         final_m_idx[pair_idx == i] = a_ids % trainer.max_models
 
                     results = trainer.env.step_lower(
-                        t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx,
-                        task_deadlines, tasks_min_accuracy
+                        t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx, task_deadlines, tasks_min_accuracy
                     )
                     
                     # ── 6. Rewards & Storage ──
@@ -323,7 +328,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         trainer, t_idx, s_idx, final_n_idx, final_m_idx, n_src
                     )
                     
-                    if self.phase == 'LOWER_ONLY' and not self.is_evaluating:
+                    if not self.upper_is_training:
                         b_next_svc_states = torch.stack([
                             self._build_service_observation(trainer, int(b_svc_ids[i]), results)
                             for i in range(B)
@@ -336,32 +341,33 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         b_dones   = torch.zeros((B, 1), device=trainer.device)
                         
                         trainer.shared_lower_agent.store_transition_train_mf_batch(
-                            service_states      = b_svc_states,
-                            task_states         = b_task_states,
-                            prev_mfs            = b_prev_mfs,
-                            curr_mfs            = b_curr_mfs,
-                            actions             = a_ids_list,
-                            rewards             = b_rewards,
-                            next_service_states = b_next_svc_states,
-                            dones               = b_dones,
-                            agent_ids           = b_agent_idx,
-                            log_probs           = lp_list,
-                            values              = values,
-                            masks               = b_masks
+                            service_states=b_svc_states, task_states=b_task_states, prev_mfs=b_prev_mfs,
+                            curr_mfs=b_curr_mfs, actions=a_ids_list, rewards=b_rewards,
+                            next_service_states=b_next_svc_states, dones=b_dones,
+                            agent_ids=b_agent_idx, log_probs=lp_list, values=values, masks=b_masks
                         )
                         
                         m_len = trainer.shared_lower_agent.memory.total_size
                         if m_len >= self.lower_collect_size:
-                            loss = trainer.shared_lower_agent.learn()
+                            loss = trainer.shared_lower_agent.learn(phrase=self.lower_phrase)
+                            
                             if loss is not None:
                                 self.lower_train_num += 1
-                                self.current_phase_updates += 1
+                                self.lower_phrase_step_counts[self.lower_phrase] += 1
+                                
+                                if self.lower_phrase_step_counts[self.lower_phrase] >= self.lower_phrase_limits[self.lower_phrase]:
+                                    if self.lower_phrase == 'Exploit':
+                                        self.upper_is_training = True
+                                        self.upper_train_num = 0
+                                        self._reset_lower_curriculum()
+                                        pbar.update(1)
+                                        self.cycle_num += 1
+                                        print(f"\n[Cycle {self.cycle_num}] LOWER Phase Complete. Switching to UPPER optimization.")
+                                    else:
+                                        self._advance_lower_phrase()
+
                                 trainer.aggregator.record_td_losses(lower_losses=loss)
                                 self.kstep_monitor.record(trainer.shared_lower_agent)
-                                if self.current_phase_updates >= self.lower_warmup_steps:
-                                    self.phase = 'UPPER_ONLY'
-                                    self.current_phase_updates = 0
-                                    print(f"\n[Cycle {self.cycle_num}] LOWER Phase Complete.")
 
                     self.lower_mf_prev = curr_slot_mfs.detach()
                     obs_lower = results
@@ -369,28 +375,30 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     
                     if slot % 1000 == 0 and slot > 0:
                         success = sum(trainer.aggregator.episode_success_qos)
-                        fail = sum(trainer.aggregator.episode_violate_qos)
-                        trainer.aggregator.log(f"  > Slot {slot:4d} | Partial OK: {success:5.0f} | FAIL: {fail:5.0f}")
+                        lv_p = trainer.shared_lower_agent.proposal_load_var
+                        lv_s = trainer.shared_lower_agent.equilibrium_load_var
+                        trainer.aggregator.log(f"  > Slot {slot:4d} | Phase: {self.lower_phrase if not self.upper_is_training else 'FROZEN':<8} | OK: {success:5.0f} | LoadVar: {lv_p:.4f}->{lv_s:.4f}")
                 else:
                     trainer.env.time_manager.tick()
 
                 if trainer.env.time_manager.is_new_frame():
                     res_upper = trainer.env.collect_upper_metrics()
+                    obs_upper = res_upper
                     next_upper_state = self.build_upper_state(trainer, res_upper)
                     is_ep_done = (slot == max_slots - 1)
                     self.store_upper_transitions(trainer, current_upper_state, next_upper_state, obs_upper, res_upper,
                                                  u_acts_matrix, u_log_probs, u_values, is_ep_done)
 
-                    if self.phase == 'UPPER_ONLY':
+                    if self.upper_is_training:
+                        # Upper learns logic
                         loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
                         if loss is not None:
                             self.upper_train_num += 1
-                            self.current_phase_updates += 1
-                            if self.current_phase_updates >= self.upper_warmup_steps:
-                                self.phase = 'LOWER_ONLY'
-                                self.current_phase_updates = 0
-                                pbar.update(1)
-                                self.cycle_num += 1
+                            if self.upper_train_num >= self.upper_warmup_steps:
+                                self.upper_is_training = False
+                                self._reset_lower_curriculum()
+                                print(f"\n[Cycle {self.cycle_num}] UPPER updated strategy. Resetting LOWER to Phase 1.")
+
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
@@ -447,11 +455,13 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         task_states    = b_task_states,
                         masks_batch    = b_masks,
                         agent_indices  = b_agent_idx,
+                        phrase         = "Exploit", 
                         deterministic  = True
                     )
 
-                    final_n_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
-                    final_m_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
+                    final_n_idxSize = len(t_idx)
+                    final_n_idx = torch.zeros(final_n_idxSize, dtype=torch.long, device=trainer.device)
+                    final_m_idx = torch.zeros(final_n_idxSize, dtype=torch.long, device=trainer.device)
                     for i in range(B):
                         a_ids = a_ids_list[i]
                         final_n_idx[pair_idx == i] = a_ids // trainer.max_models
