@@ -43,8 +43,8 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
 
         self.upper_warmup_steps = 5  
         self.lower_warmup_steps = 15  
-        self.max_cycles = 30*15
-        self.proposal_only_cycles= 20*15
+        self.max_cycles = 750
+        self.proposal_only_cycles= 700
         self.phase = 'LOWER_ONLY'
         self.cycle_num = 1
         self.current_phase_updates = 0
@@ -369,6 +369,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
 
                         loss = trainer.shared_lower_agent.learn(phrase=current_phrase, step= self.cycle_num)
                         if loss is not None:
+                            print(f"phrase: {current_phrase} step {self.cycle_num} loss: {loss}")
                             self.lower_train_num += 1
                             trainer.aggregator.record_td_losses(lower_losses=loss)
                             self.kstep_monitor.record(trainer.shared_lower_agent)
@@ -449,8 +450,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         v, s = int(b_agent_idx[i]), int(b_svc_ids[i])
                         tasks_in_group = obs_lower["obs"]['task_reqs'][t_idx[pair_idx == i]].clone()
                         tasks_in_group[:, 0] /= trainer.config.norm_data_size
-                        tasks_in_group[:, 1] /= 100.0
-                        tasks_in_group[:, 2] /= (trainer.env.time_manager.max_deadline if hasattr(trainer.env.time_manager, 'max_deadline') else 10.0)
+                        tasks_in_group[:, 2] /= 100.0
                         
                         b_task_states.append(tasks_in_group)
                         b_svc_states.append(self._build_service_observation(trainer, s, obs_lower))
@@ -458,7 +458,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         _, mask_a = self._get_service_mask(trainer, s)
                         b_masks.append(mask_a)
 
-                    a_ids_list, _, _ = trainer.shared_lower_agent.choose_action_batch(
+                    a_ids_list, _, _, _ = trainer.shared_lower_agent.choose_action_batch(
                         service_states = torch.stack(b_svc_states),
                         prev_mfs       = torch.stack(b_prev_mfs),
                         task_states    = b_task_states,
