@@ -39,6 +39,10 @@ class RolloutBuffer:
                                     dtype=torch.float32, device=device)
         self.agent_id = torch.zeros((max_size, 1),
                                     dtype=torch.int64, device=device)
+        
+        # ── Histogram (Mean Field h_t) ──
+        # M = service_state_dim // 2
+        M = service_state_dim // 2
 
         # ── Variable-length fields (list of tensors) ──
         self.task_state = [None] * max_size   # (N_i, task_dim) mỗi entry

@@ -43,8 +43,8 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
 
         self.upper_warmup_steps = 5  
         self.lower_warmup_steps = 15  
-        self.max_cycles = 30
-
+        self.max_cycles = 30*15
+        self.proposal_only_cycles= 20*15
         self.phase = 'LOWER_ONLY'
         self.cycle_num = 1
         self.current_phase_updates = 0
@@ -244,7 +244,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
     def run_training(self, trainer):
         max_slots = trainer.env.time_manager.max_steps
         ep = 0
-        pbar = tqdm(total=self.max_cycles, desc="Residual Routing Progress")
+        pbar = tqdm(total=self.max_cycles, desc="Residual Isolated Test (20P + 10R)")
 
         while self.cycle_num <= self.max_cycles:
             obs = trainer.env.reset()
@@ -252,36 +252,44 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
             obs_lower = obs['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
 
+            # Xác định Phase ở đầu mỗi Episode
+            if self.cycle_num <= self.proposal_only_cycles:
+                current_phrase = "Proposal_Only"
+            else:
+                current_phrase = "Proposal_Free"
+
+            training_complete = False  # Cờ dừng khẩn cấp khi đủ 30 cycle
+
             for slot in range(max_slots):
+                if training_complete:
+                    break  # Thoát khỏi vòng lặp slot ngay lập tức nếu đủ 30 cycle
+
+                # ── UPPER ACTION (Chạy nhưng KHÔNG HỌC) ──
                 if trainer.env.time_manager.is_new_frame():
-                    u_acts_matrix, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                    u_acts_matrix, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state,
+                                                                                  obs_upper)
                     trainer.env.step_upper(u_acts_matrix)
 
-                # ── 1. Generate workload ──
+                # ── 1. GENERATE WORKLOAD ──
                 t_idx, s_idx, batch_sizes, tasks_min_accuracy, task_deadlines = trainer.workload_gen.generate_step()
-                
+
                 if len(t_idx) > 0:
-                    # ── 2. Grouping by (Edge, Service) ──
+                    # ── 2. GROUPING BY (Edge, Service) ──
                     n_src = torch.argmax(trainer.env.engine.terminal_to_node_map[t_idx], dim=1)
                     pairs = torch.stack([n_src, s_idx], dim=-1)
                     unique_pairs, pair_idx = torch.unique(pairs, dim=0, return_inverse=True)
                     B = unique_pairs.shape[0]
 
-                    # ── 3. Data Preparation ──
+                    # ── 3. DATA PREPARATION ──
                     b_agent_idx = unique_pairs[:, 0]
-                    b_svc_ids   = unique_pairs[:, 1]
-
-                    # FIX: Linear temperature schedule (1.5 -> 1.0) for Proposal exploitation
-                    current_temp = 1.5 - (1.5 - 1.0) * (self.cycle_num - 1) / (self.max_cycles - 1) if self.max_cycles > 1 else 1.0
+                    b_svc_ids = unique_pairs[:, 1]
 
                     b_svc_states, b_task_states, b_prev_mfs, b_masks = [], [], [], []
-                    
+
                     for i in range(B):
                         v, s = int(b_agent_idx[i]), int(b_svc_ids[i])
                         tasks_in_group = obs_lower["obs"]['task_reqs'][t_idx[pair_idx == i]].clone()
-                        # data_size
                         tasks_in_group[:, 0] /= trainer.config.norm_data_size
-                        # accuracy
                         tasks_in_group[:, 2] /= 100.0
 
                         b_task_states.append(tasks_in_group)
@@ -291,23 +299,23 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         b_masks.append(mask_a)
 
                     b_svc_states = torch.stack(b_svc_states)
-                    b_prev_mfs   = torch.stack(b_prev_mfs)
+                    b_prev_mfs = torch.stack(b_prev_mfs)
 
-                    # ── 4. Inference ──
-                    a_ids_list, lp_list, values = trainer.shared_lower_agent.choose_action_batch(
-                        service_states = b_svc_states,
-                        prev_mfs       = b_prev_mfs,
-                        task_states    = b_task_states,
-                        masks_batch    = b_masks,
-                        agent_indices  = b_agent_idx,
-                        temp           = current_temp,
+                    # ── 4. INFERENCE ──
+                    a_ids_list, lp_list, values, h_node = trainer.shared_lower_agent.choose_action_batch(
+                        service_states=b_svc_states,
+                        prev_mfs=b_prev_mfs,
+                        task_states=b_task_states,
+                        masks_batch=b_masks,
+                        agent_indices=b_agent_idx,
+                        phrase=current_phrase,
                     )
 
-                    # ── 5. Environment Step ──
+                    # ── 5. ENVIRONMENT STEP ──
                     final_n_idxSize = len(t_idx)
                     final_n_idx = torch.zeros(final_n_idxSize, dtype=torch.long, device=trainer.device)
                     final_m_idx = torch.zeros(final_n_idxSize, dtype=torch.long, device=trainer.device)
-                    
+
                     for i in range(B):
                         a_ids = a_ids_list[i]
                         final_n_idx[pair_idx == i] = a_ids // trainer.max_models
@@ -317,8 +325,8 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx,
                         task_deadlines, tasks_min_accuracy
                     )
-                    
-                    # ── 6. Rewards & Storage ──
+
+                    # ── 6. REWARDS & STORAGE ──
                     dr_penalty = results['obs'].get('virtual_drift', 0.0)
                     true_reward = results['reward'] - dr_penalty
                     norm_rew = log_transform(true_reward / (trainer.config.norm_lower_rw or 1.0))
@@ -326,75 +334,76 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     curr_slot_mfs = self._compute_node_wise_mfs(
                         trainer, t_idx, s_idx, final_n_idx, final_m_idx, n_src
                     )
-                    
-                    if self.phase == 'LOWER_ONLY' and not self.is_evaluating:
-                        b_next_svc_states = torch.stack([
-                            self._build_service_observation(trainer, int(b_svc_ids[i]), results)
-                            for i in range(B)
-                        ])
-                        b_curr_mfs = torch.stack([
-                            curr_slot_mfs[int(b_svc_ids[i]), int(b_agent_idx[i])]
-                            for i in range(B)
-                        ])
-                        b_rewards = torch.full((B, 1), norm_rew, device=trainer.device)
-                        b_dones   = torch.zeros((B, 1), device=trainer.device)
-                        
-                        trainer.shared_lower_agent.store_transition_train_mf_batch(
-                            service_states      = b_svc_states,
-                            task_states         = b_task_states,
-                            prev_mfs            = b_prev_mfs,
-                            curr_mfs            = b_curr_mfs,
-                            actions             = a_ids_list,
-                            rewards             = b_rewards,
-                            next_service_states = b_next_svc_states,
-                            dones               = b_dones,
-                            agent_ids           = b_agent_idx,
-                            log_probs           = lp_list,
-                            values              = values,
-                            masks               = b_masks
-                        )
-                        
-                        m_len = trainer.shared_lower_agent.memory.total_size
-                        if m_len >= self.lower_collect_size:
-                            loss = trainer.shared_lower_agent.learn(temp=current_temp)
-                            if loss is not None:
-                                self.lower_train_num += 1
-                                self.current_phase_updates += 1
-                                trainer.aggregator.record_td_losses(lower_losses=loss)
-                                self.kstep_monitor.record(trainer.shared_lower_agent)
-                                if self.current_phase_updates >= self.lower_warmup_steps:
-                                    self.phase = 'UPPER_ONLY'
-                                    self.current_phase_updates = 0
-                                    print(f"\n[Cycle {self.cycle_num}] LOWER Phase Complete.")
+
+                    b_next_svc_states = torch.stack([
+                        self._build_service_observation(trainer, int(b_svc_ids[i]), results)
+                        for i in range(B)
+                    ])
+                    b_curr_mfs = torch.stack([
+                        curr_slot_mfs[int(b_svc_ids[i]), int(b_agent_idx[i])]
+                        for i in range(B)
+                    ])
+                    b_rewards = torch.full((B, 1), norm_rew, device=trainer.device)
+                    b_dones = torch.zeros((B, 1), device=trainer.device)
+
+                    trainer.shared_lower_agent.store_transition_train_mf_batch(
+                        service_states=b_svc_states,
+                        task_states=b_task_states,
+                        prev_mfs=b_prev_mfs,
+                        curr_mfs=b_curr_mfs,
+                        actions=a_ids_list,
+                        rewards=b_rewards,
+                        next_service_states=b_next_svc_states,
+                        dones=b_dones,
+                        agent_ids=b_agent_idx,
+                        log_probs=lp_list,
+                        values=values,
+                        masks=b_masks
+                    )
+
+                    # ══════════════════════════════════════════════════════
+                    # ĐIỂM QUAN TRỌNG: KIỂM TRA ĐỦ DATA THÌ MỚI TÍNH LÀ 1 CYCLE
+                    # ══════════════════════════════════════════════════════
+                    m_len = trainer.shared_lower_agent.memory.total_size
+                    if m_len >= self.lower_collect_size:
+
+                        loss = trainer.shared_lower_agent.learn(phrase=current_phrase, step= self.cycle_num)
+                        if loss is not None:
+                            self.lower_train_num += 1
+                            trainer.aggregator.record_td_losses(lower_losses=loss)
+                            self.kstep_monitor.record(trainer.shared_lower_agent)
+
+                            # ══════════════════════════════════════════
+                            # CHÍNH TẠI ĐÂY MỚI LÀ KẾT THÚC 1 CYCLE!
+                            # ══════════════════════════════════════════
+                            pbar.update(1)
+                            self.cycle_num += 1
+
+                            # Cập nhật lại Phase cho chu kỳ thu thập tiếp theo
+                            if self.cycle_num <= self.proposal_only_cycles:
+                                current_phrase = "Proposal_Only"
+                            else:
+                                current_phrase = "Proposal_Free"
+
+                            # Nếu đã đủ 30 cycle thì đánh cờ dừng
+                            if self.cycle_num > self.max_cycles:
+                                training_complete = True
 
                     self.lower_mf_prev = curr_slot_mfs.detach()
                     obs_lower = results
                     trainer.aggregator.add_lower(results, mf_loss=0.0, state=None)
-                    
-                    if slot % 1000 == 0 and slot > 0:
-                        success = sum(trainer.aggregator.episode_success_qos)
-                        fail = sum(trainer.aggregator.episode_violate_qos)
-                        trainer.aggregator.log(f"  > Slot {slot:4d} | Partial OK: {success:5.0f} | FAIL: {fail:5.0f}")
                 else:
                     trainer.env.time_manager.tick()
 
+                # ── UPPER METRICS COLLECT (KHÔNG HỌC, KHÔNG ĐẾM CYCLE) ──
                 if trainer.env.time_manager.is_new_frame():
                     res_upper = trainer.env.collect_upper_metrics()
                     next_upper_state = self.build_upper_state(trainer, res_upper)
                     is_ep_done = (slot == max_slots - 1)
+
                     self.store_upper_transitions(trainer, current_upper_state, next_upper_state, obs_upper, res_upper,
                                                  u_acts_matrix, u_log_probs, u_values, is_ep_done)
 
-                    if self.phase == 'UPPER_ONLY':
-                        loss = trainer.shared_upper_agent.learn(torch.arange(trainer.num_edge_agents, device=trainer.device))
-                        if loss is not None:
-                            self.upper_train_num += 1
-                            self.current_phase_updates += 1
-                            if self.current_phase_updates >= self.upper_warmup_steps:
-                                self.phase = 'LOWER_ONLY'
-                                self.current_phase_updates = 0
-                                pbar.update(1)
-                                self.cycle_num += 1
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
@@ -402,7 +411,11 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
             trainer.aggregator.report_episode(ep)
             trainer.aggregator.reset_episode()
             ep += 1
+
         pbar.close()
+        print("\n" + "=" * 60)
+        print(f"ISOLATED TEST FINISHED! Total Lower Updates: {self.lower_train_num}")
+        print("=" * 60)
         self.run_evaluation(trainer, num_episodes=5)
 
     def run_evaluation(self, trainer, num_episodes=5):

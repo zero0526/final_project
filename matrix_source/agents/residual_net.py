@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
 from matrix_source.agents.base import MultiInstanceLinear, MultiInstanceRMSNorm
 
@@ -26,7 +25,7 @@ class MFNetwork(nn.Module):
 
 
 class ProposalActor(nn.Module):
-    """(task || svc || mf) → logits"""
+    """(task || svc || mf) → logits (Baseline Prior)"""
 
     def __init__(self, task_state, service_state, mf_dim, action_dim,
                  hidden_sizes, num_instances=1):
@@ -45,52 +44,16 @@ class ProposalActor(nn.Module):
         x = F.silu(self.norm2(self.fc2(x, indices), indices))
         return self.logits(x, indices)
 
-    def evaluate(self, task, svc, mf, action, masks=None,
-                 indices=None, residual_logits=None, exclude_zero=False):
-        logits = self.forward(task, svc, mf, indices)
-        if residual_logits is not None:
-            logits = logits + residual_logits
-        if masks is not None:
-            logits = logits.masked_fill(masks == 0, -1e9)
-        if exclude_zero and logits.shape[-1] > 1:
-            logits[:, 0] = -1e9
-        dist = Categorical(logits=logits)
-        return dist.log_prob(action), dist.entropy()
-
-class ResidualCritic(nn.Module):
-    """(general_task || svc || mf || h_star) → V(s, h*)
-
-    FIX: Critic now observes the equilibrium histogram h* so that
-    V(s, h*) matches MFG theory where value depends on population state.
-    """
-
-    def __init__(self, general_task_states, service_states,
-                 mf_dim, hist_dim, hidden_sizes, num_instances=1):
-        super().__init__()
-        h1, h2 = hidden_sizes
-        in_dim = general_task_states + service_states + mf_dim + hist_dim
-        self.fc1 = MultiInstanceLinear(num_instances, in_dim, h1)
-        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
-        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
-        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
-        self.v = MultiInstanceLinear(num_instances, h2, 1)
-
-    def forward(self, general_task, svc, mf, h_star, indices=None):
-        """h_star: (B, M) equilibrium histogram — must be detached for stability."""
-        x = torch.cat([general_task, svc, mf, h_star], dim=-1)
-        x = F.silu(self.norm1(self.fc1(x, indices), indices))
-        x = F.silu(self.norm2(self.fc2(x, indices), indices))
-        return self.v(x, indices).squeeze(-1)
 
 class RefineActor(nn.Module):
-    """(task || svc || mf || proposal || hist || overload) → δlogits"""
+    """(task || svc || mf || proposal || hist || overload) → δlogits (Residual Correction)"""
 
     def __init__(self, task_state, service_state, mf_dim,
                  proposal_dim, action_dim,
                  hidden_sizes, num_instances=1):
         super().__init__()
         h1, h2 = hidden_sizes
-        M = service_state // 2  # service_state = 2*M
+        M = service_state // 2
         hist_dim = 2 * M  # histogram + overload
         in_dim = task_state + service_state + mf_dim + proposal_dim + hist_dim
 
@@ -100,12 +63,12 @@ class RefineActor(nn.Module):
         self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
         self.logits = MultiInstanceLinear(num_instances, h2, action_dim)
 
+        # Khởi tạo bằng 0 để ở Phase 1 nó là hàm số 0 (không ảnh hưởng đến Proposal)
         nn.init.zeros_(self.logits.weight)
         nn.init.zeros_(self.logits.bias)
 
-    def forward(self, task, svc, mf, current_logits,
-                histogram, overload, indices=None):
-        """current_logits: logits at step k (caller decides whether to .detach())"""
+    def forward(self, task, svc, mf, current_logits, histogram, overload, indices=None):
+        """current_logits: z_p (caller decides whether to .detach())"""
         x = torch.cat([
             task, svc, mf,
             current_logits,
@@ -116,4 +79,29 @@ class RefineActor(nn.Module):
         return self.logits(x, indices)
 
 
+class ResidualCritic(nn.Module):
+    """(general_task || svc || mf) → V(s)
 
+    MINIMALIST CRITIC: Không quan sát h* (histogram).
+    Chỉ đánh giá giá trị trạng thái tổng thể của Node để tạo tín hiệu cho PPO.
+    """
+
+    def __init__(self, general_task_states, service_states,
+                 mf_dim, hidden_sizes, num_instances=1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        # ĐÃ BỎ hist_dim ra khỏi in_dim
+        in_dim = general_task_states + service_states + mf_dim
+
+        self.fc1 = MultiInstanceLinear(num_instances, in_dim, h1)
+        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
+        self.v = MultiInstanceLinear(num_instances, h2, 1)
+
+    def forward(self, general_task, svc, mf, indices=None):
+        # ĐÃ BỎ h_star khỏi forward
+        x = torch.cat([general_task, svc, mf], dim=-1)
+        x = F.silu(self.norm1(self.fc1(x, indices), indices))
+        x = F.silu(self.norm2(self.fc2(x, indices), indices))
+        return self.v(x, indices).squeeze(-1)
