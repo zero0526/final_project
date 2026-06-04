@@ -144,7 +144,8 @@ def init_metadata_tensors(config, device="cpu"):
     service_input_size = torch.zeros((num_services, 1), device=device)
     service_size = torch.zeros((num_services, 1), device=device)
     
-    zipf_param = config.zipf_param
+    zipf_param = 2.5
+        # config.zipf_param)
     ranks = torch.arange(1, num_services + 1, dtype=torch.float32, device=device)
     zipf_weights = 1.0 / torch.pow(ranks, zipf_param)
     zipf_probs = zipf_weights / zipf_weights.sum()

@@ -70,6 +70,13 @@ class MetricsAggregator:
         self.episode_lower_q_min = []
         self.episode_lower_q_max = []
         self.episode_lower_q_mean = []
+        
+        # ✅ Refine Vital Signs
+        self.episode_refine_delta_norm = []
+        self.episode_refine_flip_rate = []
+        self.episode_refine_kl_div = []
+        self.episode_refine_q_imp = []
+        self.episode_refine_grad = []
 
         self.episode_terminal_fails = None
         
@@ -151,7 +158,17 @@ class MetricsAggregator:
         if upper_losses is not None:
             self.episode_upper_td_losses.append(_extract(upper_losses))
         if lower_losses is not None:
-            self.episode_lower_td_losses.append(_extract(lower_losses))
+            if isinstance(lower_losses, dict):
+                self.episode_lower_td_losses.append(_extract(lower_losses.get("v_loss", 0.0)))
+                # Store vital signs if present
+                if "delta_norm" in lower_losses:
+                    self.episode_refine_delta_norm.append(_extract(lower_losses["delta_norm"]))
+                    self.episode_refine_flip_rate.append(_extract(lower_losses["flip_rate"]))
+                    self.episode_refine_kl_div.append(_extract(lower_losses["kl_div"]))
+                    self.episode_refine_q_imp.append(_extract(lower_losses["q_imp"]))
+                    self.episode_refine_grad.append(_extract(lower_losses["refine_grad"]))
+            else:
+                self.episode_lower_td_losses.append(_extract(lower_losses))
 
     def record_zeta(self, lower, upper):
         self.curr_zeta_lower = lower
@@ -200,6 +217,10 @@ class MetricsAggregator:
         self.history["zeta_upper"].append(self.curr_zeta_upper)
 
         for k in ["upper_q_min", "upper_q_max", "upper_q_mean", "lower_q_min", "lower_q_max", "lower_q_mean"]:
+            self.history[k].append(_get_avg(getattr(self, f"episode_{k}"), k))
+
+        # Refine Vital Signs Averages
+        for k in ["refine_delta_norm", "refine_flip_rate", "refine_kl_div", "refine_q_imp", "refine_grad"]:
             self.history[k].append(_get_avg(getattr(self, f"episode_{k}"), k))
 
         # QoS and Completion
@@ -308,8 +329,44 @@ class MetricsAggregator:
         plt.savefig(os.path.join(cfg.plot_dir, filename))
         plt.close()
 
+        # ✅ NEW: Refine Actor Vital Signs Plot
+        self._plot_refine_health()
+
+    def _plot_refine_health(self):
+        if not self.history["refine_delta_norm"]: return
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        plt.suptitle(f"Refine Actor Vital Signs (Episode {len(self.history['total_reward'])})", fontsize=16)
+        
+        window = 10
+        vital_metrics = [
+            ("refine_delta_norm", "Delta Norm (Intervention Magnitude)", "blue"),
+            ("refine_flip_rate", "Flip Rate (Change Frequency)", "green"),
+            ("refine_kl_div", "KL Divergence (Dist Shift)", "orange"),
+            ("refine_q_imp", "Q-Improvement (Value Gain)", "red"),
+            ("refine_grad", "Refine Gradient Norm", "purple")
+        ]
+
+        for i, (key, title, color) in enumerate(vital_metrics):
+            ax = axes[i // 3, i % 3]
+            data = self.history[key]
+            ax.plot(data, color=color, alpha=0.3, label="Raw")
+            if len(data) >= window:
+                ma_data = self._moving_average(data, window)
+                ax.plot(range(window-1, len(data)), ma_data, color=color, linewidth=2, label=f"MA-{window}")
+            ax.set_title(title)
+            ax.grid(True)
+            if key == "refine_flip_rate": ax.set_ylim(0, 1)
+
+        # Remove the empty 6th subplot
+        fig.delaxes(axes[1, 2])
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        filename = f"{self.name.lower()}_refine_health.png"
+        plt.savefig(os.path.join(cfg.plot_dir, filename))
+        plt.close()
+
     def save_history_csv(self):
-        path = os.path.join(cfg.results, "training_history.csv")
+        path = os.path.join(cfg.results, "ppo_edge_centric.csv")
         if not os.path.exists(cfg.results): os.makedirs(cfg.results)
         keys = sorted(self.history.keys())
         with open(path, "w", newline="") as f:

@@ -477,7 +477,7 @@ class MatrixPhysicalEngine:
         self.reward_global_accumulator += f1
         
         # Refined QoS penalty
-        qos_penalty = self.omega_1 * torch.exp(num_violations.float()*0.12)
+        qos_penalty = self.omega_1 * num_violations.float()
         
         reward = -(f1 +qos_penalty)
         obs = {
