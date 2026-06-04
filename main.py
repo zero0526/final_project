@@ -7,9 +7,9 @@ from matrix_source.trainers.semi_distribute_task import GRUPPOSCAFFOLDREPStrateg
 from matrix_source.trainers.coma_residual import COMAResidualStrategy
 
 from matrix_source.configs.configs import cfg
-# cfg.hyper_neural["NUM_LOWER_AGENTS"]= 100
+cfg.hyper_neural["NUM_LOWER_AGENTS"]= 20
 
 if __name__ == '__main__':
-    strategy = COMAResidualStrategy()
+    strategy = D3QNScaffoldStrategy()
     trainer = Trainer(strategy=strategy)
     trainer.train()

@@ -90,7 +90,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         placement_matrix = trainer.env.engine.placement_matrix
 
         data_sizes = batch_sizes * unit_sizes[s_idx].squeeze(-1)
-        s_tasks = torch.stack([data_sizes, tasks_min_accuracy, task_deadlines, meta['service_omega'][s_idx].squeeze(-1)], dim=1).float()
+        s_tasks = torch.stack([data_sizes, task_deadlines, tasks_min_accuracy, meta['service_omega'][s_idx].squeeze(-1)], dim=1).float()
         
         # Advanced indexing using s_idx (which is already a vector per request)
         # placement[:, s_idx] -> (nodes, num_reqs) -> .T -> (num_reqs, nodes)
@@ -101,7 +101,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         states = torch.cat([s_tasks, s_backlogs, s_cpus], dim=1)
         
         states[:, 0] /= trainer.config.norm_data_size
-        states[:, 1] /= 100.0
+        states[:, 2] /= 100.0
         if states.shape[1] > 4:
             states[:, 4:4+2*trainer.num_nodes] /= trainer.config.norm_gflop
             
@@ -137,8 +137,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         done = torch.tensor([next_res["new_frame"]]*len(t_idx), dtype=torch.float32, device=trainer.device)
         c_obs, n_obs = current_res['obs'], next_res['obs']
         c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
-        cur_placements = masks[:, ::trainer.max_models]
-        next_placements = next_masks[:, ::trainer.max_models]
+
         def build_state(obs, tidx, sidx, place):
             # Advanced indexing on service dim if sidx is a vector
             back = obs['backlog'][:, sidx].T * place
@@ -146,7 +145,7 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
             
             st = torch.cat([obs['task_reqs'][tidx], back, cpu_a], dim=1)
             st[:, 0] /= trainer.config.norm_data_size
-            st[:, 1] /= 100.0
+            st[:, 2] /= 100.0
             if st.shape[1] > 4: st[:, 4:4+2*trainer.num_nodes] /= trainer.config.norm_gflop
             return st
 
@@ -194,74 +193,25 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
         )
         trainer.aggregator.add_upper(next_res, mf_loss=avg_mf_loss, state=edge_states[0] if len(edge_states) > 0 else None)
 
-    def perform_scaffold_aggregation(self, agent: D3QNAgent):
-        """
-        Cluster-Based Federated aggregation for Multi-Instance D3QNAgent using SCAFFOLD.
-        Aggregates terminals locally within each Edge Node cluster.
-        """
-        if not agent.use_scaffold:
-            return
-
-        with torch.no_grad():
-            # Parameters in agent.eval_net.get_base_params() are shape (num_instances, ...)
-            # We iterate through each cluster of terminals connected to a specific edge or cloud node
-            for node_id, terminal_ids in self.node_to_terminals.items():
-                if not terminal_ids: continue
-                
-                t_ids = torch.tensor(terminal_ids, device=agent.device)
-                
-                # 1. Aggregate local base weights (theta_i) for THIS cluster only
-                for i, p in enumerate(agent.eval_net.get_base_params()):
-                    # p.data[t_ids] has shape (len(terminal_ids), ...)
-                    cluster_p = p.data[t_ids].mean(dim=0, keepdim=True)
-                    
-                    # SCAFFOLD Control Variate (c_i) update logic:
-                    # c_i = c_i - c_cluster + (grad_sum / K)
-                    K_dims = [len(terminal_ids)] + [1] * (p.data.dim() - 1)
-                    K_expanded = agent.steps_in_round[t_ids].float().view(*K_dims)
-                    K_expanded = torch.clamp(K_expanded, min=1.0)
-                    
-                    # c_cluster for this specific parameter set and this specific cluster
-                    # self.c_global[i] in the agent stores the "global" for each instance.
-                    # We treat all instances in t_ids as sharing the same global value.
-                    
-                    # delta_c: (len(terminal_ids), ...)
-                    delta_c = agent.grad_sum[i][t_ids] / K_expanded
-                    
-                    # Update local c_i for cluster members
-                    agent.c_i[i][t_ids] = agent.c_i[i][t_ids] - agent.c_global[i][t_ids] + delta_c
-                    
-                    # Broadcast average cluster_p back to all terminals in this cluster
-                    p.data[t_ids] = cluster_p.expand(len(terminal_ids), *cluster_p.shape[1:])
-                
-                # 2. Update cluster-specific global control variate (c_global)
-                # All terminals in t_ids should now share the same new c_global value
-                for i in range(len(agent.c_i)):
-                    new_cluster_c_global = agent.c_i[i][t_ids].mean(dim=0, keepdim=True)
-                    agent.c_global[i][t_ids] = new_cluster_c_global.expand(len(terminal_ids), *new_cluster_c_global.shape[1:])
-            
-            # 3. Synchronize Target Network (Base part) for all instances
-            # (Targets are synchronized to their local eval weights which were just averaged per-cluster)
-            for target_p, eval_p in zip(agent.target_net.get_base_params(), agent.eval_net.get_base_params()):
-                target_p.data.copy_(eval_p.data)
-                
-            # 4. Checkpoint for next round
-            agent.save_base_initial()
-
     def perform_scaffold_aggregation_v2(self, agent, round_idx: int = 0):
         """
         Cluster-Based Federated Aggregation for D3QNAgentV2 (split backbone/head).
         Called once per federated round, after all local learning steps are done.
-
-        Phase 1 & 2: averages backbone weights per cluster.
-        Phase 3:     backbone frozen, only control variates are synced.
-        Always:      c_b and c_h aggregated per cluster.
         """
         if not agent.use_scaffold:
             return
 
         phase = agent._get_phase(round_idx)
 
+        # ✅ FIX QUAN TRỌNG: Ở Phase 3, TẮT HOÀN TOÀN SCAFFOLD AGGREGATION
+        # Phase 3 là để cá nhân hóa (Personalization), không ép đồng thuận toàn cục nữa.
+        if phase == 3:
+            # Chỉ cần reset bộ đếm và soft-update target net, không aggregate gì cả
+            agent.save_base_initial()
+            agent._soft_update()
+            return
+
+        # --- LOGIC CHO PHASE 1 & 2 ---
         with torch.no_grad():
             for node_id, terminal_ids in self.node_to_terminals.items():
                 if not terminal_ids:
@@ -273,35 +223,33 @@ class D3QNScaffoldStrategy(AlgorithmStrategy):
                 agent.update_local_cvariates(t_ids)
 
                 # Step 2: Aggregate backbone weights (Phase 1 & 2 only)
-                # Fix 4: Do NOT hard-sync target net here — that breaks Polyak averaging.
-                # _soft_update() (alpha=0.005) is the only target-net update path.
-                if phase < 3:
-                    # ✅ FIX 2: Aggregate Backbone weights
-                    bone_params = list(agent.eval_net.backbone.parameters())
-                    for p in bone_params:
-                        cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
-                        p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
-                    
-                    # ✅ FIX 3: Aggregate MF network weights per cluster
-                    # Only aggregate MF when backbone is still training
-                    mf_params = list(agent.mf_net.parameters())
-                    for p in mf_params:
-                        cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
-                        p.data[t_ids] = cluster_mean.expand(
-                            len(terminal_ids), 
-                            *cluster_mean.shape[1:]
-                        )
+                # 2.1. Aggregate Eval Backbone weights
+                bone_params = list(agent.eval_net.backbone.parameters())
+                for p in bone_params:
+                    cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
+                    p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
+                
+                # 2.2. Aggregate Target Backbone weights (Prevent Ghost Target Mismatch)
+                target_bone_params = list(agent.target_net.backbone.parameters())
+                for p in target_bone_params:
+                    cluster_mean = p.data[t_ids].mean(dim=0, keepdim=True)
+                    p.data[t_ids] = cluster_mean.expand(len(terminal_ids), *cluster_mean.shape[1:])
+                
+                # 2.3. MF network is NOT aggregated (Kept local to avoid negative transfer)
 
                 # Step 3: Aggregate backbone control variates -> new c_b_global
+                # (Chỉ thực hiện ở Phase 1 & 2)
                 c_b_local_slices = agent.get_c_b_local(t_ids)
-                c_b_new_global = [c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
-                                for c in c_b_local_slices]
+                c_b_new_global = [
+                    c.mean(dim=0, keepdim=True).expand(len(terminal_ids), *c.shape[1:])
+                    for c in c_b_local_slices
+                ]
                 agent.set_c_b_global(t_ids, c_b_new_global)
 
         # Reset grad accumulators and step counters for next round
         agent.save_base_initial()
         agent._soft_update()
-
+        
     def run_training(self, trainer: Trainer):
         num_eps = trainer.config.hyper_neural['NUMOF_TRAIN_EP']
         max_slots = trainer.env.time_manager.max_steps

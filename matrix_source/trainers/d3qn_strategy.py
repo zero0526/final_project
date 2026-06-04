@@ -119,8 +119,7 @@ class D3QNStrategy(AlgorithmStrategy):
         done = torch.tensor([next_res["new_frame"]]*len(t_idx), dtype=torch.float32, device=trainer.device)
         c_obs, n_obs = current_res['obs'], next_res['obs']
         c_mf, n_mf = current_res['mean_field'], next_res['mean_field']
-        cur_placements = masks[:, ::trainer.max_models]
-        next_placements = next_masks[:, ::trainer.max_models]
+
         def build_state(obs, tidx, sidx, place):
             # Advanced indexing on service dim if sidx is a vector
             back = obs['backlog'][:, sidx].T * place

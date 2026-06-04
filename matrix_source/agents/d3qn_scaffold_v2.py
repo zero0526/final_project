@@ -158,7 +158,7 @@ class D3QNAgentV2:
         device=None, use_per=False, n_step=1,
         logs_q=False, use_scaffold=False,
         # Phase schedule (in units of federated rounds)
-        total_rounds=100, phase1_frac=0.45, phase2_frac=0.65,
+        total_rounds=100, phase1_frac=0.5, phase2_frac=0.85,
     ):
         self.node_id = node_id
         self.node_type = node_type
@@ -236,7 +236,13 @@ class D3QNAgentV2:
         return 0.0
 
     def _set_backbone_lr(self, phase):
-        lr = self.lr_bone_high if phase == 1 else self.lr_bone_low
+        if phase == 1:
+            lr = self.lr_bone_high
+        elif phase == 2:
+            lr = self.lr_bone_low
+        else:
+            lr = self.lr_bone_low * 0.01
+
         for pg in self.bone_optimizer.param_groups:
             pg['lr'] = lr
 
@@ -383,9 +389,6 @@ class D3QNAgentV2:
         phase     = self._get_phase(round_idx)
         lambda_t  = self._get_lambda(round_idx)
 
-        # Phase 3: freeze backbone (no graph needed, saves VRAM)
-        self._freeze_backbone(phase == 3)
-
         # ── Forward pass ──────────────────────────────────────────────────────
         pred_curr_mfs = self.mf_net(torch.cat([states, prev_mfs], dim=-1), indices=agent_ids)
         feat          = self.eval_net.backbone(states, pred_curr_mfs.detach(), indices=agent_ids)
@@ -413,32 +416,27 @@ class D3QNAgentV2:
         self.head_optimizer.zero_grad()
         loss.backward()  # Fix 5: no retain_graph — single backward pass covers all leaf params
 
-        if self.use_scaffold:
+        if self.use_scaffold and phase < 3:
             with torch.no_grad():
                 unique_ids = torch.unique(agent_ids)
 
-                # Fix 3: Direct-index correction — no m_mask broadcasting.
-                # PyTorch zeroes gradients for non-participating instances automatically.
-
                 # ── Apply SCAFFOLD correction to backbone gradients ────────────
-                if phase < 3:
-                    bone_params = list(self.eval_net.backbone.parameters())
-                    for i, p in enumerate(bone_params):
-                        if p.grad is not None:
-                            raw_g = p.grad.data.clone()
-                            # g_b_corrected = g_b - c_b_local + c_b_global  (only active ids)
-                            p.grad.data[unique_ids] = raw_g[unique_ids] + (
-                                self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
-                            )
-                            self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
+                bone_params = list(self.eval_net.backbone.parameters())
+                for i, p in enumerate(bone_params):
+                    if p.grad is not None:
+                        raw_g = p.grad.data.clone()
+                        # g_b_corrected = g_b - c_b_local + c_b_global  (only active ids)
+                        p.grad.data[unique_ids] = raw_g[unique_ids] + (
+                            self.c_b_global[i][unique_ids] - self.c_b_local[i][unique_ids]
+                        )
+                        self.grad_b_sum[i][unique_ids] += raw_g[unique_ids]
 
-                    self.steps_in_round[unique_ids] += 1
+                self.steps_in_round[unique_ids] += 1
 
         # Clip and step
-        if phase < 3:
-            self._set_backbone_lr(phase)
-            torch.nn.utils.clip_grad_norm_(self.eval_net.backbone.parameters(), max_norm=1.0)
-            self.bone_optimizer.step()
+        self._set_backbone_lr(phase)
+        torch.nn.utils.clip_grad_norm_(self.eval_net.backbone.parameters(), max_norm=1.0)
+        self.bone_optimizer.step()
 
         torch.nn.utils.clip_grad_norm_(self.eval_net.head.parameters(), max_norm=1.0)
         self.head_optimizer.step()
@@ -499,25 +497,17 @@ class D3QNAgentV2:
 
             for i in range(len(self.c_b_local)):
                 K = steps.view(-1, *([1] * (self.grad_b_sum[i].dim() - 1)))
-                
-                # Tính delta_c
                 delta_c = self.grad_b_sum[i][active_ids] / K
                 
-                # ✅ CLIP 1: Clip delta_c để tránh giá trị cực đoan
-                delta_c = torch.clamp(delta_c, min=-1.0, max=1.0)
-                
-                # Update local control variate
+                # ✅ FIX 2: No clamping on delta_c or c_b_local.
+                # c_i must remain an unbiased gradient estimator (SCAFFOLD theorem).
+                # Clamping introduces bias that corrupts the correction term,
+                # especially when LR drops in Phase 2.
+                # gradient explosion is controlled by clip_grad_norm_ in learn().
                 self.c_b_local[i][active_ids] = (
                     self.c_b_local[i][active_ids]
                     - self.c_b_global[i][active_ids]
                     + delta_c
-                )
-                
-                # ✅ CLIP 2: Clip final c_b_local để tránh blow-up
-                self.c_b_local[i][active_ids] = torch.clamp(
-                    self.c_b_local[i][active_ids], 
-                    min=-5.0, 
-                    max=5.0
                 )
 
     # ── Soft update & IO ──────────────────────────────────────────────────────
