@@ -153,7 +153,7 @@ class PPOAgent:
                  hidden_sizes=(128, 64),
                  lr=1e-4,critic_lr=5e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
                  lam=0.95, clip_eps=0.4, k_epochs=5, entropy_coef=0.05,
-                 exclude_zero=False, num_instances=1, device=None):
+                 exclude_zero=False, num_instances=1, increase_rate_zeta=None, device=None):
 
         self.node_id = node_id
         self.node_type = node_type
@@ -175,10 +175,7 @@ class PPOAgent:
         self.initial_entropy_coef = entropy_coef  # Lưu lại giá trị ban đầu (ví dụ 0.05)
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
         self.entropy_decay_rate = 0.99          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
-        self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
-        self.zeta= 0.6
-        self.zeta_decay_rate = 0.99
-        self.max_zeta = 5
+        self.min_entropy_coef = 0.0001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
         # PPO Hyperparameters
         self.gamma = gamma
         self.lmbda = lam
@@ -188,6 +185,9 @@ class PPOAgent:
         self.min_batch_size = buffer_min_size
         self.entropy_coef = entropy_coef
         self.alpha = alpha
+
+        self.increase_rate_zeta = increase_rate_zeta
+        self.zeta = 1.0 if increase_rate_zeta else None
 
         # Networks
         self.actor = MultiInstanceActor(state_dim, self.action_dim, self.u_action_dim, hidden_sizes, num_instances).to(
@@ -250,8 +250,8 @@ class PPOAgent:
                 logits = logits.masked_fill(zero_mask, -1e9)
 
             # Apply zeta (temperature scaling)
-            if zeta != 1.0:
-                logits = logits * self.zeta
+            if self.increase_rate_zeta is not None:
+                logits = self.zeta * logits
 
             # 4. Sample actions
             if deterministic:
@@ -397,7 +397,8 @@ class PPOAgent:
                 total_batches += 1
 
         self.learn_step_counter += 1
-        
+        if self.zeta:
+            self.zeta= self.zeta*self.increase_rate_zeta
         # Record Metrics
         avg_entropy = total_entropy / total_batches if total_batches > 0 else 0
         avg_max_prob = total_max_prob / total_batches if total_batches > 0 else 0

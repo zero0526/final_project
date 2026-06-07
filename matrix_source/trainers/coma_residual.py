@@ -41,10 +41,10 @@ class COMAResidualStrategy(AlgorithmStrategy):
         self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
         self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
 
-        self.upper_warmup_steps = 5
-        self.lower_warmup_steps = 15
-        self.max_cycles = 1200
-        self.proposal_only_cycles = 500
+        self.upper_warmup_steps = 3
+        self.lower_warmup_steps = 8
+        self.max_cycles = 1600
+        self.proposal_only_cycles = 400
         self.phase = 'LOWER_ONLY'
         self.cycle_num = 1
         self.current_phase_updates = 0
@@ -74,7 +74,7 @@ class COMAResidualStrategy(AlgorithmStrategy):
             lam=trainer.config.hyper_neural.get('LAMBDA', 0.95),
             clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),
             k_epochs=self.upper_cfg['epochs'], batch_size=self.upper_cfg['batch'],
-            num_instances=trainer.num_edge_agents, device=trainer.device
+            num_instances=trainer.num_edge_agents, increase_rate_zeta=1.001, device=trainer.device
         )
 
         # ==========================================
@@ -410,14 +410,12 @@ class COMAResidualStrategy(AlgorithmStrategy):
                     m_len = trainer.shared_lower_agent.memory.total_size
                     if m_len >= self.lower_collect_size:
 
-                        # ✅ CẬP NHẬT: loss_dict bây giờ là một dictionary chứa nhiều metric
                         loss_dict = trainer.shared_lower_agent.learn(phrase=current_phrase, step=self.cycle_num)
                         if loss_dict is not None:
                             self.lower_train_num += 1
                             trainer.aggregator.record_td_losses(lower_losses=loss_dict)
                             self.kstep_monitor.record(trainer.shared_lower_agent)
 
-                            # ✅ THÊM: In ra console để quan sát nhanh (mỗi 20 cycles)
                             if self.cycle_num % 20 == 0:
                                 print(f"\n{'=' * 20} DIAGNOSTICS [Cycle {self.cycle_num:4d} | Phrase: {current_phrase}] {'=' * 20}")
                                 print(f"  Losses  -> P: {loss_dict['p_loss']:.4f} | R: {loss_dict['r_loss']:.4f} | V: {loss_dict['v_loss']:.4f}")
@@ -501,7 +499,6 @@ class COMAResidualStrategy(AlgorithmStrategy):
                         v, s = int(b_agent_idx[i]), int(b_svc_ids[i])
                         tasks_in_group = obs_lower["obs"]['task_reqs'][t_idx[pair_idx == i]].clone()
 
-                        # ✅ SỬA LỖI 2: Đồng bộ chuẩn hóa y hệt như trong run_training
                         tasks_in_group[:, 0] /= trainer.config.norm_data_size
                         tasks_in_group[:, 2] /= 100.0
 
@@ -511,8 +508,6 @@ class COMAResidualStrategy(AlgorithmStrategy):
                         _, mask_a = self._get_service_mask(trainer, s)
                         b_masks.append(mask_a)
 
-                    # ✅ SỬA LỖI 1: Unpack đủ 5 giá trị trả về từ choose_action_batch
-                    # ✅ SỬA LỖI 3: Truyền tường minh phrase="Proposal_Free" để bật Refine Actor
                     a_ids_list, *_ = trainer.shared_lower_agent.choose_action_batch(
                         service_states=torch.stack(b_svc_states),
                         prev_mfs=torch.stack(b_prev_mfs),

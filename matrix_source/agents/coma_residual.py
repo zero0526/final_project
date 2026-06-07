@@ -12,7 +12,7 @@ from matrix_source.agents.COMA_Residual_net import COMAQNetwork, RefineActor, Pr
 class COMAResidualRoutingAgent:
     def __init__(self, agent_id, node_type,
                  service_state_dim, mf_dim,
-                 action_dim, u_action_dim, max_models,  # ✅ SỬA: Thêm max_models
+                 action_dim, u_action_dim, max_models,
                  mf_hidden_sizes=(64, 64), mf_lr=1e-3, buffer_min_size=32,
                  hidden_sizes=(128, 64), lr=3e-4,
                  gamma=0.99, alpha=0.2, lambda_coma=0.3,
@@ -31,14 +31,14 @@ class COMAResidualRoutingAgent:
         self.u_action_dim = u_action_dim
         self.exclude_zero = exclude_zero
 
-        # ✅ SỬA LỖI 1: Định nghĩa M và max_models
         self.max_models = max_models
         self.M = u_action_dim // max_models  # Số lượng node (M * K = u_action_dim)
 
         # Hyperparameters
         self.gamma = gamma
-        self.lmbda = lam_gae  # ✅ SỬA LỖI 3: Đổi tên để khớp với hàm learn
+        self.lmbda = lam_gae
         self.lambda_coma = lambda_coma
+        self.initial_lambda_coma = lambda_coma  # <--- THÊM DÒNG NÀY ĐỂ LƯU GIÁ TRỊ GỐC
         self.eps_clip = clip_eps
         self.k_epochs = k_epochs
         self.batch_size = batch_size
@@ -47,9 +47,9 @@ class COMAResidualRoutingAgent:
         self.temperature = temperature
 
         # Entropy Annealing params
-        self.initial_entropy_coef = entropy_coef_start  # ✅ SỬA LỖI 3: Đổi tên để khớp với hàm learn
+        self.initial_entropy_coef = entropy_coef_start
         self.entropy_coef_end = entropy_coef_end
-        self.entropy_coef = entropy_coef_start  # ✅ SỬA LỖI 3: Đổi tên để khớp với hàm learn
+        self.entropy_coef = entropy_coef_start
 
         # Dimensions
         TASK_DIM = 4
@@ -147,14 +147,12 @@ class COMAResidualRoutingAgent:
             task_lens = torch.tensor([t.shape[0] for t in task_states], device=device)
             total_tasks = int(task_lens.sum().item())
 
-            # ✅ SỬA 1: Xử lý khi không có task, trả về LIST các tensor rỗng (0, u_action_dim)
             if total_tasks == 0:
                 empty_actions = [[] for _ in range(B)]
                 empty_lps = [torch.tensor(0.0, device=device) for _ in range(B)]
                 empty_vals = torch.zeros(B, device=device)
                 fake_h_node = torch.zeros(B, self.M, device=device)
 
-                # Tạo list các tensor rỗng, mỗi cái có shape (0, u_action_dim)
                 fake_prop_logits_list = [torch.empty(0, self.u_action_dim, device=device) for _ in range(B)]
 
                 return empty_actions, empty_lps, list(empty_vals.unbind()), fake_h_node, fake_prop_logits_list
@@ -229,12 +227,8 @@ class COMAResidualRoutingAgent:
             group_max_q_sum.scatter_add_(0, batch_idx, max_q_per_task)
             all_values = group_max_q_sum / task_lens.float().clamp(min=1)
 
-            # ✅ SỬA 2 (QUAN TRỌNG NHẤT): Chia prop_logits_masked thành LIST các tensor theo từng nhóm
-            # Giống hệt cách xử lý all_actions ở trên.
-            # Kết quả: List chứa B tensor, tensor thứ i có shape (N_i, u_action_dim)
             prop_logits_list = list(prop_logits_masked.split(task_lens_list))
 
-        # ✅ Trả về prop_logits_list (dạng List), KHÔNG PHẢI prop_logits_masked (dạng Tensor gộp)
         return all_actions, all_log_probs, list(all_values.unbind()), h_node, prop_logits_list
 
     @staticmethod
@@ -252,8 +246,6 @@ class COMAResidualRoutingAgent:
         # probs có shape: (total_n, u_action_dim) tức là (total_n, M * K)
         probs = F.softmax(self._sanitize_logits(logits_for_hist), dim=-1)
 
-        # ✅ SỬA ĐỔI: Tính h_node trực tiếp theo chiều Node (M), bỏ chiều Model (K)
-        # 1. Reshape probs thành (total_n, M, K) rồi sum theo chiều K (dim=2)
         probs_M = probs.view(total_n, self.M, self.max_models).sum(dim=2)  # Shape: (total_n, M)
 
         # 2. Khởi tạo h_node với kích thước mới: (B_batch, M)
@@ -274,8 +266,6 @@ class COMAResidualRoutingAgent:
 
         # ----------------------------------------------------------
 
-    # ② STORE TRANSITION + TRAIN MF
-    # ----------------------------------------------------------
     def store_transition_train_mf_batch(self, service_states, task_states, prev_mfs, curr_mfs,
                                         actions, rewards, next_service_states, dones,
                                         agent_ids, log_probs, values, masks=None,
@@ -300,7 +290,7 @@ class COMAResidualRoutingAgent:
         mf_input = torch.cat([g_tasks, s, pm], dim=-1)
         pred_mf = self.mf_net(mf_input, indices=agent_ids)
         loss = self.loss_fn(pred_mf, gt)
-        self.mf_optimizer.zero_grad();
+        self.mf_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.mf_net.parameters(), max_norm=5.0)
         self.mf_optimizer.step()
@@ -335,7 +325,11 @@ class COMAResidualRoutingAgent:
         if data is None: return None
 
         current_ent_coef = self.initial_entropy_coef if phrase == "Proposal_Free" else self.update_coeff(step)
-        if phrase == "Proposal_Only": self.entropy_coef = current_ent_coef
+        if phrase == "Proposal_Only":
+            self.entropy_coef = current_ent_coef
+            self.lambda_coma = 0
+        else:
+            self.lambda_coma = self.initial_lambda_coma
 
         (service_states, task_batch_cat, task_lens, p_logits_cat, actions_cat, action_lens,
          prev_mfs, curr_mfs, rewards, next_service_states, dones,
@@ -357,7 +351,6 @@ class COMAResidualRoutingAgent:
 
         dataset_size, total_tasks_flat = service_states.shape[0], task_batch_cat.shape[0]
 
-        # ✅ QUAN TRỌNG: general_tasks có shape (Dataset_Size, 7)
         general_tasks = self.tasks_to_general(self._unpack_task_batch(task_batch_cat, task_lens)).to(self.device)
 
         def expand_by_lens(tensor, lens):
@@ -373,7 +366,6 @@ class COMAResidualRoutingAgent:
             next_h_node_exp = expand_by_lens(h_node_buffer, task_lens)
             next_aids_exp = expand_by_lens(agent_ids, task_lens)
 
-            # ✅ SỬA LỖI CRITIC: Truyền next_mf_exp (đã expand) và next_h_node_exp vào Critic
             # Critic trả về Q-values cho tất cả actions: (Total_Tasks, u_action_dim)
             next_q_vals = self.critic(task_batch_cat, next_svc_exp, next_mf_exp, next_h_node_exp, indices=next_aids_exp)
 
@@ -400,20 +392,27 @@ class COMAResidualRoutingAgent:
             h_node_exp_all = expand_by_lens(h_node_buffer, task_lens)
             aids_exp_all = expand_by_lens(agent_ids, task_lens)
 
-            # 1. Lấy Q-values cho TẤT CẢ actions từ COMA Critic
+            # 1. [ĐÃ KHÔI PHỤC] Lấy Q-values cho TẤT CẢ actions từ COMA Critic
             # Shape: q_vals_all = (Total_Tasks, u_action_dim)
             q_vals_all = self.critic(task_batch_cat, svc_exp_all, mf_exp_all, h_node_exp_all, indices=aids_exp_all)
 
-            # 2. Calculate Q_f (Quality of Final Action)
+            # 2. [ĐÃ KHÔI PHỤC] Calculate Q_f (Quality of Final Action)
             # b_actions_cat shape: (Total_Tasks,) -> .view(-1, 1) ép về (Total_Tasks, 1)
             actions_idx = b_actions_cat.view(-1, 1)
             q_f = q_vals_all.gather(1, actions_idx).squeeze(-1)  # Shape: (Total_Tasks,)
 
-            # 3. Calculate Q_p (Quality of Proposal's Best Choice)
-            # p_logits_cat shape: (Total_Tasks, u_action_dim)
-            p_actions = p_logits_cat.argmax(dim=-1)  # Shape: (Total_Tasks,)
+            # === ĐIỂM THAY ĐỔI CỦA BẠN (GIỮ NGUYÊN) ===
+            # Quyết định cách lấy baseline Q_p
+            use_sampling_for_baseline = (self.learn_step_counter > 100) and (phrase == "Proposal_Free")
 
-            # ✅ SỬA LỖI: Ép buộc p_actions về shape (Total_Tasks, 1) để khớp với q_vals_all
+            if use_sampling_for_baseline:
+                # LẤY MẪU: Dùng khi Refine bị "chết lâm sàng"
+                dist_p = Categorical(logits=p_logits_cat)
+                p_actions = dist_p.sample()
+            else:
+                # ARGMAX: Dùng ở giai đoạn đầu (Proposal_Only) hoặc đầu Proposal_Free
+                p_actions = p_logits_cat.argmax(dim=-1)
+
             p_actions_idx = p_actions.view(-1, 1)
             q_p = q_vals_all.gather(1, p_actions_idx).squeeze(-1)  # Shape: (Total_Tasks,)
 
@@ -437,7 +436,7 @@ class COMAResidualRoutingAgent:
 
             if hybrid_adv_grouped.numel() > 1:
                 hybrid_adv_grouped = (hybrid_adv_grouped - hybrid_adv_grouped.mean()) / (
-                            hybrid_adv_grouped.std() + 1e-8)
+                        hybrid_adv_grouped.std() + 1e-8)
 
         if masks is not None and any(m is not None for m in masks):
             first_valid = next(m for m in masks if m is not None)
