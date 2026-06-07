@@ -44,7 +44,7 @@ class COMAResidualStrategy(AlgorithmStrategy):
         self.upper_warmup_steps = 5
         self.lower_warmup_steps = 15
         self.max_cycles = 1200
-        self.proposal_only_cycles = 800
+        self.proposal_only_cycles = 500
         self.phase = 'LOWER_ONLY'
         self.cycle_num = 1
         self.current_phase_updates = 0
