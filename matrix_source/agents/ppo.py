@@ -152,8 +152,9 @@ class PPOAgent:
                  mf_hidden_sizes, mf_lr, buffer_min_size,
                  hidden_sizes=(128, 64),
                  lr=1e-4,critic_lr=5e-4, gamma=0.99, alpha=0.005, buffer_size=100000, batch_size=64,
-                 lam=0.95, clip_eps=0.4, k_epochs=5, entropy_coef=0.05,
-                 exclude_zero=False, num_instances=1, increase_rate_zeta=None, device=None):
+                  lam=0.95, clip_eps=0.4, k_epochs=5, entropy_coef=0.05,
+                  exclude_zero=False, num_instances=1, increase_rate_zeta=None,
+                  max_zeta=10.0, device=None):
 
         self.node_id = node_id
         self.node_type = node_type
@@ -188,6 +189,7 @@ class PPOAgent:
 
         self.increase_rate_zeta = increase_rate_zeta
         self.zeta = 1.0 if increase_rate_zeta else None
+        self.max_zeta = max_zeta
 
         # Networks
         self.actor = MultiInstanceActor(state_dim, self.action_dim, self.u_action_dim, hidden_sizes, num_instances).to(
@@ -298,7 +300,6 @@ class PPOAgent:
         data = self.memory.get_all_ready(min_size=self.min_batch_size, agent_ids_pool=agents_ids)
         if data is None:
             return None
-        self.zeta = min(self.zeta * 1/self.zeta_decay_rate, self.max_zeta)
         self.entropy_coef = max(self.entropy_coef * self.entropy_decay_rate, self.min_entropy_coef)
         # ============================================================
 
@@ -397,8 +398,8 @@ class PPOAgent:
                 total_batches += 1
 
         self.learn_step_counter += 1
-        if self.zeta:
-            self.zeta= self.zeta*self.increase_rate_zeta
+        if self.zeta and self.increase_rate_zeta:
+            self.zeta = min(self.zeta * self.increase_rate_zeta, self.max_zeta)
         # Record Metrics
         avg_entropy = total_entropy / total_batches if total_batches > 0 else 0
         avg_max_prob = total_max_prob / total_batches if total_batches > 0 else 0
