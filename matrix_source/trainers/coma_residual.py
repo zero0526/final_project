@@ -92,6 +92,9 @@ class COMAResidualStrategy(AlgorithmStrategy):
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
             lr=float(trainer.config.hyper_neural['LOWER_LR']),
+            alpha=1.0,  # <--- Set target alpha là 1.0
+            proposal_only_cycles=self.proposal_only_cycles, # <--- Truyền xuống để Agent tự tính warmup
+            alpha_warmup_cycles=200, # <--- Mất 200 cycles để alpha tăng từ 0.1 -> 1.0
             buffer_min_size=self.lower_cfg['min_size'],
             buffer_size=100_000,
             clip_eps=trainer.config.hyper_neural.get('CLIP_EPS', 0.2),

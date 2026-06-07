@@ -62,7 +62,7 @@ class BaseConfig(BaseSettings):
     topology_data: Dict[str, Any] = Field(default_factory=dict)
     cold_start_energy_coef: float= Field(default= 0.2)
     transmission_coef: float= Field(default=0.2)
-    lypa_coef: float= Field(default=1e5)
+    lypa_coef: float= Field(default=1e-5)
     cold_start_time: Dict[str, float]= Field(default={"min":0.15, "max":0.85})
     avg_req: int= Field(default=20)
     neighbor_depth: int= Field(default=2)
@@ -82,8 +82,8 @@ class BaseConfig(BaseSettings):
     normalization: Dict[str, Any] = Field(default={})
     norm_gflop: float= Field(default=500.0)
     norm_data_size: float= Field(default=50.0)
-    norm_upper_rw: float= Field(default=1_000_000_0.0)
-    norm_lower_rw: float= Field(default=1_000_000.0)
+    norm_upper_rw: float= Field(default=1_000_000_000.0)
+    norm_lower_rw: float= Field(default=1_000_000_00.0)
     class Config:
         env_file = get_env_file()
         env_file_encoding = "utf-8"

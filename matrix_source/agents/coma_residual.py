@@ -15,7 +15,8 @@ class COMAResidualRoutingAgent:
                  action_dim, u_action_dim, max_models,
                  mf_hidden_sizes=(64, 64), mf_lr=1e-3, buffer_min_size=32,
                  hidden_sizes=(128, 64), lr=3e-4,
-                 gamma=0.99, alpha=0.2, lambda_coma=0.3,
+                 gamma=0.99, alpha=1.0, lambda_coma=0.3,
+                 proposal_only_cycles=400, alpha_warmup_cycles=200,
                  buffer_size=100_000, batch_size=128,
                  lam_gae=0.95, clip_eps=0.2, k_epochs=5,
                  entropy_coef_start=0.05, entropy_coef_end=0.001,
@@ -43,7 +44,15 @@ class COMAResidualRoutingAgent:
         self.k_epochs = k_epochs
         self.batch_size = batch_size
         self.min_batch_size = buffer_min_size
-        self.alpha = alpha
+        
+        # --- CẤU HÌNH ALPHA WARM-UP ---
+        self.target_alpha = alpha             # Giá trị mục tiêu (1.0)
+        self.initial_alpha = 0.1              # Giá trị khởi điểm an toàn
+        self.alpha = self.initial_alpha       # Giá trị hiện tại
+        self.proposal_only_cycles = proposal_only_cycles
+        self.alpha_warmup_cycles = alpha_warmup_cycles
+        # ------------------------------
+        
         self.temperature = temperature
 
         # Entropy Annealing params
@@ -328,8 +337,20 @@ class COMAResidualRoutingAgent:
         if phrase == "Proposal_Only":
             self.entropy_coef = current_ent_coef
             self.lambda_coma = 0
+            self.alpha = 0.0  # <--- Chắc chắn tắt Refine trong giai đoạn này
         else:
+            # 1. Khôi phục lambda_coma
             self.lambda_coma = self.initial_lambda_coma
+            
+            # 2. ALPHA WARM-UP SCHEDULE
+            # Tính số cycle đã trôi qua kể từ khi bắt đầu phase Proposal_Free
+            free_phase_step = max(0, step - self.proposal_only_cycles)
+            
+            # Tính tiến độ warm-up (từ 0.0 đến 1.0)
+            warmup_progress = min(1.0, free_phase_step / self.alpha_warmup_cycles)
+            
+            # Nội suy tuyến tính alpha từ 0.1 lên 1.0
+            self.alpha = self.initial_alpha + (self.target_alpha - self.initial_alpha) * warmup_progress
 
         (service_states, task_batch_cat, task_lens, p_logits_cat, actions_cat, action_lens,
          prev_mfs, curr_mfs, rewards, next_service_states, dones,

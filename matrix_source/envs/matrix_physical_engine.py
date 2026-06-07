@@ -476,14 +476,10 @@ class MatrixPhysicalEngine:
         f1 = total_drift + self.lypa_coef * total_energy
         self.reward_global_accumulator += f1
         
-        # Refined QoS penalty
-        qos_penalty = self.omega_1 * num_violations.float()
-        
-        reward = -(f1 +qos_penalty)
+        reward = -f1
         obs = {
             "virtual_drift": virtual_drift,
             "total_drift": total_drift,
-            "virtual_drift": virtual_drift,
             # N x S: CPU capacity spent on externally-offloaded tasks
             "external_snack": external_snack.clone(),
             "task_reqs": self.current_task_reqs.clone(),
