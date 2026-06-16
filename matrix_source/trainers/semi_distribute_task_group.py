@@ -39,25 +39,20 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         super().__init__()
         self.lower_train_num = 0
         self.upper_train_num = 0
-        self.alt_train_num = 0
-        self.alt_next = 'UPPER'
         self.lower_mf_prev = None
 
-        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
-        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
+        # ── Collect thresholds ──
+        self.upper_collect_size = 512   # upper cần đủ 512 transitions
+        self.lower_collect_size = 5120  # lower cần đủ 5120 transitions (= 10×)
 
-        self.upper_warmup_steps = 5
-        self.lower_warmup_steps = 15
+        # ── Train hyper-params ──
+        self.upper_cfg = {'batch': 64, 'epochs': 5}
+        self.lower_cfg = {'batch': 128, 'epochs': 8}
+
         self.max_cycles = 20
-
-        self.phase = 'LOWER_ONLY'
         self.cycle_num = 1
-        self.current_phase_updates = 0
-        self.entropy_decay_rate = 0.99
+
         self.is_evaluating = False
-        self.lower_collect_size = 256
-        self.lower_batch_size = 128
-        self.lower_train_epochs = 4
         self.model_workloads = None
 
         # [OPT] Cache tĩnh — khởi tạo 1 lần
@@ -209,11 +204,10 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             reward / (rew_divisor if rew_divisor != 0 else 1.0)
         )
         avg_mf_loss = 0.0
-        is_frozen = (self.phase == 'LOWER_ONLY')
         edge_states = (s_all[trainer.edge_node_ids]
                        if s_all is not None else None)
 
-        if not is_frozen and not self.is_evaluating:
+        if not self.is_evaluating:
             edge_next_states = ns_all[trainer.edge_node_ids]
             dones = torch.full(
                 (trainer.num_edge_agents,),
@@ -221,7 +215,7 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                 dtype=torch.float32, device=trainer.device
             )
             next_raw_mf = next_res['mean_fields']
-            raw_mf= current_res["mean_fields"]
+            raw_mf = current_res["mean_fields"]
 
             edge_c_mfs = raw_mf[trainer.edge_node_ids]
             edge_n_mfs = next_raw_mf[trainer.edge_node_ids]
@@ -264,10 +258,14 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                                      sim_backlog_batch,
                                      sim_capacity_batch,
                                      workload_sent_batch):
+        """
+        task_reqs đã được normalize bên ngoài trước khi gọi hàm này.
+        Chỉ cần normalize sim_backlog và sim_capacity (GFLOPs).
+        Layout: [task_reqs(4) | backlog(num_nodes) | capacity(num_nodes) | workload_sent(num_nodes)]
+        """
         st = torch.cat([task_reqs, sim_backlog_batch,
                         sim_capacity_batch, workload_sent_batch], dim=-1)
-        st[:, 0] /= trainer.config.norm_data_size
-        st[:, 1] /= 100.0
+        # backlog(num_nodes) + capacity(num_nodes) + workload_sent(num_nodes) đều là GFLOPs
         if st.shape[1] > 4:
             st[:, 4:] /= trainer.config.norm_gflop
         return st
@@ -360,7 +358,10 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
         s_idx_sorted = s_idx[sorted_indices]
         inst_idx_sorted = inst_idx_all[sorted_indices]
         batch_sizes_sorted = batch_sizes[sorted_indices]
-        task_reqs_sorted = obs_lower["obs"]['task_reqs'][t_idx_sorted]
+        task_reqs_sorted = obs_lower["obs"]['task_reqs'][t_idx_sorted].clone()
+        # Normalize task_reqs tại đây (1 lần duy nhất, KHÔNG normalize lại trong _build_simulated_state_batch)
+        task_reqs_sorted[:, 0] /= trainer.config.norm_data_size  # data_size
+        task_reqs_sorted[:, 2] /= 100.0                          # accuracy (index 1, giống ppo_stategy_v2)
         src_node_sorted = src_node_indices_all[sorted_indices]
 
         # ── Group by Edge Instance ──
@@ -561,18 +562,29 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
     # MAIN TRAINING LOOP
     # ══════════════════════════════════════════════════
     def run_training(self, trainer):
+        """
+        Collect-then-Train loop (không chia phase):
+          - Thu thập song song cho cả upper (512) và lower (5120).
+          - Trong suốt quá trình collect KHÔNG train.
+          - Khi CẢ HAI đủ ngưỡng: train upper trước → train lower → clear cả hai buffer.
+          - Mỗi lần train xong tính là 1 cycle.
+        """
         max_slots = trainer.env.time_manager.max_steps
         ep = 0
         pbar = tqdm(total=self.max_cycles, desc="Sequential GRU Progress")
+
+        upper_agent = trainer.shared_upper_agent
+        lower_agent = trainer.shared_lower_agent
 
         while self.cycle_num <= self.max_cycles:
             obs = trainer.env.reset()
             obs_upper = obs['upper']
             obs_lower = obs['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
-            self._invalidate_placement_cache()  # [OPT] Reset cache
+            self._invalidate_placement_cache()
 
             for slot in range(max_slots):
+                # ── Upper action / placement (frame boundary đầu slot) ──
                 if trainer.env.time_manager.is_new_frame():
                     u_acts, u_lp, u_val = self.get_upper_actions(
                         trainer, current_upper_state, obs_upper
@@ -580,18 +592,15 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     trainer.env.step_upper(u_acts)
                     self._invalidate_placement_cache()
 
+                # ── Sinh workload và thu thập lower transitions ──
                 t_idx, s_idx, bs, min_acc, deadlines = \
                     trainer.workload_gen.generate_step()
 
                 if len(t_idx) > 0:
-                    # [OPT-3] Gọi hàm chung — thay 80 dòng code trùng
-                    store = (
-                        self.phase == 'LOWER_ONLY'
-                        and not self.is_evaluating
-                    )
+                    # Luôn store_buffer (collect lower) — KHÔNG train ngay
                     results = self._prepare_and_process_slot(
                         trainer, obs_lower, t_idx, s_idx, bs,
-                        min_acc, deadlines, store_buffer=store
+                        min_acc, deadlines, store_buffer=True
                     )
 
                     if results is None:
@@ -600,28 +609,6 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     obs_lower = results
                     trainer.aggregator.add_lower(results, mf_loss=0.0,
                                                  state=None)
-
-                    # Training nếu đủ dữ liệu
-                    if store:
-                        agent = trainer.shared_lower_agent
-                        if len(agent.memory) >= self.lower_collect_size:
-                            loss = agent.learn(
-                                batch_size=self.lower_batch_size,
-                                k_epochs=self.lower_train_epochs
-                            )
-                            if loss is not None:
-                                self.lower_train_num += 1
-                                self.current_phase_updates += 1
-                                trainer.aggregator.record_td_losses(
-                                    lower_losses=loss
-                                )
-                                if (self.current_phase_updates
-                                        >= self.lower_warmup_steps):
-                                    self.phase = 'UPPER_ONLY'
-                                    self.current_phase_updates = 0
-                                    print(f"\n[Cycle {self.cycle_num}] "
-                                          f"LOWER Phase Complete.")
-                            agent.memory.clear()
 
                     if slot % 1000 == 0 and slot > 0:
                         ok = sum(trainer.aggregator.episode_success_qos)
@@ -633,7 +620,7 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                 else:
                     trainer.env.time_manager.tick()
 
-                # ── Upper frame boundary ──
+                # ── Upper frame boundary: thu thập upper transition ──
                 if trainer.env.time_manager.is_new_frame():
                     res_upper = trainer.env.collect_upper_metrics()
                     next_upper_state = self.build_upper_state(
@@ -645,24 +632,48 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                         obs_upper, res_upper, u_acts, u_lp, u_val,
                         is_ep_done
                     )
-
-                    if self.phase == 'UPPER_ONLY':
-                        loss = trainer.shared_upper_agent.learn(
-                            torch.arange(trainer.num_edge_agents,
-                                         device=trainer.device)
-                        )
-                        if loss is not None:
-                            self.upper_train_num += 1
-                            self.current_phase_updates += 1
-                            if (self.current_phase_updates
-                                    >= self.upper_warmup_steps):
-                                self.phase = 'LOWER_ONLY'
-                                self.current_phase_updates = 0
-                                pbar.update(1)
-                                self.cycle_num += 1
-
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
+
+                # ── Kiểm tra ngưỡng: CẢ HAI đủ → train rồi clear ──
+                upper_ready = len(upper_agent.buffer) >= self.upper_collect_size
+                lower_ready = len(lower_agent.memory) >= self.lower_collect_size
+
+                if upper_ready and lower_ready:
+                    # 1) Train upper
+                    upper_loss = upper_agent.learn(
+                        torch.arange(trainer.num_edge_agents,
+                                     device=trainer.device)
+                    )
+                    if upper_loss is not None:
+                        self.upper_train_num += 1
+                        trainer.aggregator.record_td_losses(
+                            upper_losses=upper_loss
+                        )
+
+                    # 2) Train lower
+                    lower_loss = lower_agent.learn(
+                        batch_size=self.lower_cfg['batch'],
+                        k_epochs=self.lower_cfg['epochs']
+                    )
+                    if lower_loss is not None:
+                        self.lower_train_num += 1
+                        trainer.aggregator.record_td_losses(
+                            lower_losses=lower_loss
+                        )
+
+                    # 3) Clear cả hai buffer
+                    upper_agent.buffer.clear()
+                    lower_agent.memory.clear()
+
+                    self.cycle_num += 1
+                    pbar.update(1)
+                    print(f"\n[Cycle {self.cycle_num - 1}] "
+                          f"Train done — upper×{self.upper_train_num} "
+                          f"lower×{self.lower_train_num}")
+
+                    if self.cycle_num > self.max_cycles:
+                        break
 
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
