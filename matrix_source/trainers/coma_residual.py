@@ -52,7 +52,6 @@ class COMAResidualStrategy(AlgorithmStrategy):
         self.is_evaluating = False
         self.lower_collect_size = 4096
         self.lower_batch_size = 128
-        self.lower_train_epochs = 4
         self.model_workloads = None
 
     def initialize_agents(self, trainer):

@@ -85,7 +85,7 @@ class COMAResidualRoutingAgent:
         ).to(self.device)
 
         self.critic = COMAQNetwork(
-            general_task_state=TASK_DIM, service_state=service_state_dim, mf_dim=mf_dim,
+            task_state=TASK_DIM, service_state=service_state_dim, mf_dim=mf_dim,
             action_dim=u_action_dim, hidden_sizes=hidden_sizes, num_instances=num_instances,
         ).to(self.device)
 
@@ -190,6 +190,13 @@ class COMAResidualRoutingAgent:
             else:
                 prop_logits_masked = prop_logits
 
+            probs = F.softmax(self._sanitize_logits(prop_logits_masked), dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1, keepdim=True)
+            top2_probs, _ = torch.topk(probs, k=2, dim=-1)
+            margin = (top2_probs[:, 0] - top2_probs[:, 1]).unsqueeze(-1)
+            confidence_metrics = torch.cat([entropy, margin], dim=-1)  # Shape: (total_tasks, 2)
+
+            # Tính h_node (chính là group_load)
             h_node, overload = self._compute_hist_and_overload(
                 prop_logits_masked, masks_exp, service_states, batch_idx, B, total_tasks
             )
@@ -199,8 +206,14 @@ class COMAResidualRoutingAgent:
                 delta_logits = torch.zeros_like(prop_logits)
             else:
                 delta_logits = self.refine(
-                    tasks_cat, svc_exp, mf_exp, prop_logits.detach(),
-                    h_node[batch_idx], overload[batch_idx], indices=idx_exp
+                    tasks_cat,  # task
+                    svc_exp,  # svc
+                    mf_exp,  # mf
+                    prop_logits.detach(),  # proposal_logits
+                    confidence_metrics,  # confidence_metrics
+                    h_node[batch_idx],  # group_load (Shape: total_tasks, M)
+                    mf_exp,  # mf_load (Shape: total_tasks, mf_dim)
+                    indices=idx_exp
                 )
 
             final_logits = prop_logits + self.alpha * delta_logits
@@ -508,12 +521,29 @@ class COMAResidualRoutingAgent:
                                                                                  batch_idx, B_sub, total_n)
                 h_node_refine_exp = h_node_refine[batch_idx]
                 overload_refine_exp = overload_refine[batch_idx]
+                prop_logits_masked_batch = prop_logits.clone()
+                if masks_exp is not None:
+                    prop_logits_masked_batch = prop_logits_masked_batch.masked_fill(masks_exp == 0, -1e9)
+
+                probs_batch = F.softmax(self._sanitize_logits(prop_logits_masked_batch), dim=-1)
+                entropy_batch = -torch.sum(probs_batch * torch.log(probs_batch + 1e-8), dim=-1, keepdim=True)
+                top2_probs_batch, _ = torch.topk(probs_batch, k=2, dim=-1)
+                margin_batch = (top2_probs_batch[:, 0] - top2_probs_batch[:, 1]).unsqueeze(-1)
+                conf_metrics_batch = torch.cat([entropy_batch, margin_batch], dim=-1)
 
                 if phrase == "Proposal_Only":
                     delta_logits = torch.zeros_like(prop_logits)
                 else:
-                    delta_logits = self.refine(t_cat, svc_exp, mf_exp, prop_logits.detach(), h_node_refine_exp,
-                                               overload_refine_exp, indices=aids_exp)
+                    delta_logits = self.refine(
+                        t_cat,  # task
+                        svc_exp,  # svc
+                        mf_exp,  # mf
+                        prop_logits.detach(),  # proposal_logits
+                        conf_metrics_batch,  # confidence_metrics
+                        h_node_refine_exp,  # group_load
+                        mf_exp,  # mf_load
+                        indices=aids_exp
+                    )
 
                 loss_proposal, loss_refine = 0.0, 0.0
 
