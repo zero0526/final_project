@@ -9,7 +9,7 @@ from matrix_source.trainers.semi_distribute_task_group import GroupGRUPPOSCAFFOL
 from matrix_source.trainers.coma_residual import COMAResidualStrategy
 
 from matrix_source.configs.configs import cfg
-cfg.hyper_neural["NUM_LOWER_AGENTS"]= 300
+cfg.hyper_neural["NUM_LOWER_AGENTS"]= 20
 
 if __name__ == '__main__':
     strategy = COMAResidualStrategy()

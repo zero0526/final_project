@@ -38,6 +38,13 @@ class COMARolloutBuffer:
         # Agent ID để phân biệt nếu dùng chung buffer cho nhiều loại agent
         self.agent_id = torch.zeros((max_size, 1), dtype=torch.int64, device=device)
 
+        # ── Extended Metrics cho Critic (Per-group) ──
+        self.workload = torch.zeros((max_size, h_dim), dtype=torch.float32, device=device)
+        self.ds_metrics = torch.zeros((max_size, 5), dtype=torch.float32, device=device)
+        self.deadline_metrics = torch.zeros((max_size, 5), dtype=torch.float32, device=device)
+        self.omega = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
+        self.batch_size = torch.zeros((max_size, 1), dtype=torch.float32, device=device)
+
         # ── Variable-length fields (Per-task within a group) ──
         self.task_state = [None] * max_size  # (N_i, task_dim)
         self.proposal_logits = [None] * max_size  # (N_i, action_dim) - Cần cho Q_p và Confidence
@@ -51,7 +58,8 @@ class COMARolloutBuffer:
 
     def add(self, service_state, task_state, prev_mf, curr_mf,
             proposal_logits, actions, reward, next_service_state, done,
-            log_prob, value, h_node, agent_id=0, mask=None):
+            log_prob, value, h_node, agent_id=0, mask=None,
+            workload=None, ds_metrics=None, deadline_metrics=None, omega=None, batch_size=None):
         """
         Add single transition (one group offloading step).
         """
@@ -68,6 +76,18 @@ class COMARolloutBuffer:
         self.value[idx] = self._to_tensor(value, torch.float32).view(1)
         self.h_node[idx] = self._to_tensor(h_node, torch.float32)  # Critical for COMA Critic
         self.agent_id[idx] = torch.tensor([agent_id], dtype=torch.int64, device=self.device)
+
+        # Extended Metrics
+        if workload is not None:
+            self.workload[idx] = self._to_tensor(workload, torch.float32)
+        if ds_metrics is not None:
+            self.ds_metrics[idx] = self._to_tensor(ds_metrics, torch.float32)
+        if deadline_metrics is not None:
+            self.deadline_metrics[idx] = self._to_tensor(deadline_metrics, torch.float32)
+        if omega is not None:
+            self.omega[idx] = self._to_tensor(omega, torch.float32).view(1)
+        if batch_size is not None:
+            self.batch_size[idx] = self._to_tensor(batch_size, torch.float32).view(1)
 
         # Variable-length
         if task_state is not None:
@@ -152,6 +172,11 @@ class COMARolloutBuffer:
             h_node,  # 13 (n, action_dim)     - Cho Critic COMA
             masks_final,  # 14 List[n]
             agent_id,  # 15 (n,)
+            self.workload[:n].clone(),  # 16
+            self.ds_metrics[:n].clone(),  # 17
+            self.deadline_metrics[:n].clone(),  # 18
+            self.omega[:n].clone(),  # 19
+            self.batch_size[:n].clone(),  # 20
         )
 
     def clear(self):
@@ -185,7 +210,9 @@ class MultiAgentCOMARolloutBuffer:
     def add_batch(self, service_states, task_states,
                   prev_mfs, curr_mfs, proposal_logits, actions,
                   rewards, next_service_states, dones,
-                  log_probs, values, h_nodes, agent_ids, masks=None):
+                  log_probs, values, h_nodes, agent_ids, masks=None,
+                  workloads=None, ds_metrics_list=None, deadline_metrics_list=None,
+                  omegas=None, batch_sizes=None):
         """Add batch of transitions."""
         a_ids = agent_ids.view(-1)
         for i in range(len(a_ids)):
@@ -196,7 +223,12 @@ class MultiAgentCOMARolloutBuffer:
                 proposal_logits[i], actions[i],
                 rewards[i], next_service_states[i], dones[i],
                 log_probs[i], values[i],
-                h_nodes[i], a_id, mask=masks[i] if masks else None
+                h_nodes[i], a_id, mask=masks[i] if masks else None,
+                workload=workloads[i] if workloads is not None else None,
+                ds_metrics=ds_metrics_list[i] if ds_metrics_list is not None else None,
+                deadline_metrics=deadline_metrics_list[i] if deadline_metrics_list is not None else None,
+                omega=omegas[i] if omegas is not None else None,
+                batch_size=batch_sizes[i] if batch_sizes is not None else None
             )
             self.buffer_sizes[a_id] = self.buffers[a_id].size
         self.total_size = int(self.buffer_sizes.sum().item())
@@ -230,12 +262,12 @@ class MultiAgentCOMARolloutBuffer:
     def _collate(self, samples):
         """Collate list of get_all() outputs into single batch."""
         result = []
-        # Mapping indices based on new get_all return tuple (0-15)
-        concat_indices = [0, 1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 15]
+        # Mapping indices based on new get_all return tuple (0-20)
+        concat_indices = [0, 1, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20]
         list_indices = [14]  # masks
         len_indices = [2, 5]  # task_lens, action_lens
 
-        for field_idx in range(16):
+        for field_idx in range(21):
             if field_idx in concat_indices:
                 result.append(torch.cat([s[field_idx] for s in samples], dim=0))
             elif field_idx in len_indices:

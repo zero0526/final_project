@@ -83,7 +83,7 @@ class BaseConfig(BaseSettings):
     norm_gflop: float= Field(default=500.0)
     norm_data_size: float= Field(default=50.0)
     norm_upper_rw: float= Field(default=1_000_000_0.0)
-    norm_lower_rw: float= Field(default=1_000_000.0)
+    norm_lower_rw: float= Field(default=1_000_000_0.0)
     class Config:
         env_file = get_env_file()
         env_file_encoding = "utf-8"

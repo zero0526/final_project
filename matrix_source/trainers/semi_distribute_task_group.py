@@ -77,7 +77,7 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
             u_action_dim=trainer.upper_u_action_dim,
             mf_hidden_sizes=tuple(trainer.config.hyper_neural["MF_HIDDEN_LAYER"]),
             mf_lr=float(trainer.config.hyper_neural['MF_LR']),
-            buffer_min_size=self.upper_cfg['min_size'],
+            buffer_min_size=self.upper_collect_size,
             hidden_sizes=trainer.config.hyper_neural['AGENT_HIDDEN_LAYER'],
             lr=float(trainer.config.hyper_neural['UPPER_LR']),
             gamma=trainer.config.hyper_neural['DISCOUNT_FACTOR'],
@@ -118,9 +118,6 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                 trainer.num_edge_agents, trainer.num_nodes, lower_mf_dim,
                 device=trainer.device
             )
-
-        if self.phase == 'LOWER_ONLY' and self.lower_warmup_steps == 0:
-            self.phase = 'UPPER_ONLY'
 
     # ──────────────────────────────────────────────────
     # [OPT-1] Pre-compute workloads → tensor
@@ -636,7 +633,7 @@ class GroupGRUPPOSCAFFOLDREPStrategy(AlgorithmStrategy):
                     obs_upper = res_upper
 
                 # ── Kiểm tra ngưỡng: CẢ HAI đủ → train rồi clear ──
-                upper_ready = len(upper_agent.buffer) >= self.upper_collect_size
+                upper_ready = len(upper_agent.memory) >= self.upper_collect_size
                 lower_ready = len(lower_agent.memory) >= self.lower_collect_size
 
                 if upper_ready and lower_ready:

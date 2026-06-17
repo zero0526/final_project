@@ -116,3 +116,6 @@ class MultiAgentPolicyBuffer:
             collated.append(torch.cat([s[i] for s in samples if s is not None], dim=0))
 
         return tuple(collated)
+
+    def __len__(self):
+        return self.buffer_sizes.min().item()
