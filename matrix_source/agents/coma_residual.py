@@ -171,11 +171,10 @@ class COMAResidualRoutingAgent:
                 final_logits, prep_data['task_lens'], B, prep_data['batch_idx'], device, deterministic
             )
 
-            # 5. Critic evaluation (for V-values) - Direct Baseline
+            # 5. Critic evaluation (for V-values) - Direct Baseline at Node level
             all_values = self._evaluate_critic_value(
-                prep_data['svc_exp'], prep_data['mf_exp'], proposal_data['h_node'], 
-                prep_data['masks_exp'], metrics, prep_data['batch_idx'], 
-                prep_data['idx_exp'], prep_data['task_lens'], B, prep_data['total_tasks']
+                service_states, prep_data['pred_mfs'], proposal_data['h_node'], 
+                prep_data['masks_batch'], metrics, agent_indices, B
             )
 
             prop_logits_list = list(proposal_data['prop_logits_masked'].split(prep_data['task_lens'].cpu().tolist()))
@@ -222,7 +221,7 @@ class COMAResidualRoutingAgent:
         return {
             'total_tasks': total_tasks, 'task_lens': task_lens, 'batch_idx': batch_idx,
             'tasks_cat': tasks_cat, 'svc_exp': svc_exp, 'mf_exp': mf_exp, 
-            'idx_exp': idx_exp, 'masks_exp': masks_exp
+            'idx_exp': idx_exp, 'masks_exp': masks_exp, 'pred_mfs': pred_mfs, 'masks_batch': masks_batch
         }
 
     def _handle_empty_batch(self, B, device):
@@ -332,29 +331,41 @@ class COMAResidualRoutingAgent:
         
         return {'all_actions': all_actions, 'all_log_probs': list(sum_lp.unbind()), 'probs': probs}
 
-    def _evaluate_critic_value(self, svc_exp, mf_exp, h_node, masks_exp, metrics, 
-                               batch_idx, idx_exp, task_lens, B, total_tasks):
+    def _evaluate_critic_value(self, svc, mf, h_node, masks_batch, metrics, agent_indices, B):
+        """Tính toán Baseline Value (V) cho toàn bộ Node/Group."""
         device = self.device
-        h_node_exp = h_node[batch_idx]
-        mask_node_exp = masks_exp.view(total_tasks, self.M, self.max_models)[:, :, 0]
+        
+        # Prepare Mask Node level
+        if masks_batch is not None:
+            if isinstance(masks_batch, list):
+                mask_node = torch.stack(masks_batch).to(device)
+            else:
+                mask_node = masks_batch.to(device)
+            # COMA Critic often looks at model availability (mask[:, :, 0])
+            mask_node = mask_node.view(B, self.M, self.max_models)[:, :, 0]
+        else:
+            mask_node = torch.ones(B, self.M, device=device)
 
         if metrics:
-            workload_exp = metrics['workload'][batch_idx]
-            ds_metrics_exp = metrics['ds_metrics'][batch_idx]
-            deadline_metrics_exp = metrics['deadline_metrics'][batch_idx]
-            omega_exp = metrics['omega'][batch_idx]
-            bs_exp = metrics['batch_size'][batch_idx]
+            workload = metrics['workload']
+            ds_metrics = metrics['ds_metrics']
+            deadline_metrics = metrics['deadline_metrics']
+            omega = metrics['omega']
+            batch_sizes = metrics['batch_size']
         else:
-            raise ValueError("Metrics are required for COMA-Residual.")
+            workload = torch.zeros(B, self.M, device=device)
+            ds_metrics = torch.zeros(B, 5, device=device)
+            deadline_metrics = torch.zeros(B, 5, device=device)
+            omega = torch.zeros(B, 1, device=device)
+            batch_sizes = torch.ones(B, 1, device=device)
 
-        v_vals_task = self.critic(svc_exp, mf_exp, h_node_exp, workload_exp, mask_node_exp, 
-                                 ds_metrics_exp, deadline_metrics_exp, omega_exp, bs_exp, indices=idx_exp)
-        
-        # v_vals_task is already (Total_Tasks,) because of .squeeze(-1) in network
-        group_v_sum = torch.zeros(B, device=device)
-        group_v_sum.scatter_add_(0, batch_idx, v_vals_task)
-        
-        return group_v_sum / task_lens.float().clamp(min=1)
+        # Call critic directly at node level (B rows)
+        v_node = self.critic(
+            svc, mf, h_node, workload, mask_node, 
+            ds_metrics, deadline_metrics, omega, batch_sizes, 
+            indices=agent_indices
+        )
+        return v_node
 
     @staticmethod
     def _expand_by_lens(tensor, lens):
@@ -465,10 +476,10 @@ class COMAResidualRoutingAgent:
             
             n_mask_node = b['masks'].view(B, self.M, self.max_models)[:, :, 0].to(self.device)
             
-            n_val_task = self.critic(n_svc_exp, n_mf_exp, n_h_node_g[group_idx], b['wl'][group_idx], n_mask_node[group_idx], 
-                                     b['ds'][group_idx], b['dl'][group_idx], b['om'][group_idx], b['bs'][group_idx], indices=n_aid_exp)
-            
-            n_val_g = torch.zeros(B, device=self.device).scatter_add_(0, group_idx, n_val_task) / b['t_lens'].float().clamp(min=1)
+            n_val_g = self.critic(
+                b['n_svc'], n_mf, n_h_node_g, b['wl'], n_mask_node, 
+                b['ds'], b['dl'], b['om'], b['bs'], indices=b['aids']
+            )
             adv = compute_gae(b['rew'], n_val_g, b['old_val'], b['done'], b['aids'], self.gamma, self.lmbda)
             ret = adv + b['old_val']
             if adv.numel() > 1: adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -478,23 +489,27 @@ class COMAResidualRoutingAgent:
         return adv, ret, curr_mf_det, group_idx, n_mask_node
 
     def _compute_hybrid_advantages(self, b, adv_data):
+        """Tính toán Hybrid Advantage trực tiếp ở cấp độ Agent để tránh broadcasting lỗi."""
         adv, ret, curr_mf_det, group_idx, n_mask_node = adv_data
-        B, T = b['svc'].shape[0], b['t_cat'].shape[0]
+        B = b['svc'].shape[0]
         
         with torch.no_grad():
-            svc_e = b['svc'][group_idx]
-            mf_e = curr_mf_det[group_idx]
-            aid_e = b['aids'][group_idx]
+            mask_node = b['masks'].view(B, self.M, self.max_models)[:, :, 0].to(self.device)
             
-            mask_node_exp = b['masks'].view(B, self.M, self.max_models)[:, :, 0].to(self.device)[group_idx]
+            # 1. Tính giá trị Critic hiện tại cho toàn bộ các Agent trong batch (B rows)
+            v_curr = self.critic(
+                b['svc'], curr_mf_det, b['h_node'], b['wl'], mask_node, 
+                b['ds'], b['dl'], b['om'], b['bs'], indices=b['aids']
+            )
             
-            v_all = self.critic(svc_e, mf_e, b['h_node'][group_idx], b['wl'][group_idx], mask_node_exp, 
-                                b['ds'][group_idx], b['dl'][group_idx], b['om'][group_idx], b['bs'][group_idx], indices=aid_e)
+            # 2. Tính Hybrid Advantage trực tiếp: R - V(s)
+            # Cả ret và v_curr đều là cấp độ Agent (B,) nên phép trừ an toàn
+            hyb_adv_g = ret - v_curr.detach()
             
-            hyb_adv_task = ret[group_idx] - v_all.detach()
-            hyb_adv_g = torch.zeros(B, device=self.device).scatter_add_(0, group_idx, hyb_adv_task)
-            if hyb_adv_g.numel() > 1: hyb_adv_g = (hyb_adv_g - hyb_adv_g.mean()) / (hyb_adv_g.std() + 1e-8)
-            
+            # 3. Chuẩn hóa (Normalization) để ổn định training
+            if hyb_adv_g.numel() > 1:
+                hyb_adv_g = (hyb_adv_g - hyb_adv_g.mean()) / (hyb_adv_g.std() + 1e-8)
+                
         return hyb_adv_g, curr_mf_det, group_idx
 
     def _run_optimization_epochs(self, b, adv_ret_data, phrase, ent_coef):
@@ -552,10 +567,11 @@ class COMAResidualRoutingAgent:
         )
         
         # 3. Critic Loss (using expanded metrics from buffer)
-        b_mask_node_exp = masks_e.view(-1, self.M, self.max_models)[:, :, 0]
-        v_task = self.critic(svc_e, mf_e, h_node_r[group_idx], b['wl'][idx][group_idx], b_mask_node_exp, 
-                             b['ds'][idx][group_idx], b['dl'][idx][group_idx], b['om'][idx][group_idx], b['bs'][idx][group_idx], indices=aid_e)
-        v_grouped = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, v_task) / b_t_lens.float().clamp(min=1)
+        b_mask_node = all_m[idx].view(B_sub, self.M, self.max_models)[:, :, 0]
+        v_grouped = self.critic(
+            b['svc'][idx], curr_mf_det[idx], h_node_r, b['wl'][idx], b_mask_node, 
+            b['ds'][idx], b['dl'][idx], b['om'][idx], b['bs'][idx], indices=b['aids'][idx]
+        )
         loss_c = F.mse_loss(v_grouped, ret[idx])
 
         # Step optimizers
@@ -587,7 +603,10 @@ class COMAResidualRoutingAgent:
             curr_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist.log_prob(act_cat))
             
             ratio = torch.exp(curr_lp - old_joint_lp)
-            loss_p = -torch.min(ratio * adv_gae, torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * dist.entropy().mean()
+            
+            # Aggregate entropy per node to maintain consistent scale with policy gradient (B_sub level)
+            ent_per_node = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist.entropy())
+            loss_p = -torch.min(ratio * adv_gae, torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * ent_per_node.mean()
             loss_r = torch.tensor(0.0, device=self.device)
         else:
             # Proposal Update in Free stage (Dùng phân phối Hybrid hiện tại so với old_lp)
@@ -596,7 +615,10 @@ class COMAResidualRoutingAgent:
             curr_p_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist_P.log_prob(act_cat))
             
             ratio_P = torch.exp(curr_p_lp - old_joint_lp)
-            loss_p = -torch.min(ratio_P * adv_gae, torch.clamp(ratio_P, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * dist_P.entropy().mean()
+            
+            # Aggregate entropy per node to maintain consistent scale with policy gradient (B_sub level)
+            ent_per_node_P = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist_P.entropy())
+            loss_p = -torch.min(ratio_P * adv_gae, torch.clamp(ratio_P, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * ent_per_node_P.mean()
             
             # Refine Update (Cũng dùng phân phối Hybrid hiện tại)
             final_logits_R = apply_m_s(prop_logits.detach() + self.alpha * delta_logits)
