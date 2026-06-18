@@ -70,6 +70,7 @@ class MetricsAggregator:
         self.episode_lower_q_min = []
         self.episode_lower_q_max = []
         self.episode_lower_q_mean = []
+        self.episode_prop_logits  = []     # Avg prop_logit magnitude per step
 
         self.episode_terminal_fails = None
         
@@ -156,6 +157,13 @@ class MetricsAggregator:
     def record_zeta(self, lower, upper):
         self.curr_zeta_lower = lower
         self.curr_zeta_upper = upper
+
+    def record_prop_logits(self, prop_logits):
+        """Record the mean absolute value of proposal logits for a batch."""
+        if prop_logits is not None:
+            v = prop_logits.detach().float().abs().mean()
+            self.episode_prop_logits.append(v)
+
         
     def record_q_stats(self, node_type, q_min, q_max, q_mean):
         if node_type == "Edge_Group":
@@ -220,9 +228,8 @@ class MetricsAggregator:
         self.history["avg_remaining_tasks"].append(_get_avg(self.episode_remaining_tasks, "avg_remaining_tasks"))
         self.history["avg_realized_delay"].append(_get_avg(self.episode_realized_delay, "avg_realized_delay"))
         self.history["total_violations"].append(violate)
-        
-        # Additional metrics for restored plots
         self.history["qos_rate"].append(success / (violate if violate > 0 else 1.0))
+        self.history["avg_prop_logits"].append(_get_avg(self.episode_prop_logits, "avg_prop_logits"))
 
         self.episode_count += 1
         if self.episode_count % 50 == 0:
@@ -274,35 +281,41 @@ class MetricsAggregator:
 
     def plot_history(self, ep=None):
         if not self.history["total_reward"]: return
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        fig, axes = plt.subplots(3, 3, figsize=(18, 16))
         plt.suptitle(f"Training Progress (Episode {len(self.history['total_reward'])})", fontsize=16)
         
         window = 10
         metrics = [
-            ("total_reward", "Reward Convergence", "blue"),
-            ("avg_backlog_drift", "System Stability (Drift)", "green"),
-            ("total_energy", "Energy Consumption", "orange"),
-            ("avg_realized_delay", "Delay Evolution", "red"),
-            ("qos_success_rate", "QoS Satisfaction", "purple"),
-            ("completion_rate", "Task Throughput", "blue")
+            ("total_reward",       "Reward Convergence",       "blue"),
+            ("avg_backlog_drift",   "System Stability (Drift)", "green"),
+            ("total_energy",        "Energy Consumption",       "orange"),
+            ("avg_realized_delay",  "Delay Evolution",          "red"),
+            ("qos_success_rate",    "QoS Satisfaction",         "purple"),
+            ("completion_rate",     "Task Throughput",          "blue"),
+            ("avg_prop_logits",     "Proposal Logits (mean |z|)", "teal"),
         ]
 
         for i, (key, title, color) in enumerate(metrics):
             ax = axes[i // 3, i % 3]
-            data = self.history[key]
-            
-            # Plot raw data with transparency
+            data = self.history.get(key, [])
+            if not data:
+                ax.set_title(title)
+                ax.set_visible(True)
+                continue
+
             ax.plot(data, color=color, alpha=0.3, label="Raw")
-            
-            # Plot MA-10
             if len(data) >= window:
                 ma_data = self._moving_average(data, window)
                 ax.plot(range(window-1, len(data)), ma_data, color=color, linewidth=2, label=f"MA-{window}")
-            
+
             ax.set_title(title)
             ax.legend()
             ax.grid(True)
-            
+
+        # Hide unused subplots (index 7 and 8)
+        for j in range(len(metrics), 9):
+            axes[j // 3, j % 3].set_visible(False)
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         filename = f"{self.name.lower()}_progress_training.png"
         plt.savefig(os.path.join(cfg.plot_dir, filename))

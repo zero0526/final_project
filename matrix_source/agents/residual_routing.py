@@ -179,6 +179,7 @@ class ResidualRoutingAgent:
         self.entropy_coef         = entropy_coef
         self.entropy_decay_rate   = 0.99
         self.min_entropy_coef     = 0.001
+        self.last_prop_logits_mean= 0.0
 
         TASK_DIM         = 4
         GENERAL_TASK_DIM = 7
@@ -361,6 +362,7 @@ class ResidualRoutingAgent:
 
             # ═══ 4. HISTOGRAM & OVERLOAD (Vectorized) ═══
             prop_for_hist = prop_logits.clone()
+            self.last_prop_logits_mean = prop_logits.detach().float().abs().mean()
             if masks_exp is not None:
                 prop_for_hist = prop_for_hist.masked_fill(masks_exp == 0, -1e9)
 
@@ -426,7 +428,6 @@ class ResidualRoutingAgent:
                 print(f"  [INFER] overload[0]: {[f'{x:.3f}' for x in overload[0].tolist()]}")
                 print(f"  [INFER] |Δz|: {delta_logits.abs().mean():.6f}")
                 self._infer_logged += 1
-
         return all_actions, all_log_probs, all_values
 
     @staticmethod

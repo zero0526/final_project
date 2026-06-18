@@ -310,6 +310,9 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         agent_indices=b_agent_idx,
                         phrase=current_phrase,
                     )
+                    # Record proposal logits magnitude for monitoring
+                    if hasattr(trainer.shared_lower_agent, 'last_prop_logits_mean'):
+                        trainer.aggregator.record_prop_logits(trainer.shared_lower_agent.last_prop_logits_mean)
 
                     # ── 5. ENVIRONMENT STEP ──
                     final_n_idxSize = len(t_idx)

@@ -150,7 +150,7 @@ class ResidualRoutingAgent:
                 masks_exp = None
 
             prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp)
-
+            self.last_prop_logits_mean = prop_logits.detach().float().abs().mean()
             # Tính h_node CHỈ ĐỂ BỎ VÀO REFINE ACTOR
             h_node, overload = self._compute_hist_and_overload(prop_logits.detach(), masks_exp, service_states,
                                                                batch_idx, B, total_tasks)
@@ -296,7 +296,7 @@ class ResidualRoutingAgent:
         task_offsets[1:] = task_lens.cumsum(0)[:-1]
         all_flat_idx = torch.arange(total_tasks_flat, device=self.device)
 
-        epoch_metrics = {'v': 0.0, 'p': 0.0, 'r': 0.0}
+        epoch_metrics = {'v': 0.0, 'p': 0.0, 'r': 0.0, 'ent_f': 0.0, 'norm_f': 0.0, 'alpha_p': 0.0, 'alpha_r': 0.0}
         total_batches = 0
 
         for _ in range(self.k_epochs):
@@ -359,7 +359,7 @@ class ResidualRoutingAgent:
                     ratio_P = torch.exp(sum_lp_P - b_old_lp)
                     loss_proposal = -torch.min(ratio_P * b_adv, torch.clamp(ratio_P, 1 - self.eps_clip,
                                                                             1 + self.eps_clip) * b_adv).mean() \
-                                    - current_ent_coef * dist_P.entropy().mean()
+                                    # - current_ent_coef * dist_P.entropy().mean()
 
                     # Nhánh Refine (Stop-gradient đối với Proposal)
                     z_R = apply_mask_and_sanitize(prop_logits.detach() + self.alpha * delta_logits)
