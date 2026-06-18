@@ -79,7 +79,7 @@ class RefineActor(nn.Module):
 
         x = F.silu(self.norm1(self.fc1(x, indices), indices))
         x = F.silu(self.norm2(self.fc2(x, indices), indices))
-        return self.delta_logits(x, indices)
+        return torch.tanh(self.delta_logits(x, indices))
 
 
 class CriticNetwork(nn.Module):

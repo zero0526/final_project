@@ -15,7 +15,7 @@ class COMAResidualRoutingAgent:
                  service_state_dim, mf_dim,
                  action_dim, u_action_dim, max_models,
                  mf_hidden_sizes=(64, 64), mf_lr=1e-3, buffer_min_size=32,
-                 hidden_sizes=(128, 64), lr=3e-4,
+                 hidden_sizes=(128, 64), lr=3e-4, residual_logit_scale = 2,
                  gamma=0.99, alpha=1.0, lambda_coma=0.3,
                  proposal_only_cycles=400, alpha_warmup_cycles=200,
                  buffer_size=100_000, batch_size=128,
@@ -47,11 +47,7 @@ class COMAResidualRoutingAgent:
         self.min_batch_size = buffer_min_size
         
         # --- CẤU HÌNH ALPHA WARM-UP ---
-        self.target_alpha = alpha             # Giá trị mục tiêu (1.0)
-        self.initial_alpha = 0.1              # Giá trị khởi điểm an toàn
-        self.alpha = self.initial_alpha       # Giá trị hiện tại
         self.proposal_only_cycles = proposal_only_cycles
-        self.alpha_warmup_cycles = alpha_warmup_cycles
         # ------------------------------
         
         self.temperature = temperature
@@ -66,6 +62,7 @@ class COMAResidualRoutingAgent:
         GENERAL_TASK_DIM = 7
         self.service_state_dim = service_state_dim
         self.mf_dim = mf_dim
+        self.residual_logit_scale= residual_logit_scale
 
         # ── Networks ──
         self.mf_net = MFNetwork(
@@ -163,7 +160,8 @@ class COMAResidualRoutingAgent:
             final_logits = self._get_refined_logits(
                 prep_data['tasks_cat'], prep_data['svc_exp'], prep_data['mf_exp'], prep_data['idx_exp'],
                 proposal_data['prop_logits'],
-                proposal_data['h_node'], prep_data['batch_idx'], prep_data['masks_exp'], phrase
+                proposal_data['h_node'], proposal_data['h_wl'],
+                prep_data['batch_idx'], prep_data['masks_exp'], phrase
             )
 
             # 4. Action Selection
@@ -231,7 +229,7 @@ class COMAResidualRoutingAgent:
                 torch.zeros(B, self.M, device=device), 
                 [torch.empty(0, self.u_action_dim, device=device) for _ in range(B)])
 
-    def _get_proposal_and_confidence(self, tasks_cat, svc_exp, mf_exp, idx_exp, masks_exp, 
+    def _get_proposal_and_confidence(self, tasks_cat, svc_exp, mf_exp, idx_exp, masks_exp,
                                      service_states, batch_idx, B, total_tasks):
         prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp)
         
@@ -251,11 +249,22 @@ class COMAResidualRoutingAgent:
         )
         self.proposal_load_var = h_node.var(dim=1).mean().item()
 
+        # --- Compute quick workload estimate (mf_load for RefineActor) ---
+        # P(node | task) summed over models → (total_tasks, M)
+        probs_M = probs.view(total_tasks, self.M, self.max_models).sum(dim=2)
+        # ds from tasks_cat[:, 0] (normalized data size)
+        task_ds = tasks_cat[:, 0].view(-1, 1)
+        wl_per_task = probs_M * task_ds  # (total_tasks, M) – unnormalized workload proxy
+        # Aggregate per agent group → (B, M)
+        h_wl = torch.zeros(B, self.M, device=self.device)
+        h_wl.scatter_add_(0, batch_idx.unsqueeze(1).expand(-1, self.M), wl_per_task)
+
         return {
             'prop_logits': prop_logits, 
             'prop_logits_masked': prop_logits_masked,
             'confidence_metrics': confidence_metrics, 
-            'h_node': h_node
+            'h_node': h_node,
+            'h_wl': h_wl,  # expected workload estimate per agent group
         }
 
     def _compute_hist_and_overload(
@@ -297,17 +306,19 @@ class COMAResidualRoutingAgent:
 
         return h_node, overload
 
-    def _get_refined_logits(self, tasks_cat, svc_exp, mf_exp, idx_exp, prop_logits, 
-                            h_node, batch_idx, masks_exp, phrase):
+    def _get_refined_logits(self, tasks_cat, svc_exp, mf_exp, idx_exp, prop_logits,
+                            h_node, h_wl, batch_idx, masks_exp, phrase):
         if phrase == "Proposal_Only":
             delta_logits = torch.zeros_like(prop_logits)
         else:
+            # h_wl: (B, M) workload estimate per group → expand to per-task
+            h_wl_exp = h_wl[batch_idx]  # (total_tasks, M)
             delta_logits = self.refine(
                 tasks_cat, svc_exp, mf_exp, prop_logits.detach(),
-                h_node[batch_idx], mf_exp, indices=idx_exp
+                h_node[batch_idx], h_wl_exp, indices=idx_exp
             )
 
-        final_logits = prop_logits + self.alpha * delta_logits
+        final_logits = prop_logits + self.residual_logit_scale * delta_logits
         if masks_exp is not None:
             final_logits = final_logits.masked_fill(masks_exp == 0, -1e9)
         if self.exclude_zero and self.u_action_dim > 1:
@@ -429,13 +440,6 @@ class COMAResidualRoutingAgent:
         current_ent_coef = self.initial_entropy_coef if phrase == "Proposal_Free" else self.update_coeff(step)
         if phrase == "Proposal_Only":
             self.entropy_coef = current_ent_coef
-            self.lambda_coma = 0
-            self.alpha = 0.0
-        else:
-            self.lambda_coma = self.initial_lambda_coma
-            free_phase_step = max(0, step - self.proposal_only_cycles)
-            warmup_progress = min(1.0, free_phase_step / self.alpha_warmup_cycles)
-            self.alpha = self.initial_alpha + (self.target_alpha - self.initial_alpha) * warmup_progress
         return current_ent_coef
 
     def _get_buffer_data(self, agents_ids):
@@ -557,7 +561,9 @@ class COMAResidualRoutingAgent:
 
         if phrase == "Proposal_Only": delta_logits = torch.zeros_like(prop_logits)
         else:
-            delta_logits = self.refine(t_cat, svc_e, mf_e, prop_logits.detach(), h_node_r[group_idx], mf_e, indices=aid_e)
+            # mf_load = buffered workload from this group (stored in b['wl'])
+            wl_e = b['wl'][idx][group_idx]  # (total_tasks_sub, M)
+            delta_logits = self.refine(t_cat, svc_e, mf_e, prop_logits.detach(), h_node_r[group_idx], wl_e, indices=aid_e)
 
         # Compute losses
         loss_p, loss_r, m = self._compute_actor_losses(
@@ -584,13 +590,6 @@ class COMAResidualRoutingAgent:
         })
         return m
 
-    def _get_confidence_metrics(self, logits):
-        probs = F.softmax(logits, dim=-1)
-        ent = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1, keepdim=True)
-        top2, _ = torch.topk(probs, k=2, dim=-1)
-        margin = (top2[:, 0] - top2[:, 1]).unsqueeze(-1)
-        return torch.cat([ent, margin], dim=-1)
-
     def _compute_actor_losses(self, prop_logits, delta_logits, act_cat, group_idx, B_sub, adv_gae, hyb_adv, old_joint_lp, phrase, ent_coef, masks_e):
         def apply_m_s(z):
             if masks_e is not None: z = z.masked_fill(masks_e == 0, -1e9)
@@ -610,7 +609,7 @@ class COMAResidualRoutingAgent:
             loss_r = torch.tensor(0.0, device=self.device)
         else:
             # Proposal Update in Free stage (Dùng phân phối Hybrid hiện tại so với old_lp)
-            final_logits_P = apply_m_s(prop_logits + self.alpha * delta_logits.detach())
+            final_logits_P = apply_m_s(prop_logits + self.residual_logit_scale * delta_logits.detach())
             dist_P = Categorical(logits=final_logits_P)
             curr_p_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist_P.log_prob(act_cat))
             
@@ -621,7 +620,7 @@ class COMAResidualRoutingAgent:
             loss_p = -torch.min(ratio_P * adv_gae, torch.clamp(ratio_P, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * ent_per_node_P.mean()
             
             # Refine Update (Cũng dùng phân phối Hybrid hiện tại)
-            final_logits_R = apply_m_s(prop_logits.detach() + self.alpha * delta_logits)
+            final_logits_R = apply_m_s(prop_logits.detach() + self.residual_logit_scale * delta_logits)
             dist_R = Categorical(logits=final_logits_R)
             curr_r_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist_R.log_prob(act_cat))
             
