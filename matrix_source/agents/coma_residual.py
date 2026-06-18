@@ -6,7 +6,8 @@ from torch.distributions import Categorical
 import math
 
 from matrix_source.agents.buffer.com_buffer import MultiAgentCOMARolloutBuffer
-from matrix_source.agents.COMA_Residual_net import COMAQNetwork, RefineActor, ProposalActor, MFNetwork
+from matrix_source.agents.COMA_Residual_net import CriticNetwork, RefineActor, ProposalActor, MFNetwork
+from matrix_source.agents.sac_ec import Critic
 
 
 class COMAResidualRoutingAgent:
@@ -84,7 +85,7 @@ class COMAResidualRoutingAgent:
             action_dim=u_action_dim, hidden_sizes=hidden_sizes, num_instances=num_instances,
         ).to(self.device)
 
-        self.critic = COMAQNetwork(
+        self.critic = CriticNetwork(
             service_state=service_state_dim, mf_dim=mf_dim,
             action_dim=1, hidden_sizes=hidden_sizes, num_instances=num_instances,
         ).to(self.device)
@@ -161,7 +162,7 @@ class COMAResidualRoutingAgent:
             # 3. Refine Logic
             final_logits = self._get_refined_logits(
                 prep_data['tasks_cat'], prep_data['svc_exp'], prep_data['mf_exp'], prep_data['idx_exp'],
-                proposal_data['prop_logits'], proposal_data['confidence_metrics'], 
+                proposal_data['prop_logits'],
                 proposal_data['h_node'], prep_data['batch_idx'], prep_data['masks_exp'], phrase
             )
 
@@ -298,12 +299,12 @@ class COMAResidualRoutingAgent:
         return h_node, overload
 
     def _get_refined_logits(self, tasks_cat, svc_exp, mf_exp, idx_exp, prop_logits, 
-                           confidence_metrics, h_node, batch_idx, masks_exp, phrase):
+                            h_node, batch_idx, masks_exp, phrase):
         if phrase == "Proposal_Only":
             delta_logits = torch.zeros_like(prop_logits)
         else:
             delta_logits = self.refine(
-                tasks_cat, svc_exp, mf_exp, prop_logits.detach(), confidence_metrics,
+                tasks_cat, svc_exp, mf_exp, prop_logits.detach(),
                 h_node[batch_idx], mf_exp, indices=idx_exp
             )
 
@@ -541,11 +542,14 @@ class COMAResidualRoutingAgent:
 
         if phrase == "Proposal_Only": delta_logits = torch.zeros_like(prop_logits)
         else:
-            conf = self._get_confidence_metrics(apply_m_s(prop_logits.detach()))
-            delta_logits = self.refine(t_cat, svc_e, mf_e, prop_logits.detach(), conf, h_node_r[group_idx], mf_e, indices=aid_e)
+            delta_logits = self.refine(t_cat, svc_e, mf_e, prop_logits.detach(), h_node_r[group_idx], mf_e, indices=aid_e)
 
         # Compute losses
-        loss_p, loss_r, m = self._compute_actor_losses(prop_logits, delta_logits, act_cat, p_log_b, group_idx, B_sub, adv[idx], hybrid_adv_g[idx], phrase, ent_coef, masks_e)
+        loss_p, loss_r, m = self._compute_actor_losses(
+            prop_logits, delta_logits, act_cat, group_idx, B_sub, 
+            adv[idx], hybrid_adv_g[idx], b['old_lp'][idx], 
+            phrase, ent_coef, masks_e
+        )
         
         # 3. Critic Loss (using expanded metrics from buffer)
         b_mask_node_exp = masks_e.view(-1, self.M, self.max_models)[:, :, 0]
@@ -571,32 +575,35 @@ class COMAResidualRoutingAgent:
         margin = (top2[:, 0] - top2[:, 1]).unsqueeze(-1)
         return torch.cat([ent, margin], dim=-1)
 
-    def _compute_actor_losses(self, prop_logits, delta_logits, act_cat, p_log_b, group_idx, B_sub, adv_gae, hyb_adv, phrase, ent_coef, masks_e):
+    def _compute_actor_losses(self, prop_logits, delta_logits, act_cat, group_idx, B_sub, adv_gae, hyb_adv, old_joint_lp, phrase, ent_coef, masks_e):
         def apply_m_s(z):
             if masks_e is not None: z = z.masked_fill(masks_e == 0, -1e9)
             if self.exclude_zero and self.u_action_dim > 1: z[:, 0] = -1e9
             return self._sanitize_logits(z)
 
-        old_p_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, F.log_softmax(apply_m_s(p_log_b), dim=-1).gather(1, act_cat.unsqueeze(1)).squeeze(1))
-        
         if phrase == "Proposal_Only":
-            dist = Categorical(logits=apply_m_s(prop_logits))
+            logits = apply_m_s(prop_logits)
+            dist = Categorical(logits=logits)
             curr_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist.log_prob(act_cat))
-            ratio = torch.exp(curr_lp - old_p_lp)
+            
+            ratio = torch.exp(curr_lp - old_joint_lp)
             loss_p = -torch.min(ratio * adv_gae, torch.clamp(ratio, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * dist.entropy().mean()
             loss_r = torch.tensor(0.0, device=self.device)
         else:
-            # Proposal Update in Free stage
-            dist_P = Categorical(logits=apply_m_s(prop_logits + self.alpha * delta_logits.detach()))
+            # Proposal Update in Free stage (Dùng phân phối Hybrid hiện tại so với old_lp)
+            final_logits_P = apply_m_s(prop_logits + self.alpha * delta_logits.detach())
+            dist_P = Categorical(logits=final_logits_P)
             curr_p_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist_P.log_prob(act_cat))
-            ratio_P = torch.exp(curr_p_lp - old_p_lp)
+            
+            ratio_P = torch.exp(curr_p_lp - old_joint_lp)
             loss_p = -torch.min(ratio_P * adv_gae, torch.clamp(ratio_P, 1-self.eps_clip, 1+self.eps_clip) * adv_gae).mean() - ent_coef * dist_P.entropy().mean()
             
-            # Refine Update
-            dist_R = Categorical(logits=apply_m_s(prop_logits.detach() + self.alpha * delta_logits))
+            # Refine Update (Cũng dùng phân phối Hybrid hiện tại)
+            final_logits_R = apply_m_s(prop_logits.detach() + self.alpha * delta_logits)
+            dist_R = Categorical(logits=final_logits_R)
             curr_r_lp = torch.zeros(B_sub, device=self.device).scatter_add_(0, group_idx, dist_R.log_prob(act_cat))
-            old_r_lp = old_p_lp # This is a simplification, should ideally be from buffer if refine log_probs stored
-            ratio_R = torch.exp(curr_r_lp - old_r_lp)
+            
+            ratio_R = torch.exp(curr_r_lp - old_joint_lp)
             loss_r = -torch.min(ratio_R * hyb_adv, torch.clamp(ratio_R, 1-self.eps_clip, 1+self.eps_clip) * hyb_adv).mean()
 
         # Tracking (Simplified)

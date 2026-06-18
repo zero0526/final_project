@@ -9,7 +9,6 @@ class MFNetwork(nn.Module):
     Mean Field Network: Xử lý/Dự đoán trường trung bình (Mean Field).
     mf đại diện cho hành vi trung bình của các Edge khác (VD: tải kỳ vọng họ gửi đến các node).
     """
-
     def __init__(self, input_dim, output_dim, hidden_sizes, num_instances=1):
         super().__init__()
         h1, h2 = hidden_sizes
@@ -21,7 +20,6 @@ class MFNetwork(nn.Module):
     def forward(self, x, indices=None):
         x = F.silu(self.norm(self.fc1(x, indices), indices))
         x = F.silu(self.fc2(x, indices))
-        # Dùng sigmoid nếu mf là tỷ lệ tải, hoặc softmax nếu là phân phối xác suất offload
         return torch.sigmoid(self.out(x, indices))
 
 class ProposalActor(nn.Module):
@@ -59,7 +57,6 @@ class RefineActor(nn.Module):
         # TÁCH RIÊNG group_load và mf_load
         in_dim = (task_state + service_state + mf_dim +
                   action_dim +  # proposal_logits
-                  2 +  # confidence_metrics (entropy, margin)
                   service_state//2 +  # group_load (tải do chính nhóm này gây ra)
                   mf_dim)  # mf_load (tải do các edge khác gây ra)
 
@@ -72,14 +69,12 @@ class RefineActor(nn.Module):
         nn.init.zeros_(self.delta_logits.weight)
         nn.init.zeros_(self.delta_logits.bias)
 
-    def forward(self, task, svc, mf, proposal_logits,
-                confidence_metrics, group_load, mf_load, indices=None):
+    def forward(self, task, svc, mf, proposal_logits, group_load, mf_load, indices=None):
         x = torch.cat([
             task, svc, mf,
             proposal_logits,
-            confidence_metrics,
-            group_load,  # Đưa riêng
-            mf_load  # Đưa riêng
+            group_load,  
+            mf_load 
         ], dim=-1)
 
         x = F.silu(self.norm1(self.fc1(x, indices), indices))
@@ -87,7 +82,7 @@ class RefineActor(nn.Module):
         return self.delta_logits(x, indices)
 
 
-class COMAQNetwork(nn.Module):
+class CriticNetwork(nn.Module):
     """
     Centralized Q-Network cho Credit Assignment (COMA-inspired).
     Đánh giá Q(s, h_node, a) cho TỪNG task, nhưng có nhận thức được tải trọng của CẢ NHÓM (h_node).

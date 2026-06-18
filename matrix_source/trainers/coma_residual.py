@@ -38,8 +38,8 @@ class COMAResidualStrategy(AlgorithmStrategy):
         self.lower_mf_prev = None
         self.mf_ema_alpha = 0.7
 
-        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 7}
-        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 5}
+        self.lower_cfg = {'min_size': 4096, 'batch': 128, 'epochs': 8}
+        self.upper_cfg = {'min_size': 512, 'batch': 64, 'epochs': 3}
 
         self.upper_warmup_steps = 3
         self.lower_warmup_steps = 8
@@ -61,10 +61,10 @@ class COMAResidualStrategy(AlgorithmStrategy):
         # 1. UPPER AGENT (GIỮ NGUYÊN 100%)
         # ==========================================
         # num_service x num_model
-        self.model_workloads = torch.tensor(trainer.env.metadata["model_workloads"], 
+        self.model_workloads = trainer.env.metadata["model_workloads"].detach().clone().to( 
                                             device=trainer.device, dtype=torch.float32)
         # num_service x 1
-        self.service_input_size = torch.tensor(trainer.env.metadata["service_input_size"], 
+        self.service_input_size = trainer.env.metadata["service_input_size"].detach().clone().to( 
                                               device=trainer.device, dtype=torch.float32)
 
         trainer.shared_upper_agent = PPOAgent(
@@ -149,13 +149,9 @@ class COMAResidualStrategy(AlgorithmStrategy):
         act_matrix = torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device)
         mf_global = obs_upper.get('mean_fields',
                                   torch.zeros((trainer.num_nodes, trainer.num_services), device=trainer.device))
-        if self.upper_mf_ema is None:
-            self.upper_mf_ema = mf_global.clone()
-        else:
-            self.upper_mf_ema = (1 - self.mf_ema_alpha) * self.upper_mf_ema + self.mf_ema_alpha * mf_global
 
         edge_states = current_upper_state[trainer.edge_node_ids]
-        edge_mfs = self.upper_mf_ema[trainer.edge_node_ids]
+        edge_mfs = mf_global[trainer.edge_node_ids]
         instance_indices = self.up_instance_mapping[trainer.edge_node_ids]
         is_det = self.is_evaluating
 
@@ -178,10 +174,9 @@ class COMAResidualStrategy(AlgorithmStrategy):
         rew_divisor = trainer.config.norm_upper_rw
         norm_rew = log_transform(reward / (rew_divisor if rew_divisor != 0 else 1.0))
         avg_mf_loss = 0.0
-        is_frozen = (self.phase == 'LOWER_ONLY')
         edge_states = s_all[trainer.edge_node_ids] if s_all is not None else None
 
-        if not is_frozen and not self.is_evaluating:
+        if not self.is_evaluating:
             edge_next_states = ns_all[trainer.edge_node_ids]
             dones = torch.full((trainer.num_edge_agents,), 1.0 if is_done else 0.0, dtype=torch.float32,
                                device=trainer.device)
@@ -198,19 +193,17 @@ class COMAResidualStrategy(AlgorithmStrategy):
             rewards = torch.full((trainer.num_edge_agents,), norm_rew, dtype=torch.float32, device=trainer.device)
             instance_indices = self.up_instance_mapping[trainer.edge_node_ids]
 
-            # Gọi store_transition của Upper Agent
-            # Lưu ý: PPOAgent có thể không cần proposal_logits/h_nodes, nhưng ta truyền masks nếu có
             avg_mf_loss = trainer.shared_upper_agent.store_transition_train_mf_batch(
-                service_states=edge_states,
+                states=edge_states,
                 prev_mfs=edge_c_mfs,
                 curr_mfs=edge_n_mfs,
                 actions=edge_a_ids,
                 rewards=rewards,
-                next_service_states=edge_next_states,
+                next_states=edge_next_states,
                 dones=dones,
                 agent_ids=instance_indices,
-                log_probs=log_probs,
-                values=values,
+                log_prob=log_probs,
+                value=values,
                 masks=None  # Upper Agent thường không có mask phức tạp như Lower Agent
             )
 
@@ -235,7 +228,7 @@ class COMAResidualStrategy(AlgorithmStrategy):
         return mask_v, mask_a
 
     def _build_service_observation(self, trainer, s_idx, obs_lower):
-        """Build service_state (2M) for a specific service."""
+        """Build norm service_state (2M) for a specific service."""
         f = (obs_lower["obs"]['cpu_alloc'][:, s_idx] * trainer.env.engine.placement_matrix[:, s_idx]).float()
         f = f / trainer.config.norm_gflop
         q = obs_lower["obs"]['backlog'][:, s_idx].float()
@@ -329,54 +322,63 @@ class COMAResidualStrategy(AlgorithmStrategy):
         }
 
     def _calculate_post_inference_workload(self, trainer, B, prop_logits, task_states, a_ids_list, svc_ids):
-        """Calculates expected workload after inference, scaling by service intensity."""
+        """Calculates expected workload after inference, scaling by service intensity.
+
+        task_states[:, 0] đã được chuẩn hoá: raw_data_size / norm_data_size
+        (trong đó raw_data_size = data_size_per_unit * batch_size, tức đã nhân với batchsize*unit).
+        → De-normalize bằng cách nhân lại norm_data_size để lấy lại đơn vị thô phục vụ tính workload.
+
+        Các trường chuẩn hoá khác (deadline / 100, ...) không tham gia tính workload nên kệ.
+        Nếu state bị vênh đơn vị so với service_input_size thì chuyển hoá thêm trong bước intensities.
+        """
         total_tasks = sum(len(a) for a in a_ids_list)
-        if total_tasks == 0: 
+        if total_tasks == 0:
             return torch.zeros(B, trainer.shared_lower_agent.M, device=trainer.device)
-        
-        # 1. Probabilities of mapping each task to each node (M)
+
+        # all_probs: (total_tasks, M * max_models) — xác suất chọn hành động (node_v, model_b)
         all_p_logits = torch.cat(prop_logits, dim=0)
+        # all_probs shape: (total_tasks, M * max_models)
         all_probs = torch.softmax(all_p_logits, dim=-1)
-        # Sum probabilities over model instances for each node
-        all_probs_M = all_probs.view(total_tasks, trainer.shared_lower_agent.M, trainer.shared_lower_agent.max_models).sum(dim=2)
-        
-        # 2. Respective intensities for each task's service
-        # svc_ids are for groups, expand to all tasks
+        # Reshape → (total_tasks, M, max_models): P(node_v, model_b | task_i)
+        all_probs_3d = all_probs.view(total_tasks, trainer.shared_lower_agent.M, trainer.shared_lower_agent.max_models)
+
+        # Số lượng đơn vị tính toán của mỗi task:
+        #   num_units = raw_data_size / service_input_size
+        #   task_states[:, 0] đã bị chuẩn hoá = raw_data_size / norm_data_size
+        #   → raw_data_size = task_states[:, 0] * norm_data_size
         t_lens = [len(a) for a in a_ids_list]
         t_lens_tensor = torch.tensor(t_lens, device=trainer.device)
+        # all_svc_ids: per-task service id, shape (total_tasks,)
         all_svc_ids = torch.repeat_interleave(svc_ids, t_lens_tensor)
-        
-        # Scale: Intensity[service] * DataSize[task]
-        # We use service_input_size as a scaling factor for computing intensity
-        intensities = self.service_input_size[all_svc_ids].to(trainer.device)
+
         all_tasks_cat = torch.cat(task_states, dim=0)
-        all_ds = all_tasks_cat[:, 0].view(-1, 1) # Normalized data size
-        
-        expected_task_load = all_probs_M * (all_ds * intensities)
-        
-        # 3. Aggregate into groups (B agents)
+        # raw_data_size đã nhân batchsize*unit, de-normalize về đơn vị thực
+        raw_ds = all_tasks_cat[:, 0] * trainer.config.norm_data_size           # (total_tasks,)
+        # num_units: số lần lặp input_size khớp trong raw_ds
+        num_units = (raw_ds / self.service_input_size[all_svc_ids].squeeze(-1)) # (total_tasks,)
+
+        # model_workloads: (num_services, max_models) — GFLOPs xử lý 1 unit tại mỗi model
+        # mw_per_task: (total_tasks, max_models)
+        mw_per_task = self.model_workloads[all_svc_ids]                         # (total_tasks, max_models)
+
+        # Kỳ vọng workload tại node v cho task i:
+        #   E[wl_{i,v}] = Σ_b P(v,b|i) * workload(svc_i, b) * num_units_i
+        # → all_probs_3d: (T, M, max_models)  *  mw_per_task: (T, 1, max_models)  → sum over max_models
+        expected_task_load = (
+            all_probs_3d * mw_per_task.unsqueeze(1)
+        ).sum(dim=2) * num_units.view(-1, 1)                                    # (total_tasks, M)
+
+        # 4. Gom nhóm về B agents
         b_idx_exp = torch.repeat_interleave(torch.arange(B, device=trainer.device), t_lens_tensor)
         wl_group = torch.zeros(B, trainer.shared_lower_agent.M, device=trainer.device)
-        wl_group.scatter_add_(0, b_idx_exp.view(-1, 1).expand(-1, trainer.shared_lower_agent.M), expected_task_load)
-        
-        return wl_group
+        wl_group.scatter_add_(
+            0,
+            b_idx_exp.view(-1, 1).expand(-1, trainer.shared_lower_agent.M),
+            expected_task_load
+        )
 
-    def _handle_lower_storage_and_learn(self, trainer, storage_data, phrase, pbar):
-        """Encapsulates buffer storage and learning process."""
-        trainer.shared_lower_agent.store_transition_train_mf_batch(**storage_data)
-        
-        if trainer.shared_lower_agent.memory.total_size >= self.lower_collect_size:
-            loss_dict = trainer.shared_lower_agent.learn(phrase=phrase, step=self.cycle_num)
-            if loss_dict is not None:
-                self.lower_train_num += 1
-                trainer.aggregator.record_td_losses(lower_losses=loss_dict)
-                self.kstep_monitor.record(trainer.shared_lower_agent)
-                self._print_diagnostics(phrase, loss_dict)
-                
-                pbar.update(1)
-                self.cycle_num += 1
-                return True # Cycle completed
-        return False
+        return wl_group/trainer.config.norm_gflop
+
 
     def _print_diagnostics(self, phrase, loss_dict):
         """Prints training status periodically."""
@@ -389,79 +391,122 @@ class COMAResidualStrategy(AlgorithmStrategy):
 
     def run_training(self, trainer):
         max_slots = trainer.env.time_manager.max_steps
-        pbar = tqdm(total=self.max_cycles, desc="Training")
+        pbar = tqdm(total=self.max_cycles, desc="Training", initial=self.cycle_num - 1)
 
         while self.cycle_num <= self.max_cycles:
-            obs = trainer.env.reset()
-            obs_upper, obs_lower = obs['upper'], obs['lower']
-            current_upper_state = self.build_upper_state(trainer, obs_upper)
+            # Phase current cycle
             phrase = "Proposal_Only" if self.cycle_num <= self.proposal_only_cycles else "Proposal_Free"
-            stop_ep = False
-
-            for slot in range(max_slots):
-                if stop_ep: break
+            
+            # --- STEP 1: ROLLOUT / DATA COLLECTION ---
+            # Thu thập cho đến khi MỌI agent ở CẢ 2 TẦNG đều đủ transition
+            while True:
+                # Kiểm tra ngưỡng (threshold) cho từng agent riêng biệt
+                # Upper: min 512, Lower: min 4096
+                upper_ready = (trainer.shared_upper_agent.memory.buffer_sizes >= 512).all().item()
+                lower_ready = (trainer.shared_lower_agent.memory.buffer_sizes >= 4096).all().item()
                 
-                # 1. Upper Decision
-                if trainer.env.time_manager.is_new_frame():
-                    u_acts, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state, obs_upper)
-                    trainer.env.step_upper(u_acts)
+                if upper_ready and lower_ready:
+                    break  # Đã đủ data, chuyển sang train
+                
+                # Bắt đầu rollout episode mới
+                obs = trainer.env.reset()
+                obs_upper, obs_lower = obs['upper'], obs['lower']
+                current_upper_state = self.build_upper_state(trainer, obs_upper)
+                
+                for _ in range(max_slots):
+                    # 1. Upper Decision
+                    if trainer.env.time_manager.is_new_frame():
+                        u_acts, u_log_probs, u_values = self.get_upper_actions(trainer, current_upper_state, obs_upper)
+                        trainer.env.step_upper(u_acts)
 
-                # 2. Lower Rollout
-                t_idx, s_idx, b_sz, t_acc, t_dl = trainer.workload_gen.generate_step()
-                if len(t_idx) > 0:
-                    # Preparation & Metrics
-                    gd = self._prepare_group_data(trainer, t_idx, s_idx, obs_lower)
-                    metrics = self._calculate_group_metrics(trainer, gd['task_states'])
+                    # 2. Lower Rollout
+                    t_idx, s_idx, b_sz, t_acc, t_dl = trainer.workload_gen.generate_step()
+                    if len(t_idx) > 0:
+                        gd = self._prepare_group_data(trainer, t_idx, s_idx, obs_lower)
+                        metrics = self._calculate_group_metrics(trainer, gd['task_states'])
 
-                    # Inference
-                    a_ids_list, lp_list, values, h_nodes, prop_logits = trainer.shared_lower_agent.choose_action_batch(
-                        gd['svc_states'], gd['prev_mfs'], gd['task_states'], gd['masks'], gd['agent_idx'], phrase=phrase, metrics=metrics
-                    )
-                    metrics['workload'] = self._calculate_post_inference_workload(
-                        trainer, gd['B'], prop_logits, gd['task_states'], a_ids_list, gd['svc_ids']
-                    )
+                        # Inference
+                        a_ids_list, lp_list, values, h_nodes, prop_logits = trainer.shared_lower_agent.choose_action_batch(
+                            gd['svc_states'], gd['prev_mfs'], gd['task_states'], gd['masks'], gd['agent_idx'], 
+                            phrase=phrase, metrics=metrics
+                        )
+                        metrics['workload'] = self._calculate_post_inference_workload(
+                            trainer, gd['B'], prop_logits, gd['task_states'], a_ids_list, gd['svc_ids']
+                        )
 
-                    # Env Step
-                    f_n, f_m = torch.zeros_like(t_idx), torch.zeros_like(t_idx)
-                    for i in range(gd['B']):
-                        f_n[gd['pair_idx'] == i] = a_ids_list[i] // trainer.max_models
-                        f_m[gd['pair_idx'] == i] = a_ids_list[i] % trainer.max_models
-                    
-                    results = trainer.env.step_lower(t_idx, s_idx, b_sz, f_n, f_m, t_dl, t_acc)
-                    rew = log_transform((results['reward'] - results['obs'].get('virtual_drift', 0)) / (trainer.config.norm_lower_rw or 1.0))
-                    
-                    # Storage & Storage Learn
-                    curr_mfs = self._compute_node_wise_mfs(trainer, t_idx, s_idx, f_n, f_m, gd['n_src'])
-                    next_svc = torch.stack([self._build_service_observation(trainer, int(gd['svc_ids'][i]), results) for i in range(gd['B'])])
-                    curr_mfs_b = torch.stack([curr_mfs[int(gd['svc_ids'][i]), int(gd['agent_idx'][i])] for i in range(gd['B'])])
-                    
-                    storage_data = {
-                        'service_states': gd['svc_states'], 'task_states': gd['task_states'], 'prev_mfs': gd['prev_mfs'], 
-                        'curr_mfs': curr_mfs_b, 'actions': a_ids_list, 'rewards': torch.full((gd['B'], 1), rew, device=trainer.device),
-                        'next_service_states': next_svc, 'dones': torch.zeros((gd['B'], 1), device=trainer.device),
-                        'agent_ids': gd['agent_idx'], 'log_probs': lp_list, 'values': values, 'masks': gd['masks'],
-                        'proposal_logits': prop_logits, 'h_nodes': h_nodes, 'workloads': metrics['workload'],
-                        'ds_metrics': metrics['ds_metrics'], 'deadline_metrics': metrics['deadline_metrics'],
-                        'omegas': metrics['omega'], 'batch_sizes': metrics['batch_size']
-                    }
-                    
-                    if self._handle_lower_storage_and_learn(trainer, storage_data, phrase, pbar):
-                        phrase = "Proposal_Only" if self.cycle_num <= self.proposal_only_cycles else "Proposal_Free"
-                        if self.cycle_num > self.max_cycles: stop_ep = True
-                    
-                    self.lower_mf_prev, obs_lower = curr_mfs.detach(), results
-                    trainer.aggregator.add_lower(results, mf_loss=0.0)
-                else: trainer.env.time_manager.tick()
+                        # Env Step
+                        f_n, f_m = torch.zeros_like(t_idx), torch.zeros_like(t_idx)
+                        for i in range(gd['B']):
+                            f_n[gd['pair_idx'] == i] = a_ids_list[i] // trainer.max_models
+                            f_m[gd['pair_idx'] == i] = a_ids_list[i] % trainer.max_models
+                        
+                        results = trainer.env.step_lower(t_idx, s_idx, b_sz, f_n, f_m, t_dl, t_acc)
+                        rew = log_transform((results['reward'] - results['obs'].get('virtual_drift', 0)) / (trainer.config.norm_lower_rw or 1.0))
+                        
+                        # Storage (Lưu transition và train MF mạng supervised)
+                        curr_mfs = self._compute_node_wise_mfs(trainer, t_idx, s_idx, f_n, f_m, gd['n_src'])
+                        next_svc = torch.stack([self._build_service_observation(trainer, int(gd['svc_ids'][i]), results) for i in range(gd['B'])])
+                        curr_mfs_b = torch.stack([curr_mfs[int(gd['svc_ids'][i]), int(gd['agent_idx'][i])] for i in range(gd['B'])])
+                        
+                        mf_loss = trainer.shared_lower_agent.store_transition_train_mf_batch(
+                            service_states=gd['svc_states'], task_states=gd['task_states'], 
+                            prev_mfs=gd['prev_mfs'], curr_mfs=curr_mfs_b, actions=a_ids_list, 
+                            rewards=torch.full((gd['B'], 1), rew, device=trainer.device),
+                            next_service_states=next_svc, dones=torch.zeros((gd['B'], 1), device=trainer.device),
+                            agent_ids=gd['agent_idx'], log_probs=lp_list, values=values, masks=gd['masks'],
+                            proposal_logits=prop_logits, h_nodes=h_nodes, workloads=metrics['workload'],
+                            ds_metrics=metrics['ds_metrics'], deadline_metrics=metrics['deadline_metrics'],
+                            omegas=metrics['omega'], batch_sizes=metrics['batch_size']
+                        )
+                        
+                        self.lower_mf_prev, obs_lower = curr_mfs.detach(), results
+                        trainer.aggregator.add_lower(results, mf_loss=mf_loss)
+                    else:
+                        trainer.env.time_manager.tick()
 
-                # 3. Upper Transition
-                if trainer.env.time_manager.is_new_frame():
-                    res_u = trainer.env.collect_upper_metrics()
-                    self.store_upper_transitions(trainer, current_upper_state, self.build_upper_state(trainer, res_u), obs_upper, res_u, u_acts, u_log_probs, u_values, slot == max_slots -1)
-                    current_upper_state, obs_upper = self.build_upper_state(trainer, res_u), res_u
+                    # 3. Upper Transition Storage
+                    if trainer.env.time_manager.is_new_frame():
+                        res_u = trainer.env.collect_upper_metrics()
+                        # call store_upper_transitions (Lưu vào shared_upper_agent.memory)
+                        self.store_upper_transitions(
+                            trainer, current_upper_state, self.build_upper_state(trainer, res_u), 
+                            obs_upper, res_u, u_acts, u_log_probs, u_values, False
+                        )
+                        current_upper_state, obs_upper = self.build_upper_state(trainer, res_u), res_u
 
-            trainer.aggregator.store_history()
-            trainer.aggregator.report_episode(0) # Simplified ep count
-            trainer.aggregator.reset_episode()
+                    # Kiểm tra lại ngay trong slot để thoát rollout sớm nếu đủ data
+                    upper_ready = (trainer.shared_upper_agent.memory.buffer_sizes >= 512).all().item()
+                    lower_ready = (trainer.shared_lower_agent.memory.buffer_sizes >= 4096).all().item()
+                    if upper_ready and lower_ready:
+                        break
+
+                trainer.aggregator.store_history()
+                trainer.aggregator.report_episode(0)
+                trainer.aggregator.reset_episode()
+                
+                # Check condition again after episode
+                if upper_ready and lower_ready:
+                    break
+
+            # --- STEP 2: TRAINING PHASE (SEQUENTIAL) ---
+            # 2.1 Train Upper Agent
+            print(f"\n[Cycle {self.cycle_num}] Training Upper Agent...")
+            u_loss = trainer.shared_upper_agent.learn() # Tự động clear buffer bên trong
+            if u_loss is not None:
+                self.upper_train_num += 1
+            
+            # 2.2 Train Lower Agent
+            print(f"[Cycle {self.cycle_num}] Training Lower Agent...")
+            l_loss_dict = trainer.shared_lower_agent.learn(phrase=phrase, step=self.cycle_num) # Tự động clear buffer bên trong
+            if l_loss_dict is not None:
+                self.lower_train_num += 1
+                trainer.aggregator.record_td_losses(lower_losses=l_loss_dict)
+                self.kstep_monitor.record(trainer.shared_lower_agent)
+                self._print_diagnostics(phrase, l_loss_dict)
+
+            # --- STEP 3: UPDATE PROGRESS ---
+            pbar.update(1)
+            self.cycle_num += 1
 
         pbar.close()
         self.run_evaluation(trainer, num_episodes=5)

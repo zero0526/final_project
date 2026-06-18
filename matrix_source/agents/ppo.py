@@ -396,7 +396,6 @@ class PPOAgent:
 
                 epoch_v_loss += critic_loss.item()
                 total_batches += 1
-
         self.learn_step_counter += 1
         if self.zeta and self.increase_rate_zeta:
             self.zeta = min(self.zeta * self.increase_rate_zeta, self.max_zeta)
