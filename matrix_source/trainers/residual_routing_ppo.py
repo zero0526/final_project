@@ -370,7 +370,7 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     m_len = trainer.shared_lower_agent.memory.total_size
                     if m_len >= self.lower_collect_size:
 
-                        loss = trainer.shared_lower_agent.learn(phrase=current_phrase, step= self.cycle_num)
+                        loss = trainer.shared_lower_agent.learn(step= self.cycle_num)
                         if loss is not None:
                             print(f"phrase: {current_phrase} step {self.cycle_num} loss: {loss}")
                             self.lower_train_num += 1
