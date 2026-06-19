@@ -401,11 +401,11 @@ class RefinementStrategy(AlgorithmStrategy):
                     # ══════════════════════════════════════════════════════
                     # ĐIỂM QUAN TRỌNG: KIỂM TRA ĐỦ DATA THÌ MỚI TÍNH LÀ 1 CYCLE
                     # ══════════════════════════════════════════════════════
-                    is_lower_enough= all(b.size >= self.lower_cfg["min_size"] for  b in trainer.shared_lower_agent.memory.buffers)
-                    is_upper_enough= all(b.size >= self.upper_cfg["min_size"] for b in trainer.shared_upper_agent.memory.buffers )
+                    # is_lower_enough= all((b.size >= self.lower_cfg["min_size"]) for  b in trainer.shared_lower_agent.memory.buffers)
+                    # is_upper_enough= all(b.size >= self.upper_cfg["min_size"] for b in trainer.shared_upper_agent.memory.buffers )
 
-                    if is_lower_enough and is_upper_enough:
-                        upper_loss = trainer.shared_upper_agent.learn()
+                    m_len = trainer.shared_lower_agent.memory.total_size
+                    if m_len >= self.lower_collect_size:
                         loss = trainer.shared_lower_agent.learn(step=self.cycle_num)
                         if loss is not None:
                             current_phase = trainer.shared_lower_agent.current_phase_name

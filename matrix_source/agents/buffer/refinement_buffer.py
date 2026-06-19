@@ -341,11 +341,11 @@ class MultiAgentRolloutBuffer:
         """
         Collate list of get_all() outputs into single batch.
 
-        Each sample = tuple of 14 items from RolloutBuffer.get_all()
+        Each sample = tuple of 16 items from RolloutBuffer.get_all()
         """
         result = []
 
-        for field_idx in range(14):
+        for field_idx in range(16):
             if field_idx == 1:
                 # task_batch_cat: concat
                 result.append(torch.cat([s[1] for s in samples], dim=0))

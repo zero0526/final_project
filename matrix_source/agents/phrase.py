@@ -192,7 +192,7 @@ class ProposalOnlyPhase(BasePhase):
             self._current_entropy_coef * self.hp['entropy_decay_rate'],
             self.hp['entropy_coef_end']
         )
-
+        # 0.001 + (0.05 - 0.001) * math.exp(-0.0307 * step)
         # Call parent to increment step_counter
         super().step()
 
@@ -247,19 +247,17 @@ class ProposalOnlyPhase(BasePhase):
         # 2. Entropy Bonus (Dùng nguyên Tổng Sum)
         # ══════════════════════════════════════════
         # sum_ent là tổng entropy của tất cả các task thuộc về 1 agent
-        sum_ent = torch.zeros(B_sub, device=agent.device).scatter_add_(
-            0, batch_idx, dist.entropy()
-        )
+
 
         # Chỉ lấy trung bình (mean) theo Batch Size (B_sub)
-        entropy_loss = -self._current_entropy_coef * sum_ent.mean()
+        entropy_loss = -self._current_entropy_coef * dist.entropy().mean()
 
         return {
             'loss_proposal': ppo_loss + entropy_loss,
             'loss_refine': None,  # Không có refine loss
             'metrics': {
                 'entropy_coef': self._current_entropy_coef,
-                'entropy': sum_ent.mean().item(),  # Log tổng entropy trung bình của agents
+                'entropy': entropy_loss.item(),  # Log tổng entropy trung bình của agents
                 'ppo_loss': ppo_loss.item(),
             }
         }
@@ -511,15 +509,8 @@ class ProposalFreePhase(BasePhase):
             torch.clamp(ratio_R, 1 - agent.eps_clip, 1 + agent.eps_clip) * advantages
         ).mean()
 
-        # ══════════════════════════════════════════
-        # Entropy bonus
-        # ══════════════════════════════════════════
-        sum_ent_R = torch.zeros(B_sub, device=agent.device).scatter_add_(
-            0, batch_idx, dist_R.entropy()
-        )
-
         # SỬA 3: KHÔNG chia cho b_t_lens. Dùng luôn sum_ent_R.mean()
-        entropy_loss_R = -self._current_entropy_coef * sum_ent_R.mean()
+        entropy_loss_R = -self._current_entropy_coef * dist_R.entropy().mean()
 
         # Total loss cho Refine
         loss_refine = ppo_loss_R + entropy_loss_R
@@ -542,7 +533,7 @@ class ProposalFreePhase(BasePhase):
             'loss_refine': loss_refine,
             'metrics': {
                 'beta': beta,
-                'entropy_R': sum_ent_R.mean().item(),  # Đổi thành sum_ent_R
+                'entropy_R': entropy_loss_R.item(),  # Đổi thành sum_ent_R
                 'entropy_coef': self._current_entropy_coef,
                 'delta_norm': delta_norm,
                 'contribution_ratio': contrib_ratio,
