@@ -4,8 +4,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 from typing import Dict, Optional, Any, Tuple
-from matrix_source.agents.buffer.rollout_buffer import MultiAgentRolloutBuffer
-from matrix_source.agents.residual_net import ResidualCritic, RefineActor, ProposalActor, MFNetwork
+from matrix_source.agents.buffer.refinement_buffer import MultiAgentRolloutBuffer
+from matrix_source.agents.residual_net import ResidualCritic, RefineActor2, ProposalActor, MFNetwork
 from matrix_source.agents.phrase import ProposalFreePhase, ProposalOnlyPhase, BasePhase
 from matrix_source.trainers.ppo_stategy import compute_gae
 
@@ -16,6 +16,7 @@ class ResidualRoutingAgent:
     """
 
     def __init__(self,
+                 model_workload: torch.Tensor,
                  agent_id: int,
                  node_type: str,
                  service_state_dim: int,
@@ -37,12 +38,23 @@ class ResidualRoutingAgent:
                  exclude_zero: bool = False,
                  num_instances: int = 1,
                  device: Optional[str] = None,
-
+                 min_steps:int = 300,
+                 reward_stable_threshold:float = 0.1,
+                 reward_stable_window:int = 10,
+                 p_entropy_coef_start:float = 0.05,
+                 p_entropy_coef_end:float = 0.001,
+                 p_entropy_decay_rate:float = 0.995,
+                 alpha:float = 1.0,  # proposal (frozen)
+                 beta:float = 1.0,  # refine
+                 entropy_coef_start:float = 0.05,
+                 entropy_coef_end:float =0.001,  #
+                 entropy_decay_rate:float = 0.995,  # Decay
                  initial_phase: str = "ProposalOnly"):
 
         # ══════════════════════════════════════════
         # 1. BASIC SETUP
         # ══════════════════════════════════════════
+        self.model_workload= model_workload
         self.agent_id = agent_id
         self.node_type = node_type
         self.device = torch.device(
@@ -63,12 +75,12 @@ class ResidualRoutingAgent:
         self.eps_clip = clip_eps
         self.k_epochs = k_epochs
         self.batch_size = batch_size
-
+        self.min_batch_size= buffer_min_size
         # ══════════════════════════════════════════
         # 2. NETWORKS
         # ══════════════════════════════════════════
         TASK_DIM = 4
-        GENERAL_TASK_DIM = 7
+        GENERAL_TASK_DIM = 10
 
         self.mf_net = MFNetwork(
             input_dim=GENERAL_TASK_DIM + service_state_dim + mf_dim,
@@ -86,7 +98,7 @@ class ResidualRoutingAgent:
             num_instances=num_instances,
         ).to(self.device)
 
-        self.refine = RefineActor(
+        self.refine = RefineActor2(
             task_state=TASK_DIM,
             service_state=service_state_dim,
             mf_dim=mf_dim,
@@ -127,8 +139,21 @@ class ResidualRoutingAgent:
 
         # 5. PHASE REGISTRY
         self.phases: Dict[str, BasePhase] = {
-            "ProposalOnly": ProposalOnlyPhase(),
-            "ProposalFree": ProposalFreePhase(),
+            "ProposalOnly": ProposalOnlyPhase({
+                "min_steps": min_steps,
+                "reward_stable_threshold": reward_stable_threshold,
+                "reward_stable_window": reward_stable_window,
+                "entropy_coef_start": p_entropy_coef_start,
+                "entropy_coef_end": p_entropy_coef_end,
+                "entropy_decay_rate": p_entropy_decay_rate
+            }),
+            "ProposalFree": ProposalFreePhase({
+                'alpha': alpha,  # proposal (frozen)
+                'beta': beta,  # refine
+                'entropy_coef_start': entropy_coef_start,
+                'entropy_coef_end':entropy_coef_end,  #
+                'entropy_decay_rate': entropy_decay_rate,  # Decay
+            }),
         }
 
         self.phase_order = ["ProposalOnly", "ProposalFree"]
@@ -214,17 +239,19 @@ class ResidualRoutingAgent:
             'auto_transition': self.auto_transition_enabled,
         }
 
-    # ① INFERENCE (ROLLOUT)
     def choose_action(self, state, prev_mf, mask=None, agent_idx=0,
-                      task_state=None, deterministic=False):
+                      task_state=None, task_batch_size=None, service_idx=0, deterministic=False):
         """Wrapper cho single agent"""
         idx_t = torch.tensor([agent_idx], device=self.device)
+        svc_idx_t = torch.tensor([service_idx], device=self.device)
         if state.dim() == 1:
             state = state.unsqueeze(0)
         if prev_mf.dim() == 1:
             prev_mf = prev_mf.unsqueeze(0)
         if not isinstance(task_state, list):
             task_state = [task_state]
+        if not isinstance(task_batch_size, list) and task_batch_size is not None:
+            task_batch_size = [task_batch_size]
         if mask is not None and not isinstance(mask, list):
             mask = [mask]
 
@@ -232,6 +259,8 @@ class ResidualRoutingAgent:
             service_states=state,
             prev_mfs=prev_mf,
             task_states=task_state,
+            task_batch_sizes=task_batch_size,
+            service_indices=svc_idx_t,
             masks_batch=mask,
             agent_indices=idx_t,
             deterministic=deterministic,
@@ -239,8 +268,8 @@ class ResidualRoutingAgent:
         return actions[0], log_probs[0], values[0]
 
     def choose_action_batch(self, service_states, prev_mfs, task_states,
-                            masks_batch=None, agent_indices=None,
-                            deterministic=False):
+                            task_batch_sizes=None, service_indices=None, masks_batch=None, 
+                            agent_indices=None, deterministic=False):
         """
         Batch inference - dùng alpha/beta từ phase hiện tại để fusion
 
@@ -259,6 +288,8 @@ class ResidualRoutingAgent:
             agent_indices = torch.zeros(B, dtype=torch.long, device=device)
         else:
             agent_indices = agent_indices.to(device).view(-1)
+        
+        service_indices = service_indices.to(device).view(-1)
 
         service_states = service_states.to(device).float()
         prev_mfs = prev_mfs.to(device).float()
@@ -279,9 +310,20 @@ class ResidualRoutingAgent:
             )
 
             tasks_cat = torch.cat(task_states, dim=0).to(device).float()
+            
+            # Handle task batch sizes
+            if task_batch_sizes is not None:
+                bs_cat = torch.cat(task_batch_sizes, dim=0).to(device).float()
+            else:
+                bs_cat = torch.ones(total_tasks, device=device)
+
             svc_exp = service_states[batch_idx]
             mf_exp = pred_mfs[batch_idx]
             idx_exp = agent_indices[batch_idx]
+            s_idx_exp = service_indices[batch_idx]
+            
+            # Workload for each task (total_n, max_models)
+            workload_cat = self.model_workload[s_idx_exp].to(device)
 
             # 3. Mask Handling
             if masks_batch is not None:
@@ -300,9 +342,9 @@ class ResidualRoutingAgent:
             self.last_prop_logits_mean = prop_logits.detach().float().abs().mean()
 
             # 5. Compute histogram & overload (input cho Refine)
-            h_node, overload = self._compute_hist_and_overload(
+            h_node = self._compute_hist(
                 prop_logits.detach(), masks_exp, service_states,
-                batch_idx, B, total_tasks
+                batch_idx, B, total_tasks, bs_cat=bs_cat, workload_cat=workload_cat
             )
             self.proposal_load_var = h_node.var(dim=1).mean().item()
 
@@ -310,19 +352,17 @@ class ResidualRoutingAgent:
                 delta_logits = self.refine(
                     tasks_cat, svc_exp, mf_exp,
                     prop_logits.detach(),
-                    h_node[batch_idx], overload[batch_idx],
+                    h_node[batch_idx],
                     indices=idx_exp
                 )
             else:# Phase 1
                 delta_logits = torch.zeros_like(prop_logits)
 
-            self.equilibrium_load_var = h_node.var(dim=1).mean().item()
-
             # 7. Fusion: final = alpha * prop + beta * delta
             final_logits = alpha * prop_logits + beta * delta_logits
 
             # 8. Mask & Sanitize
-            final_logits = self._mask_and_sanitize(final_logits, masks_exp)
+            final_logits = self.mask_and_sanitize(final_logits, masks_exp)
 
             # 9. Action Selection
             if deterministic:
@@ -354,7 +394,8 @@ class ResidualRoutingAgent:
                                         prev_mfs, curr_mfs,
                                         actions, rewards, next_service_states,
                                         dones, agent_ids,
-                                        log_probs, values, masks=None):
+                                        log_probs, values, service_indices=None, 
+                                        masks=None, task_batch_sizes=None):
         """
         Store transitions to buffer AND train mean-field network.
 
@@ -369,7 +410,8 @@ class ResidualRoutingAgent:
         self.memory.add_batch(
             service_states, task_states, prev_mfs, curr_mfs,
             actions, rewards, next_service_states, dones,
-            log_probs, values, agent_ids, masks=masks
+            log_probs, values, agent_ids, service_indices=service_indices, 
+            masks=masks, task_batch_sizes=task_batch_sizes
         )
 
         return loss_mf
@@ -433,7 +475,8 @@ class ResidualRoutingAgent:
         # Unpack data
         (service_states, task_batch_cat, task_lens, actions_cat, action_lens,
          prev_mfs, curr_mfs, rewards, next_service_states, dones,
-         old_log_probs, old_values, masks, agent_ids) = data
+         old_log_probs, old_values, masks, agent_ids, 
+         batch_sizes_cat, service_indices_cat) = data
 
         # Move to device
         service_states = service_states.to(self.device).float()
@@ -518,7 +561,8 @@ class ResidualRoutingAgent:
                     idx, service_states, prev_mfs, old_log_probs,
                     advantages, returns, agent_ids, general_tasks,
                     detached_mfs_all, task_lens, task_offsets, all_flat_idx,
-                    task_batch_cat, actions_cat, all_masks
+                    task_batch_cat, actions_cat, all_masks, 
+                    batch_sizes_cat, service_indices_cat
                 )
 
                 # ── FORWARD PASS ──
@@ -528,10 +572,12 @@ class ResidualRoutingAgent:
                 )
 
                 # Compute histogram & overload (input cho Refine)
-                h_node, overload = self._compute_hist_and_overload(
+                h_node = self._compute_hist(
                     prop_logits.detach(), batch_data['masks_exp'],
                     batch_data['b_svc'], batch_data['batch_idx'],
-                    batch_data['B_sub'], batch_data['total_n']
+                    batch_data['B_sub'], batch_data['total_n'],
+                    bs_cat=batch_data['bs_cat'], 
+                    workload_cat=batch_data['workload_cat']
                 )
 
                 # Refine forward (chỉ khi beta > 0)
@@ -541,7 +587,6 @@ class ResidualRoutingAgent:
                         batch_data['mf_exp'],
                         prop_logits.detach(),
                         h_node[batch_data['batch_idx']],
-                        overload[batch_data['batch_idx']],
                         indices=batch_data['aids_exp']
                     )
                 else:
@@ -551,7 +596,6 @@ class ResidualRoutingAgent:
                 batch_data['prop_logits'] = prop_logits
                 batch_data['delta_logits'] = delta_logits
                 batch_data['h_node'] = h_node
-                batch_data['overload'] = overload
 
                 # ── DELEGATE TO PHASE ──
                 losses = self.current_phase.compute_losses(self, batch_data)
@@ -628,6 +672,7 @@ class ResidualRoutingAgent:
         self.memory.clear()
         return epoch_metrics['v'] / max(total_batches, 1)
 
+
     # ④ CHECKPOINT (Save Agent + All Phases)
     def save(self, path: str):
         """Lưu đầy đủ state của agent VÀ tất cả phases"""
@@ -695,7 +740,8 @@ class ResidualRoutingAgent:
     def _prepare_batch(self, idx, service_states, prev_mfs, old_log_probs,
                        advantages, returns, agent_ids, general_tasks,
                        detached_mfs_all, task_lens, task_offsets, all_flat_idx,
-                       task_batch_cat, actions_cat, all_masks):
+                       task_batch_cat, actions_cat, all_masks, 
+                       batch_sizes_cat, service_indices_cat):
         """Chuẩn bị data cho một mini-batch"""
         B_sub = len(idx)
 
@@ -729,6 +775,9 @@ class ResidualRoutingAgent:
         mf_exp = b_mf[batch_idx]
         aids_exp = b_aids[batch_idx]
         masks_exp = all_masks[idx][batch_idx] if all_masks is not None else None
+        bs_cat = batch_sizes_cat[flat_indices]
+        svc_idx_exp = service_indices_cat[idx][batch_idx]
+        workload_cat = self.model_workload[svc_idx_exp].to(self.device)
 
         return {
             'B_sub': B_sub,
@@ -748,6 +797,8 @@ class ResidualRoutingAgent:
             'mf_exp': mf_exp,
             'aids_exp': aids_exp,
             'masks_exp': masks_exp,
+            'bs_cat': bs_cat,
+            'workload_cat': workload_cat,
             'returns': b_ret,  # For critic
         }
 
@@ -760,13 +811,18 @@ class ResidualRoutingAgent:
     def _general_single(self, tasks):
         """Compute general features for a single agent's tasks"""
         if tasks.shape[0] == 0:
-            return torch.zeros(7, device=self.device)
+            return torch.zeros(10, device=self.device)
         t = tasks.float()
         mean = t.mean(dim=0)
         std = t.std(dim=0, correction=0) if t.shape[0] > 1 else torch.zeros_like(mean)
+        
+        # Tứ phân vị cho chiều thời gian (index 1)
+        time_dim = t[:, 1]
+        q = torch.quantile(time_dim, torch.tensor([0.25, 0.5, 0.75], device=self.device))
+        
         return torch.tensor([
-            mean[0], mean[1], float(t.shape[0]),
-            mean[2], std[2], mean[3], std[3]
+            float(t.shape[0]), mean[0], mean[1], std[1], 
+            mean[2], std[2], q[0], q[1], q[2], mean[3]
         ], dtype=torch.float32, device=self.device)
 
     def _unpack_task_batch(self, task_batch_cat, task_lens):
@@ -798,28 +854,29 @@ class ResidualRoutingAgent:
             z[:, 0] = -1e9
         return self._sanitize_logits(z)
 
-    def _compute_hist_and_overload(self, logits, masks_exp, svc_batch,
-                                   batch_idx, B_batch, total_n):
+    def _compute_hist(self, logits, masks_exp, svc_batch,
+                                   batch_idx, B_batch, total_n, bs_cat=None, workload_cat=None):
         """
-        Compute histogram (h_node) and overload metrics from logits.
-        Used as input for RefineActor.
+        Compute histogram (h_node)
         """
         logits_for_hist = logits.detach()
         if masks_exp is not None:
             logits_for_hist = logits_for_hist.masked_fill(masks_exp == 0, -1e9)
 
         probs = F.softmax(self._sanitize_logits(logits_for_hist), dim=-1)
-        probs_M = probs.view(total_n, self.M, self.max_models).sum(dim=2)
+        
+        # workload_cat is (total_n, max_models)
+        # probs is (total_n, M * max_models)
+        # We need (total_n, M) weighted workload
+        probs_reshaped = probs.view(total_n, self.M, self.max_models)
+        
+        probs_M = (probs_reshaped * workload_cat.unsqueeze(1)).sum(dim=2)
+
+        # Apply weighting by task batch size
+        probs_M = probs_M * bs_cat.view(-1, 1)
 
         h_node = torch.zeros(B_batch, self.M, device=self.device)
         h_node.scatter_add_(
             0, batch_idx.unsqueeze(1).expand(-1, self.M), probs_M
         )
-
-        f_v = svc_batch[:, :self.M]
-        capacity_dist = f_v / (f_v.sum(dim=1, keepdim=True) + 1e-8)
-        load_ratio = h_node / (capacity_dist + 1e-8)
-        mean_load_ratio = (load_ratio * capacity_dist).sum(dim=1, keepdim=True)
-        overload = (load_ratio - mean_load_ratio) / (mean_load_ratio + 1e-8)
-
-        return h_node, overload
+        return h_node/500.0

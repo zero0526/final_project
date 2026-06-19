@@ -78,6 +78,38 @@ class RefineActor(nn.Module):
         x = F.silu(self.norm2(self.fc2(x, indices), indices))
         return self.logits(x, indices)
 
+class RefineActor2(nn.Module):
+    """(task || svc || mf || proposal || hist || overload) → δlogits (Residual Correction)"""
+
+    def __init__(self, task_state, service_state, mf_dim,
+                 proposal_dim, action_dim,
+                 hidden_sizes, num_instances=1):
+        super().__init__()
+        h1, h2 = hidden_sizes
+        M = service_state // 2
+        hist_dim = M  # histogram + overload
+        in_dim = task_state + service_state + mf_dim + proposal_dim + hist_dim
+
+        self.fc1 = MultiInstanceLinear(num_instances, in_dim, h1)
+        self.norm1 = MultiInstanceRMSNorm(num_instances, h1)
+        self.fc2 = MultiInstanceLinear(num_instances, h1, h2)
+        self.norm2 = MultiInstanceRMSNorm(num_instances, h2)
+        self.logits = MultiInstanceLinear(num_instances, h2, action_dim)
+
+        # Khởi tạo bằng 0 để ở Phase 1 nó là hàm số 0 (không ảnh hưởng đến Proposal)
+        nn.init.xavier_uniform_(self.logits.weight, gain=1.0)
+        nn.init.normal_(self.logits.bias, std=0.1)
+
+    def forward(self, task, svc, mf, current_logits, histogram, overload, indices=None):
+        """current_logits: z_p (caller decides whether to .detach())"""
+        x = torch.cat([
+            task, svc, mf,
+            current_logits,
+            histogram, overload,
+        ], dim=-1)
+        x = F.silu(self.norm1(self.fc1(x, indices), indices))
+        x = F.silu(self.norm2(self.fc2(x, indices), indices))
+        return self.logits(x, indices)
 
 class ResidualCritic(nn.Module):
     """(general_task || svc || mf) → V(s)

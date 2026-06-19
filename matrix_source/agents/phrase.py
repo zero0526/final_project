@@ -16,8 +16,8 @@ class PhaseParameters:
     train_refine: bool = False
     freeze_proposal: bool = False
     freeze_refine: bool = True
-    grad_clip_proposal: float = 0.5
-    grad_clip_refine: float = 0.5
+    grad_clip_proposal: float = 1.0
+    grad_clip_refine: float = 1.0
     lr_proposal: Optional[float] = None  # None = dùng default
     lr_refine: Optional[float] = None
 
@@ -129,8 +129,7 @@ class ProposalOnlyPhase(BasePhase):
             'entropy_coef_end': 0.001,
             'entropy_decay_rate': 0.995,
             'min_steps': 5000,
-            'reward_threshold': -20.0,
-            'reward_stable_window': 100,  # Tăng từ 30 → 100
+            'reward_stable_window': 10,  # Tăng từ 30 → 100
             'reward_stable_threshold': 0.1,
             'lr_proposal': 3e-4,
             'lr_critic': 1e-3,
@@ -213,7 +212,6 @@ class ProposalOnlyPhase(BasePhase):
             lr_refine=None,
         )
 
-    # LOSS COMPUTATION
     def compute_losses(self, agent, batch_data) -> Dict[str, torch.Tensor]:
         """Tính loss cho Proposal only"""
         # Unpack batch
@@ -224,41 +222,47 @@ class ProposalOnlyPhase(BasePhase):
         masks_exp = batch_data['masks_exp']
         batch_idx = batch_data['batch_idx']
         B_sub = batch_data['B_sub']
-        b_t_lens = batch_data['b_t_lens']
+        # b_t_lens = batch_data['b_t_lens'] # Không còn cần dùng đến nữa
 
         # Final logits = alpha * proposal (beta = 0)
         final_logits = agent.mask_and_sanitize(prop_logits, masks_exp)
         dist = Categorical(logits=final_logits)
 
-        # PPO Loss
+        # ══════════════════════════════════════════
+        # 1. PPO Loss (Dùng nguyên Tổng Sum, KHÔNG CHIA)
+        # ══════════════════════════════════════════
         sum_lp = torch.zeros(B_sub, device=agent.device).scatter_add_(
             0, batch_idx, dist.log_prob(act_cat)
         )
-        new_lp = sum_lp / b_t_lens.float()
-        ratio = torch.exp(new_lp - old_log_probs)
+
+        # Lấy trực tiếp sum_lp trừ đi old_log_probs (cũng đang ở dạng tổng)
+        ratio = torch.exp(sum_lp - old_log_probs)
 
         ppo_loss = -torch.min(
             ratio * advantages,
             torch.clamp(ratio, 1 - agent.eps_clip, 1 + agent.eps_clip) * advantages
         ).mean()
 
-        # Entropy bonus (dùng _current_entropy_coef đã được decay trong step())
+        # ══════════════════════════════════════════
+        # 2. Entropy Bonus (Dùng nguyên Tổng Sum)
+        # ══════════════════════════════════════════
+        # sum_ent là tổng entropy của tất cả các task thuộc về 1 agent
         sum_ent = torch.zeros(B_sub, device=agent.device).scatter_add_(
             0, batch_idx, dist.entropy()
         )
-        ent_m = sum_ent / b_t_lens.float()
-        entropy_loss = -self._current_entropy_coef * ent_m.mean()
+
+        # Chỉ lấy trung bình (mean) theo Batch Size (B_sub)
+        entropy_loss = -self._current_entropy_coef * sum_ent.mean()
 
         return {
             'loss_proposal': ppo_loss + entropy_loss,
             'loss_refine': None,  # Không có refine loss
             'metrics': {
                 'entropy_coef': self._current_entropy_coef,
-                'entropy': ent_m.mean().item(),
+                'entropy': sum_ent.mean().item(),  # Log tổng entropy trung bình của agents
                 'ppo_loss': ppo_loss.item(),
             }
         }
-
     # TRANSITION LOGIC
     def should_transition(self, metrics: Dict[str, float]) -> Optional[str]:
         """
@@ -477,37 +481,45 @@ class ProposalFreePhase(BasePhase):
         masks_exp = batch_data['masks_exp']
         batch_idx = batch_data['batch_idx']
         B_sub = batch_data['B_sub']
-        b_t_lens = batch_data['b_t_lens']
+        # b_t_lens = batch_data['b_t_lens']  # ĐÃ BỎ: Không cần dùng nữa
 
         beta = self.hp['beta']
 
         # ══════════════════════════════════════════
         # REFINE LOSS ONLY (stop-gradient trên proposal)
         # ══════════════════════════════════════════
-        final_R = agent._mask_and_sanitize(
+
+        # SỬA 1: Bỏ dấu gạch dưới (_) ở hàm mask_and_sanitize
+        final_R = agent.mask_and_sanitize(
             prop_logits.detach() + beta * delta_logits,  # ← prop.detach() = frozen
             masks_exp
         )
         dist_R = Categorical(logits=final_R)
 
+        # ══════════════════════════════════════════
         # PPO Loss
+        # ══════════════════════════════════════════
         sum_lp_R = torch.zeros(B_sub, device=agent.device).scatter_add_(
             0, batch_idx, dist_R.log_prob(act_cat)
         )
-        new_lp_R = sum_lp_R / b_t_lens.float()
-        ratio_R = torch.exp(new_lp_R - old_log_probs)
+
+        # SỬA 2: KHÔNG chia cho b_t_lens. Trừ thẳng luôn!
+        ratio_R = torch.exp(sum_lp_R - old_log_probs)
 
         ppo_loss_R = -torch.min(
             ratio_R * advantages,
             torch.clamp(ratio_R, 1 - agent.eps_clip, 1 + agent.eps_clip) * advantages
         ).mean()
 
-        # Entropy bonus (cao để explore)
+        # ══════════════════════════════════════════
+        # Entropy bonus
+        # ══════════════════════════════════════════
         sum_ent_R = torch.zeros(B_sub, device=agent.device).scatter_add_(
             0, batch_idx, dist_R.entropy()
         )
-        ent_R = sum_ent_R / b_t_lens.float()
-        entropy_loss_R = -self._current_entropy_coef * ent_R.mean()
+
+        # SỬA 3: KHÔNG chia cho b_t_lens. Dùng luôn sum_ent_R.mean()
+        entropy_loss_R = -self._current_entropy_coef * sum_ent_R.mean()
 
         # Total loss cho Refine
         loss_refine = ppo_loss_R + entropy_loss_R
@@ -530,7 +542,7 @@ class ProposalFreePhase(BasePhase):
             'loss_refine': loss_refine,
             'metrics': {
                 'beta': beta,
-                'entropy_R': ent_R.mean().item(),
+                'entropy_R': sum_ent_R.mean().item(),  # Đổi thành sum_ent_R
                 'entropy_coef': self._current_entropy_coef,
                 'delta_norm': delta_norm,
                 'contribution_ratio': contrib_ratio,

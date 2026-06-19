@@ -92,8 +92,8 @@ class MultiInstanceActor(nn.Module):
         logits = self.forward(state, mf, indices)
 
         # Apply zeta (temperature scaling)
-        # if zeta != 1.0:
-        #     logits = logits * zeta
+        if zeta is not None:
+            logits = logits * zeta
 
         if masks is not None:
             logits = logits.masked_fill(masks == 0, -1e9)
@@ -176,9 +176,9 @@ class PPOAgent:
         self.entropy_coef = entropy_coef          # Giá trị đang dùng hiện tại
         self.entropy_decay_rate = 0.99          # Tốc độ giảm sau mỗi lần learn (thử 0.999 - 0.9999)
         self.min_entropy_coef = 0.001             # Giá trị nhỏ nhất cho phép (không để nó bằng 0 hoàn toàn)
-        self.zeta= 0.6
-        self.zeta_decay_rate = 0.99
-        self.max_zeta = 5
+        self.zeta= 0.95
+        self.zeta_decay_rate = 0.9995
+        self.max_zeta = 2
         # PPO Hyperparameters
         self.gamma = gamma
         self.lmbda = lam
@@ -250,7 +250,7 @@ class PPOAgent:
                 logits = logits.masked_fill(zero_mask, -1e9)
 
             # Apply zeta (temperature scaling)
-            if zeta != 1.0:
+            if self.zeta is not None:
                 logits = logits * self.zeta
 
             # 4. Sample actions
