@@ -64,8 +64,8 @@ class RefineActor(nn.Module):
         self.logits = MultiInstanceLinear(num_instances, h2, action_dim)
 
         # Khởi tạo bằng 0 để ở Phase 1 nó là hàm số 0 (không ảnh hưởng đến Proposal)
-        nn.init.xavier_uniform_(self.delta_head.weight, gain=1.0)
-        nn.init.normal_(self.delta_head.bias, std=0.1)
+        nn.init.xavier_uniform_(self.logits.weight, gain=1.0)
+        nn.init.normal_(self.logits.bias, std=0.1)
 
     def forward(self, task, svc, mf, current_logits, histogram, overload, indices=None):
         """current_logits: z_p (caller decides whether to .detach())"""
