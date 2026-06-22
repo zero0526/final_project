@@ -348,10 +348,16 @@ class ResidualRoutingAgent:
             )
             self.proposal_load_var = h_node.var(dim=1).mean().item()
 
+            # Sanitize prop_logits & Apply Mask before Softmax
+            sanitized_prop = prop_logits.detach()
+            if masks_exp is not None:
+                sanitized_prop = sanitized_prop.masked_fill(masks_exp == 0, -1e9)
+            prop_probs = F.softmax(sanitized_prop, dim=-1)
+
             if beta > 0:# 6. Refinement Forward (chỉ khi beta > 0)
                 delta_logits = self.refine(
                     tasks_cat, svc_exp, mf_exp,
-                    prop_logits.detach(),
+                    prop_probs,
                     h_node[batch_idx],
                     indices=idx_exp
                 )
@@ -374,6 +380,11 @@ class ResidualRoutingAgent:
                 log_probs_cat = dist.log_prob(actions_cat)
 
             # 10. Unflatten & Aggregate
+            # Calculate exact prop_probs_mean per agent (B) 
+            # Note: prop_probs already mask-filtered above
+            sum_prop = torch.zeros(B, self.u_action_dim, device=device).scatter_add_(
+                0, batch_idx.unsqueeze(-1).expand(-1, self.u_action_dim), prop_probs
+            )
             task_lens_list = task_lens.cpu().tolist()
             all_actions = list(actions_cat.split(task_lens_list))
 
@@ -582,10 +593,14 @@ class ResidualRoutingAgent:
 
                 # Refine forward (chỉ khi beta > 0)
                 if phase_params.beta > 0 and phase_params.train_refine:
+                    sanitized_prop = prop_logits.detach()
+                    if batch_data['masks_exp'] is not None:
+                        sanitized_prop = sanitized_prop.masked_fill(batch_data['masks_exp'] == 0, -1e9)
+                    
                     delta_logits = self.refine(
                         batch_data['t_cat'], batch_data['svc_exp'],
                         batch_data['mf_exp'],
-                        prop_logits.detach(),
+                        F.softmax(sanitized_prop, dim=-1),
                         h_node[batch_data['batch_idx']],
                         indices=batch_data['aids_exp']
                     )

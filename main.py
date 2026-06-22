@@ -7,7 +7,7 @@ from matrix_source.trainers.semi_distribute_task import GRUPPOSCAFFOLDREPStrateg
 from matrix_source.trainers.residual_routing_ppo import ResidualRoutingPPOStrategy
 from matrix_source.trainers.refinement import RefinementStrategy
 from matrix_source.configs.configs import cfg
-cfg.hyper_neural["NUM_LOWER_AGENTS"]= 20
+cfg.hyper_neural["NUM_LOWER_AGENTS"]= 100
 
 if __name__ == '__main__':
     strategy = RefinementStrategy()
