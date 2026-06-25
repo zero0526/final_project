@@ -46,7 +46,7 @@ class ResidualRoutingAgent:
         self.min_entropy_coef = 0.001
 
         TASK_DIM = 4
-        GENERAL_TASK_DIM = 7
+        GENERAL_TASK_DIM = 15  # 7 base + 4 quantiles × 2 cols (col1, col2)
 
         # ── Networks ──
         self.mf_net = MFNetwork(
@@ -57,12 +57,14 @@ class ResidualRoutingAgent:
         self.proposal = ProposalActor(
             task_state=TASK_DIM, service_state=service_state_dim, mf_dim=mf_dim,
             action_dim=u_action_dim, hidden_sizes=hidden_sizes, num_instances=num_instances,
+            general_task_dim=GENERAL_TASK_DIM,
         ).to(self.device)
 
         self.refine = RefineActor(
             task_state=TASK_DIM, service_state=service_state_dim, mf_dim=mf_dim,
             proposal_dim=proposal_dim, action_dim=u_action_dim,
             hidden_sizes=hidden_sizes, num_instances=num_instances,
+            general_task_dim=GENERAL_TASK_DIM,
         ).to(self.device)
 
         # CRITIC KHÔNG NHẬN h_star (hist_dim)
@@ -113,12 +115,21 @@ class ResidualRoutingAgent:
         return self._general_single(task_states)
 
     def _general_single(self, tasks):
-        if tasks.shape[0] == 0: return torch.zeros(7, device=self.device)
+        if tasks.shape[0] == 0: return torch.zeros(15, device=self.device)
         t = tasks.float()
         mean = t.mean(dim=0)
         std = t.std(dim=0, correction=0) if t.shape[0] > 1 else torch.zeros_like(mean)
-        return torch.tensor([mean[0], mean[1], float(t.shape[0]), mean[2], std[2], mean[3], std[3]], 
-                            dtype=torch.float32, device=self.device)
+        # Tứ phân vị cho cột 1 và cột 2, q3
+        q = torch.tensor([0.25, 0.50, 0.75, 0.95], dtype=torch.float32, device=self.device)
+        q2 = torch.quantile(t[:, 2], q)  # p25/p50/p75/p95 của cột 1
+        q3 = torch.quantile(t[:, 3], q)  # p25/p50/p75/p95 của cột 2
+        return torch.cat([
+            torch.tensor([mean[0], mean[1], float(t.shape[0]), mean[2], std[2]],
+                         dtype=torch.float32, device=self.device),
+            q2,   # 4 giá trị: p25/p50/p75/p95 cột 2
+            torch.tensor([mean[3], std[3]], dtype=torch.float32, device=self.device),
+            q3,   # 4 giá trị: p25/p50/p75/p95 cột 3
+        ])  # tổng = 5 + 4 + 2 + 4 = 15
 
     def choose_action_batch(self, service_states, prev_mfs, task_states, masks_batch=None,
                             agent_indices=None, deterministic=False, phrase="Proposal_Free"):
@@ -142,6 +153,7 @@ class ResidualRoutingAgent:
 
             tasks_cat = torch.cat(task_states, dim=0).to(device).float()
             svc_exp, mf_exp, idx_exp = service_states[batch_idx], pred_mfs[batch_idx], agent_indices[batch_idx]
+            gen_exp = general_task[batch_idx]  # broadcast general_task xuống từng task
 
             if masks_batch is not None:
                 masks_exp = torch.stack(masks_batch).to(device)[batch_idx] if masks_batch[0].dim() == 1 else torch.cat(
@@ -149,7 +161,7 @@ class ResidualRoutingAgent:
             else:
                 masks_exp = None
 
-            prop_logits = self.proposal(tasks_cat, svc_exp, mf_exp, indices=idx_exp)
+            prop_logits = self.proposal(gen_exp, tasks_cat, svc_exp, mf_exp, indices=idx_exp)
             self.last_prop_logits_mean = prop_logits.detach().float().abs().mean()
             # Tính h_node CHỈ ĐỂ BỎ VÀO REFINE ACTOR
             h_node, overload = self._compute_hist_and_overload(prop_logits.detach(), masks_exp, service_states,
@@ -159,7 +171,7 @@ class ResidualRoutingAgent:
             if phrase == "Proposal_Only":
                 delta_logits = torch.zeros_like(prop_logits)
             else:
-                delta_logits = self.refine(tasks_cat, svc_exp, mf_exp, prop_logits.detach(), h_node[batch_idx],
+                delta_logits = self.refine(gen_exp, tasks_cat, svc_exp, mf_exp, prop_logits.detach(), h_node[batch_idx],
                                            overload[batch_idx], indices=idx_exp)
 
             self.equilibrium_load_var = h_node.var(dim=1).mean().item()
@@ -316,19 +328,20 @@ class ResidualRoutingAgent:
 
                 batch_idx = torch.repeat_interleave(torch.arange(B_sub, device=self.device), b_t_lens)
                 svc_exp, mf_exp, aids_exp = b_svc[batch_idx], b_mf[batch_idx], b_aids[batch_idx]
+                gen_exp = b_gen[batch_idx]  # broadcast general_task xuống từng task
                 masks_exp = all_masks[idx][batch_idx] if all_masks is not None else None
 
                 # ══════════════════════════════════════════
                 # 1. FORWARD PASS
                 # ══════════════════════════════════════════
-                prop_logits = self.proposal(t_cat, svc_exp, mf_exp, indices=aids_exp)
+                prop_logits = self.proposal(gen_exp, t_cat, svc_exp, mf_exp, indices=aids_exp)
                 h_node, overload = self._compute_hist_and_overload(prop_logits.detach(), masks_exp, b_svc, batch_idx,
                                                                    B_sub, total_n)
 
                 if phrase == "Proposal_Only":
                     delta_logits = torch.zeros_like(prop_logits)
                 else:
-                    delta_logits = self.refine(t_cat, svc_exp, mf_exp, prop_logits.detach(), h_node[batch_idx],
+                    delta_logits = self.refine(gen_exp, t_cat, svc_exp, mf_exp, prop_logits.detach(), h_node[batch_idx],
                                                overload[batch_idx], indices=aids_exp)
 
                 # ══════════════════════════════════════════
@@ -352,6 +365,7 @@ class ResidualRoutingAgent:
 
                 elif phrase == "Proposal_Free":
                     # Nhánh Proposal (Stop-gradient đối với Refine)
+                    # Recompute prop_logits với grad (delta detached) cho loss_proposal
                     z_P = apply_mask_and_sanitize(prop_logits + self.alpha * delta_logits.detach())
                     dist_P = Categorical(logits=z_P)
                     sum_lp_P = torch.zeros(B_sub, device=self.device).scatter_add_(0, batch_idx,
