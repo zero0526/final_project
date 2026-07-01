@@ -8,7 +8,7 @@
                 "y": "248.0"
             },
             "specs": {
-                "cpu": 5600.0,
+                "cpu": 56000.0,
                 "ram": 80,
                 "hdd": 80,
                 "is_computing": true
@@ -78,7 +78,7 @@
                 "y": "151.0"
             },
             "specs": {
-                "cpu": 3134.57,
+                "cpu": 31340.57,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -92,7 +92,7 @@
                 "y": "323.0"
             },
             "specs": {
-                "cpu": 3133.85,
+                "cpu": 31330.85,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -106,7 +106,7 @@
                 "y": "298.0"
             },
             "specs": {
-                "cpu": 3610.43,
+                "cpu": 36100.43,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -134,7 +134,7 @@
                 "y": "403.0"
             },
             "specs": {
-                "cpu": 1031.83,
+                "cpu": 10310.83,
                 "ram": 10,
                 "hdd": 10,
                 "is_computing": true
@@ -148,7 +148,7 @@
                 "y": "132.0"
             },
             "specs": {
-                "cpu": 3434.41,
+                "cpu": 34340.41,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -162,7 +162,7 @@
                 "y": "466.0"
             },
             "specs": {
-                "cpu": 3551.88,
+                "cpu": 35510.88,
                 "ram": 20,
                 "hdd": 10,
                 "is_computing": true
@@ -190,7 +190,7 @@
                 "y": "218.0"
             },
             "specs": {
-                "cpu": 853.17,
+                "cpu": 8530.17,
                 "ram": 10,
                 "hdd": 10,
                 "is_computing": true
