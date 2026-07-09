@@ -54,6 +54,8 @@ class MetricsAggregator:
         self.episode_assigned_list = []
         self.episode_failed_list = []
         self.episode_realized_delay = []
+        self.episode_virtual_drift = []
+        self.episode_ttl_penalty = []
         
         # Training/State tracking
         self.episode_upper_mf_losses = []
@@ -108,10 +110,13 @@ class MetricsAggregator:
             
         info = step_output.get("info", {})
         obs = step_output.get("obs", {})
-        if obs: self.episode_backlog_drift.append(obs.get("total_drift", 0))
+        if obs: 
+            self.episode_backlog_drift.append(obs.get("total_drift", 0))
+            self.episode_virtual_drift.append(obs.get("virtual_drift", 0))
         
         self.episode_energy.append(step_output.get("energy", 0))
         self.episode_violations.append(step_output.get("violations", 0))
+        self.episode_ttl_penalty.append(info.get("ttl_penalty_val", 0))
 
         # Lazy summation of QoS vectors
         def _sum(v): return v.float().sum() if isinstance(v, torch.Tensor) else v
@@ -130,11 +135,9 @@ class MetricsAggregator:
                 self.episode_terminal_fails = np.zeros_like(term_fails)
             self.episode_terminal_fails += term_fails
         
-        r_delay = info.get("realized_delay", {})
-        if r_delay:
-            # Vectorized mean of all delays in the dict (each value is a tensor)
-            delays = [torch.mean(v) for v in r_delay.values()]
-            self.episode_realized_delay.append(torch.stack(delays).mean())
+        r_delay = info.get("realized_delay")
+        if r_delay is not None and r_delay.numel() > 0:
+            self.episode_realized_delay.append(r_delay.mean() / 10)
 
         # Failure reasons
         reasons = info.get("fail_reasons")
@@ -226,8 +229,10 @@ class MetricsAggregator:
         self.history["completion_rate"].append(success / total_resolved if total_resolved > 0 else 0.0)
         self.history["avg_backlog_drift"].append(_get_avg(self.episode_backlog_drift, "avg_backlog_drift"))
         self.history["avg_remaining_tasks"].append(_get_avg(self.episode_remaining_tasks, "avg_remaining_tasks"))
-        self.history["avg_realized_delay"].append(_get_avg(self.episode_realized_delay, "avg_realized_delay"))
+        self.history["realized_delay"].append(_get_avg(self.episode_realized_delay, "realized_delay"))
+        self.history["avg_virtual_drift"].append(_get_avg(self.episode_virtual_drift, "avg_virtual_drift"))
         self.history["total_violations"].append(violate)
+        self.history["avg_ttl_penalty"].append(_get_avg(self.episode_ttl_penalty, "avg_ttl_penalty"))
         self.history["qos_rate"].append(success / (violate if violate > 0 else 1.0))
         self.history["avg_prop_logits"].append(_get_avg(self.episode_prop_logits, "avg_prop_logits"))
 
@@ -247,7 +252,9 @@ class MetricsAggregator:
         total_success = sum(self.episode_success_qos)
         total_failed = sum(self.episode_violate_qos)
         
-        self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%} | OK: {total_success:4.0f} | FAIL: {total_failed:4.0f}")
+        delay = self.history["realized_delay"][-1] if self.history["realized_delay"] else 0
+        
+        self.log(f"EP {ep:4d} | Rew: {tr:8.2f} | Delay: {delay:6.2f} | Energy: {en:8.2f} | QoS: {qos:6.2%} | Comp: {cr:6.2%} | OK: {total_success:4.0f} | FAIL: {total_failed:4.0f}")
         
         if self.episode_terminal_fails is not None and np.sum(self.episode_terminal_fails) > 0:
             pass
@@ -281,18 +288,23 @@ class MetricsAggregator:
 
     def plot_history(self, ep=None):
         if not self.history["total_reward"]: return
-        fig, axes = plt.subplots(3, 3, figsize=(18, 16))
+        fig, axes = plt.subplots(4, 3, figsize=(18, 16))
         plt.suptitle(f"Training Progress (Episode {len(self.history['total_reward'])})", fontsize=16)
         
         window = 10
         metrics = [
-            ("total_reward",       "Reward Convergence",       "blue"),
-            ("avg_backlog_drift",   "System Stability (Drift)", "green"),
-            ("total_energy",        "Energy Consumption",       "orange"),
-            ("avg_realized_delay",  "Delay Evolution",          "red"),
-            ("qos_success_rate",    "QoS Satisfaction",         "purple"),
-            ("completion_rate",     "Task Throughput",          "blue"),
-            ("avg_prop_logits",     "Proposal Logits (mean |z|)", "teal"),
+            ("total_reward", "Reward Convergence", "blue"),
+            ("avg_backlog_drift", "System Stability (Drift)", "green"),
+            ("total_energy", "Energy Consumption", "orange"),
+            ("realized_delay", "Delay Evolution", "red"),
+            ("qos_success_rate", "QoS Satisfaction", "purple"),
+            ("completion_rate", "Task Throughput", "blue"),
+            ("avg_upper_td_loss", "Upper TD Loss", "brown"),
+            ("avg_lower_td_loss", "Lower TD Loss", "cyan"),
+            ("avg_upper_mf_loss", "Upper MF Loss", "olive"),
+            ("avg_lower_mf_loss", "Lower MF Loss", "pink"),
+            ("avg_ttl_penalty", "TTL Penalty", "red"),
+            ("avg_virtual_drift", "Virtual Drift (Cheating Penalty)", "orange")
         ]
 
         for i, (key, title, color) in enumerate(metrics):
@@ -300,22 +312,21 @@ class MetricsAggregator:
             data = self.history.get(key, [])
             if not data:
                 ax.set_title(title)
-                ax.set_visible(True)
+                ax.grid(True)
                 continue
-
+            
+            # Plot raw data with transparency
             ax.plot(data, color=color, alpha=0.3, label="Raw")
+            
+            # Plot MA-10
             if len(data) >= window:
                 ma_data = self._moving_average(data, window)
                 ax.plot(range(window-1, len(data)), ma_data, color=color, linewidth=2, label=f"MA-{window}")
-
+            
             ax.set_title(title)
-            ax.legend()
+            # ax.legend()
             ax.grid(True)
-
-        # Hide unused subplots (index 7 and 8)
-        for j in range(len(metrics), 9):
-            axes[j // 3, j % 3].set_visible(False)
-
+            
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         filename = f"{self.name.lower()}_progress_training.png"
         plt.savefig(os.path.join(cfg.plot_dir, filename))
@@ -325,8 +336,15 @@ class MetricsAggregator:
         path = os.path.join(cfg.results, "training_history.csv")
         if not os.path.exists(cfg.results): os.makedirs(cfg.results)
         keys = sorted(self.history.keys())
+        max_len = max(len(self.history[k]) for k in keys) if keys else 0
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(keys)
-            for i in range(len(self.history[keys[0]])):
-                writer.writerow([self.history[k][i] for k in keys])
+            for i in range(max_len):
+                row = []
+                for k in keys:
+                    if i < len(self.history[k]):
+                        row.append(self.history[k][i])
+                    else:
+                        row.append(0.0)
+                writer.writerow(row)

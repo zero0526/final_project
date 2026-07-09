@@ -36,6 +36,7 @@ class MatrixPhysicalEngine:
         # Reward Weights
         self.omega_1 = config.hyper_neural["OMEGA_Q1"]
         self.omega_2 = config.hyper_neural["OMEGA_Q2"]
+        self.omega_ttl = config.hyper_neural.get("OMEGA_TTL", 10)
         
         # State Tensors
         self.num_nodes = self.resource_specs.shape[0]
@@ -46,6 +47,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.backlog_counts = torch.zeros((self.num_nodes, self.num_services), dtype=torch.long, device=self.device)
         self.deadline_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
+        self.age_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         self.f_min_queue = torch.zeros((self.num_nodes, self.num_services, self.max_K), device=self.device)
         
         self.cpu_alloc_matrix = torch.zeros((self.num_nodes, self.num_services), device=self.device)
@@ -105,6 +107,7 @@ class MatrixPhysicalEngine:
         self.backlog_queue.zero_()
         self.backlog_counts.zero_()
         self.deadline_queue.zero_()
+        self.age_queue.zero_()
         self.f_min_queue.zero_()
         self.immediate_fails.zero_()
         self.fail_placement.zero_()
@@ -381,6 +384,7 @@ class MatrixPhysicalEngine:
                     vq_n, vq_s, vq_k = v_hw_n[valid_queue_mask], v_hw_s[valid_queue_mask], absolute_ks[valid_queue_mask]
                     self.backlog_queue[vq_n, vq_s, vq_k] = v_hw_w[valid_queue_mask]
                     self.deadline_queue[vq_n, vq_s, vq_k] = v_hw_t[valid_queue_mask]
+                    self.age_queue[vq_n, vq_s, vq_k] = trans_delays[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     self.f_min_queue[vq_n, vq_s, vq_k] = v_hw_fmin[valid_queue_mask]
                     self.terminal_queue[vq_n, vq_s, vq_k] = terminal_indices[valid_mask][hw_mask][sort_idx][valid_queue_mask]
                     
@@ -429,15 +433,17 @@ class MatrixPhysicalEngine:
         # Terminal -> source node mapping (num_terminals,)
         src_node_mapping = torch.argmax(self.terminal_to_node_map, dim=1).long()
         
-        self.backlog_queue, actual_processed, local_processed = ops.deplete_float_queue(
-            self.backlog_queue, self.deadline_queue, self.terminal_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
+        self.backlog_queue, actual_processed, local_processed, realized_delays = ops.deplete_float_queue(
+            self.backlog_queue, self.deadline_queue, self.terminal_queue, self.age_queue, src_node_mapping, self.cpu_alloc_matrix, self.slot_duration
         )
         
-        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids = ops.age_and_clean_dual_queue(
-            self.backlog_queue, self.deadline_queue, self.slot_duration, self.f_min_queue, self.terminal_queue
+        self.backlog_queue, self.deadline_queue, processed_aux, expired_counts_tensor, failed_terminal_ids, failed_svc_ids, failed_workload_total = ops.age_and_clean_dual_queue(
+            self.backlog_queue, self.deadline_queue, self.slot_duration, self.age_queue, self.f_min_queue, self.terminal_queue
         )
+        
+        self.rejected_workload_step += failed_workload_total
 
-        self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1]
+        self.age_queue, self.f_min_queue, self.terminal_queue = processed_aux[0], processed_aux[1], processed_aux[2]
         
         if failed_terminal_ids is not None and len(failed_terminal_ids) > 0:
             self.terminal_fail_counts.index_put_((failed_terminal_ids.long(), failed_svc_ids.long()), torch.ones_like(failed_terminal_ids, dtype=torch.float), accumulate=True)
@@ -479,11 +485,15 @@ class MatrixPhysicalEngine:
         # Refined QoS penalty
         qos_penalty = self.omega_1 * torch.exp(num_violations.float()*0.12)
         
-        reward = -(f1 +qos_penalty)
+        active_mask = self.backlog_queue > 0
+        tau = self.slot_duration * 3.0
+        urgency_weights = torch.exp(-self.deadline_queue[active_mask] / tau + 2)
+        ttl_penalty_val = (self.backlog_queue[active_mask] * urgency_weights).sum()
+        
+        reward = -(f1 + qos_penalty)
         obs = {
             "virtual_drift": virtual_drift,
             "total_drift": total_drift,
-            "virtual_drift": virtual_drift,
             # N x S: CPU capacity spent on externally-offloaded tasks
             "external_snack": external_snack.clone(),
             "task_reqs": self.current_task_reqs.clone(),
@@ -493,6 +503,7 @@ class MatrixPhysicalEngine:
         info = {
             "num_tasks": self.current_num_tasks,
             "external_snack": external_snack.clone(),
+            "realized_delay": realized_delays.clone() if realized_delays is not None else torch.tensor([], device=self.device),
             "immediate_fails": self.immediate_fails.sum(),
             "expired_count": violate_step_tensor.sum() - self.immediate_fails.sum(),
             "remaining": self.backlog_counts.sum(),
@@ -508,7 +519,8 @@ class MatrixPhysicalEngine:
                 "expired": expired_counts_tensor.sum(),
                 "hw_deficit_per_svc": self.service_hw_deficit,
                 "hw_fail_count_per_svc": self.service_hw_fail_count
-            }
+            },
+            "ttl_penalty_val": self.omega_ttl * ttl_penalty_val.clone() if hasattr(ttl_penalty_val, 'clone') else self.omega_ttl * ttl_penalty_val
         }
         res = {
             "pre_reward": -total_energy,
