@@ -129,8 +129,8 @@ class Trainer:
                 self.zeta_lower_max
             )
     def config_scenario(self, num_terminals=20):
-        self.strategy.max_cycles = 950
-        self.strategy.proposal_only_cycles= 950
+        self.strategy.max_cycles = 1000
+        self.strategy.proposal_only_cycles=  1000
         if num_terminals == 20:
             cfg.hyper_neural["NUM_LOWER_AGENTS"]= 20
             cfg.norm_upper_rw= 1_000_000_0.0

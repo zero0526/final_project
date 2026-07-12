@@ -8,7 +8,9 @@ from matrix_source.trainers.residual_routing_ppo import ResidualRoutingPPOStrate
 from matrix_source.configs.configs import cfg
 
 if __name__ == '__main__':
+    num_terminals= 20
+    cfg.hyper_neural["NUM_LOWER_AGENTS"] = num_terminals
     strategy = ResidualRoutingPPOStrategy()
     trainer = Trainer(strategy=strategy)
-    trainer.config_scenario(num_terminals=20)
-    trainer.train()
+    trainer.config_scenario(num_terminals=num_terminals)
+    trainer.train(max_cycles_finetune=1000)

@@ -168,7 +168,7 @@ class D3QNAgent:
         self.prev_loss = 0.0
         self.learn_step_counter = 0
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0):
+    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0, deterministic=False):
         # Single agent usage (fallback or legacy)
         idx_tensor = torch.tensor([agent_idx], device=self.device)
         actions = self.choose_action_batch(
@@ -177,11 +177,12 @@ class D3QNAgent:
             epsilon, 
             zeta,
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
-            agent_indices=idx_tensor
+            agent_indices=idx_tensor,
+            deterministic=deterministic
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None):
+    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None, deterministic=False):
         batch_size = states_batch.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -204,7 +205,7 @@ class D3QNAgent:
 
         # 1. Per-Agent Cold-Start Check
         is_policy_agent = torch.tensor([
-            self.memory.get_len(aid.item()) >= self.min_batch_size 
+            (self.memory.get_len(aid.item()) >= self.min_batch_size) or deterministic
             for aid in agent_indices
         ], device=self.device)
         
@@ -250,10 +251,13 @@ class D3QNAgent:
                 else:
                     random_probs = random_probs / self.u_action_dim
 
-                if random.random() < epsilon:
+                if random.random() < epsilon and not deterministic:
                     final_actions[indices] = torch.multinomial(random_probs, 1).squeeze(1)
                 else:
-                    final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
+                    if deterministic:
+                        final_actions[indices] = q_values.argmax(dim=1)
+                    else:
+                        final_actions[indices] = torch.multinomial(probs_boltzmann, 1).squeeze(1)
 
         return final_actions
 

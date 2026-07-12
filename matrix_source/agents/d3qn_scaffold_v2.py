@@ -257,18 +257,19 @@ class D3QNAgentV2:
 
     # ── Action selection (unchanged from v1) ──────────────────────────────────
 
-    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0):
+    def choose_action(self, state, prev_mf, epsilon, zeta, mask=None, agent_idx=0, deterministic=False):
         idx_tensor = torch.tensor([agent_idx], device=self.device)
         actions = self.choose_action_batch(
             state.unsqueeze(0) if not torch.is_tensor(state) else state.detach().unsqueeze(0),
             prev_mf.unsqueeze(0) if not torch.is_tensor(prev_mf) else prev_mf.detach().unsqueeze(0),
             epsilon, zeta,
             masks_batch=mask.unsqueeze(0) if mask is not None else None,
-            agent_indices=idx_tensor
+            agent_indices=idx_tensor,
+            deterministic=deterministic
         )
         return int(actions[0])
 
-    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None):
+    def choose_action_batch(self, states_batch, prev_mfs_batch, epsilon, zeta, masks_batch=None, agent_indices=None, deterministic=False):
         batch_size = states_batch.shape[0]
         if agent_indices is None:
             agent_indices = torch.zeros(batch_size, dtype=torch.long, device=self.device)
@@ -282,7 +283,7 @@ class D3QNAgentV2:
         prev_mfs_batch = prev_mfs_batch.to(self.device).float()
 
         is_policy_agent = torch.tensor([
-            self.memory.get_len(aid.item()) >= self.min_batch_size
+            (self.memory.get_len(aid.item()) >= self.min_batch_size) or deterministic
             for aid in agent_indices
         ], device=self.device)
 
@@ -318,6 +319,9 @@ class D3QNAgentV2:
                 if self.exclude_zero and self.u_action_dim > 1:
                     q_values[:, 0] -= 1e10
 
+                # ── Sửa lỗi: Lấy argmax trên q_values CHƯA CLAMP để không làm mất tác dụng của masks ──
+                q_values_unclamped = q_values.clone()
+
                 # Guard: clamp q_values to prevent softmax overflow
                 q_values = torch.nan_to_num(q_values, nan=0.0, posinf=50.0, neginf=-50.0)
                 q_values = q_values.clamp(-50.0, 50.0)
@@ -331,7 +335,20 @@ class D3QNAgentV2:
                         probs[bad_rows] = (masks_batch[indices][bad_rows].float() + 1e-8)
                     probs[bad_rows] = probs[bad_rows] / probs[bad_rows].sum(dim=1, keepdim=True)
 
-                final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
+                if random.random() < epsilon and not deterministic:
+                    # epsilon-greedy random action
+                    random_probs = torch.ones_like(q_values)
+                    if masks_batch is not None:
+                        m = masks_batch[indices]
+                        random_probs = m / m.sum(dim=1, keepdim=True).clamp(min=1e-8)
+                    else:
+                        random_probs = random_probs / self.u_action_dim
+                    final_actions[indices] = torch.multinomial(random_probs, 1).squeeze(1)
+                else:
+                    if deterministic:
+                        final_actions[indices] = q_values_unclamped.argmax(dim=1)
+                    else:
+                        final_actions[indices] = torch.multinomial(probs, 1).squeeze(1)
 
         return final_actions.tolist()
 
