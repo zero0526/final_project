@@ -69,8 +69,42 @@ class Trainer:
         self.aggregator.name = self.strategy.__class__.__name__
         self.strategy.initialize_agents(self)
 
-    def train(self):
-        self.strategy.run_training(self)
+    def train(self, resume_from=None, save_every=None, save_dir="checkpoints", **kwargs):
+        """
+        Runs the injected strategy's training loop with support for checkpoint loading and saving.
+        """
+        if save_every is None:
+            strat_name = self.strategy.__class__.__name__
+            if "PPO" in strat_name:
+                save_every = 1
+            else:
+                save_every = 500
+
+        self.strategy.run_training(
+            self,
+            resume_from=resume_from,
+            save_every=save_every,
+            save_dir=save_dir,
+            **kwargs
+        )
+
+    def evaluate(self, checkpoint_dir, num_eval_eps=10, label=None, plot_dir="eval_results", compare_results=None, **kwargs):
+        """
+        Runs greedy evaluation episodes using the model weights loaded from checkpoint_dir,
+        computes the standard performance metrics, and plots the results.
+        """
+        if label is None:
+            label = self.strategy.__class__.__name__.replace("Strategy", "")
+        
+        return self.strategy.evaluate(
+            self,
+            checkpoint_dir=checkpoint_dir,
+            num_eval_eps=num_eval_eps,
+            label=label,
+            plot_dir=plot_dir,
+            compare_results=compare_results,
+            **kwargs
+        )
 
     def update_rates(self, ep):
         # 1. Update Epsilons using exponential decay: eps = eps_end + (eps_start - eps_end) * exp(-t / tau)
@@ -94,7 +128,22 @@ class Trainer:
                 self.zeta_initial_lower + self.zeta_lower_step * (ep - self.zeta_lower_warmup),
                 self.zeta_lower_max
             )
-
+    def config_scenario(self, num_terminals=20):
+        self.strategy.max_cycles = 950
+        self.strategy.proposal_only_cycles= 950
+        if num_terminals == 20:
+            cfg.hyper_neural["NUM_LOWER_AGENTS"]= 20
+            cfg.norm_upper_rw= 1_000_000_0.0
+            cfg.norm_lower_rw= 1_000_000_0.0
+        elif num_terminals == 40:
+            cfg.hyper_neural["NUM_LOWER_AGENTS"]= 40
+            cfg.norm_upper_rw= 5_000_000_0.0
+            cfg.norm_lower_rw= 5_000_000_0.0
+        elif num_terminals == 60:
+            cfg.hyper_neural["NUM_LOWER_AGENTS"]= 60
+            cfg.norm_upper_rw= 10_000_000_0.0
+            cfg.norm_lower_rw= 10_000_000_0.0
+            cfg.hyper_neural["SLOT_DURATION"]= 1.0
 def log_transform(reward: float) -> float:
     return reward
 

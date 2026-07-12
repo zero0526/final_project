@@ -429,18 +429,35 @@ class ResidualRoutingAgent:
     # ----------------------------------------------------------
     # ④ CHECKPOINT
     # ----------------------------------------------------------
-    def save(self, path: str):
+    def save(self, path: str, round_idx=None):
         torch.save({
             'proposal': self.proposal.state_dict(), 'refine': self.refine.state_dict(),
             'critic': self.critic.state_dict(), 'mf_net': self.mf_net.state_dict(),
             'proposal_opt': self.optimizer_proposal.state_dict(), 'refine_opt': self.optimizer_refine.state_dict(),
             'critic_opt': self.optimizer_critic.state_dict(), 'mf_opt': self.mf_optimizer.state_dict(),
             'learn_step': self.learn_step_counter, 'entropy_coef': self.entropy_coef,
+            'round_idx': round_idx,
         }, path)
 
     def load(self, path: str):
+        import os
+        if not os.path.exists(path):
+            print(f"[ResidualRoutingAgent] No checkpoint found at '{path}'")
+            return None
         ckpt = torch.load(path, map_location=self.device)
-        for k in ['proposal', 'refine', 'critic', 'mf_net']: getattr(self, k).load_state_dict(ckpt[k])
-        for k in ['proposal_opt', 'refine_opt', 'critic_opt', 'mf_opt']: getattr(self, f"optimizer_{k.replace('_opt','')}").load_state_dict(ckpt[k])
+        
+        # Load models
+        for k in ['proposal', 'refine', 'critic', 'mf_net']: 
+            if k in ckpt: getattr(self, k).load_state_dict(ckpt[k])
+            
+        # Load optimizers safely
+        if 'proposal_opt' in ckpt: self.optimizer_proposal.load_state_dict(ckpt['proposal_opt'])
+        if 'refine_opt' in ckpt: self.optimizer_refine.load_state_dict(ckpt['refine_opt'])
+        if 'critic_opt' in ckpt: self.optimizer_critic.load_state_dict(ckpt['critic_opt'])
+        if 'mf_opt' in ckpt: self.mf_optimizer.load_state_dict(ckpt['mf_opt'])
+        
         self.learn_step_counter = ckpt.get('learn_step', 0)
         self.entropy_coef = ckpt.get('entropy_coef', self.initial_entropy_coef)
+        round_idx = ckpt.get('round_idx', None)
+        print(f"[ResidualRoutingAgent] Loaded checkpoint from '{path}' (round_idx: {round_idx})")
+        return round_idx

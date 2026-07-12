@@ -241,10 +241,16 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
     # ==========================================
     # MAIN TRAINING LOOP
     # ==========================================
-    def run_training(self, trainer):
+    def run_training(self, trainer, max_cycles_finetune: int = 1000, resume_from: str = None, save_every: int = 1, save_dir: str = "checkpoints"):
         max_slots = trainer.env.time_manager.max_steps
+        # Resume from checkpoint if specified
+        if resume_from is not None:
+            self.load_checkpoint(trainer, save_dir=resume_from)
+        if max_cycles_finetune is not None:
+            self.max_cycles = max_cycles_finetune
         ep = 0
         pbar = tqdm(total=self.max_cycles, desc="Residual Isolated Test (20P + 10R)")
+        pbar.update(self.cycle_num - 1)
 
         while self.cycle_num <= self.max_cycles:
             obs = trainer.env.reset()
@@ -411,6 +417,10 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                     current_upper_state = next_upper_state
                     obs_upper = res_upper
 
+            # Auto-save checkpoint
+            if (ep + 1) % save_every == 0:
+                self.save_checkpoint(trainer, ep + 1, save_dir=save_dir)
+
             trainer.aggregator.store_history()
             trainer.aggregator.report_episode(ep)
             trainer.aggregator.reset_episode()
@@ -420,18 +430,104 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
         print("\n" + "=" * 60)
         print(f"ISOLATED TEST FINISHED! Total Lower Updates: {self.lower_train_num}")
         print("=" * 60)
-        self.run_evaluation(trainer, num_episodes=5)
+        pass
 
-    def run_evaluation(self, trainer, num_episodes=5):
-        print(f"\n--- Starting Post-Training Evaluation ({num_episodes} Episodes) ---")
+    # ── Checkpoint helpers ────────────────────────────────────────────────────
+
+    def save_checkpoint(self, trainer, ep: int, save_dir: str = "checkpoints"):
+        import os as _os
+        import torch as _torch
+        _os.makedirs(save_dir, exist_ok=True)
+
+        trainer.shared_upper_agent.save(
+            _os.path.join(save_dir, "upper_agent.pt"),
+            round_idx=ep,
+        )
+        trainer.shared_lower_agent.save(
+            _os.path.join(save_dir, "lower_agent.pt"),
+            round_idx=ep,
+        )
+
+        trainer_state = {
+            "ep":                    ep,
+            "cycle_num":             self.cycle_num,
+            "phase":                 self.phase,
+            "current_phase_updates": self.current_phase_updates,
+            "lower_train_num":       self.lower_train_num,
+            "upper_train_num":       self.upper_train_num,
+            "total_upper_steps":     trainer.total_upper_steps,
+            "total_lower_steps":     trainer.total_lower_steps,
+            "lower_mf_prev":         self.lower_mf_prev,
+            "upper_mf_ema":          self.upper_mf_ema,
+        }
+        _torch.save(trainer_state, _os.path.join(save_dir, "trainer_state.pt"))
+        print(f"[Checkpoint] Saved at episode {ep}, cycle {self.cycle_num}, phase {self.phase} -> {save_dir}")
+
+    def load_checkpoint(self, trainer, save_dir: str = "checkpoints") -> int:
+        import os as _os
+        import torch as _torch
+        upper_path   = _os.path.join(save_dir, "upper_agent.pt")
+        lower_path   = _os.path.join(save_dir, "lower_agent.pt")
+        trainer_path = _os.path.join(save_dir, "trainer_state.pt")
+
+        if not _os.path.exists(upper_path) or not _os.path.exists(lower_path):
+            print(f"[Checkpoint] No checkpoint found in '{save_dir}', starting fresh.")
+            return 0
+
+        ep_upper = trainer.shared_upper_agent.load(upper_path)
+        ep_lower = trainer.shared_lower_agent.load(lower_path)
+        resumed_ep = max(ep_upper if ep_upper else 0, ep_lower if ep_lower else 0)
+
+        if _os.path.exists(trainer_path):
+            state = _torch.load(trainer_path, map_location="cpu")
+            self.cycle_num             = state.get("cycle_num",             self.cycle_num)
+            self.phase                 = state.get("phase",                 self.phase)
+            self.current_phase_updates = state.get("current_phase_updates", self.current_phase_updates)
+            self.lower_train_num       = state.get("lower_train_num",       self.lower_train_num)
+            self.upper_train_num       = state.get("upper_train_num",       self.upper_train_num)
+            trainer.total_upper_steps  = state.get("total_upper_steps",     trainer.total_upper_steps)
+            trainer.total_lower_steps  = state.get("total_lower_steps",     trainer.total_lower_steps)
+            
+            if "lower_mf_prev" in state and state["lower_mf_prev"] is not None:
+                self.lower_mf_prev = state["lower_mf_prev"].to(trainer.device)
+            if "upper_mf_ema" in state and state["upper_mf_ema"] is not None:
+                self.upper_mf_ema = state["upper_mf_ema"].to(trainer.device)
+
+            resumed_ep = state.get("ep", resumed_ep)
+
+        print(f"[Checkpoint] Resumed from episode {resumed_ep}, cycle {self.cycle_num}, phase {self.phase} <- {save_dir}")
+        return resumed_ep
+
+    # ── Evaluation (4 metrics + bar chart) ───────────────────────────────────
+
+    METRICS_BAR = ['total_energy', 'avg_backlog_drift', 'realized_delay', 'qos_success_rate']
+
+    def evaluate(
+        self,
+        trainer,
+        checkpoint_dir: str,
+        num_eval_eps: int = 10,
+        label: str = "Residual-Routing-PPO",
+        plot_dir: str = "eval_results",
+        compare_results: dict = None,
+    ) -> dict:
+        import numpy as np
+        import os as _os
+        import torch
+
+        _os.makedirs(plot_dir, exist_ok=True)
+        self.load_checkpoint(trainer, save_dir=checkpoint_dir)
+
+        print(f"\n--- Starting Evaluation ({num_eval_eps} Episodes) ---")
         self.is_evaluating = True
         max_slots = trainer.env.time_manager.max_steps
         
-        for ep in range(num_episodes):
+        collected = {m: [] for m in self.METRICS_BAR}
+
+        for ep_i in range(num_eval_eps):
             res = trainer.env.reset()
             obs_upper, obs_lower = res['upper'], res['lower']
             current_upper_state = self.build_upper_state(trainer, obs_upper)
-            ep_reward = 0
 
             for slot in range(max_slots):
                 if trainer.env.time_manager.is_new_frame():
@@ -467,18 +563,26 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
                         task_states    = b_task_states,
                         masks_batch    = b_masks,
                         agent_indices  = b_agent_idx,
-                        deterministic  = True
+                        deterministic  = True,
+                        phrase         = "Proposal_Only" # Fixed evaluating
                     )
 
-                    final_n_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
-                    final_m_idx = torch.zeros(len(t_idx), dtype=torch.long, device=trainer.device)
+                    final_n_idxSize = len(t_idx)
+                    final_n_idx = torch.zeros(final_n_idxSize, dtype=torch.long, device=trainer.device)
+                    final_m_idx = torch.zeros(final_n_idxSize, dtype=torch.long, device=trainer.device)
                     for i in range(B):
                         a_ids = a_ids_list[i]
                         final_n_idx[pair_idx == i] = a_ids // trainer.max_models
                         final_m_idx[pair_idx == i] = a_ids % trainer.max_models
 
                     results = trainer.env.step_lower(t_idx, s_idx, batch_sizes, final_n_idx, final_m_idx, task_deadlines, tasks_min_accuracy)
-                    ep_reward += results['reward']
+                    
+                    trainer.aggregator.add_step_matrices(
+                        f_alloc=trainer.env.engine.cpu_alloc_matrix,
+                        arrivals=results['info']['arrival_matrix'],
+                        backlog=trainer.env.engine.backlog_queue.sum(dim=-1)
+                    )
+                    trainer.aggregator.add_lower(results)
                     
                     curr_slot_mfs = self._compute_node_wise_mfs(trainer, t_idx, s_idx, final_n_idx, final_m_idx, n_src)
                     self.lower_mf_prev = curr_slot_mfs.detach()
@@ -488,10 +592,102 @@ class ResidualRoutingPPOStrategy(AlgorithmStrategy):
 
                 if trainer.env.time_manager.is_new_frame():
                     res_upper = trainer.env.collect_upper_metrics()
+                    trainer.aggregator.add_upper(res_upper)
+                    current_upper_state = self.build_upper_state(trainer, res_upper)
                     obs_upper = res_upper
-                    next_upper_state = self.build_upper_state(trainer, res_upper)
-                    current_upper_state = next_upper_state
 
-            print(f"Eval Episode {ep + 1}: Total Reward={ep_reward:.2f}")
+            trainer.aggregator.store_history()
+            for m in self.METRICS_BAR:
+                hist = trainer.aggregator.history.get(m, [])
+                if hist:
+                    collected[m].append(hist[-1])
+            trainer.aggregator.reset_episode()
+            
+            line = "  ".join(
+                f"{m.split('_')[-1]}={collected[m][-1]:.4f}"
+                for m in self.METRICS_BAR if collected[m]
+            )
+            print(f"[Eval] Episode {ep_i + 1}/{num_eval_eps} - {line}")
 
         self.is_evaluating = False
+
+        results_summary = {}
+        print("\n[Eval] === Results Summary ===")
+        for m in self.METRICS_BAR:
+            arr = np.array(collected[m], dtype=np.float64)
+            results_summary[m] = {
+                "mean": float(arr.mean()) if len(arr) > 0 else 0.0,
+                "std":  float(arr.std())  if len(arr) > 0 else 0.0,
+                "raw":  arr.tolist(),
+            }
+            print(f"  {m:25s}: mean={results_summary[m]['mean']:.4f}  std+-{results_summary[m]['std']:.4f}")
+
+        self._plot_eval_bar(results_summary, label, compare_results, plot_dir)
+        return results_summary
+
+    def _plot_eval_bar(self, results: dict, label: str, compare_results: dict, plot_dir: str):
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import os as _os
+
+        METRIC_DISPLAY = {
+            'total_energy':      'Total Energy',
+            'avg_backlog_drift': 'Avg Backlog Drift',
+            'realized_delay':    'Realized Delay',
+            'qos_success_rate':  'QoS Success Rate',
+        }
+
+        all_algos = {
+            label: {m: (results[m]['mean'], results[m]['std']) for m in self.METRICS_BAR}
+        }
+        if compare_results:
+            all_algos.update(compare_results)
+
+        algos  = list(all_algos.keys())
+        n_algo = len(algos)
+        n_eps  = len(next(iter(results.values()))['raw'])
+        colors = plt.cm.tab10.colors
+
+        fig, axes = plt.subplots(1, len(self.METRICS_BAR), figsize=(5.5 * len(self.METRICS_BAR), 5))
+        if len(self.METRICS_BAR) == 1:
+            axes = [axes]
+
+        for ax_i, metric in enumerate(self.METRICS_BAR):
+            ax = axes[ax_i]
+            x     = np.arange(n_algo)
+            means = [all_algos[a].get(metric, (0.0, 0.0))[0] for a in algos]
+            stds  = [all_algos[a].get(metric, (0.0, 0.0))[1] for a in algos]
+
+            bars = ax.bar(
+                x, means, yerr=stds,
+                color=[colors[i % len(colors)] for i in range(n_algo)],
+                capsize=7, width=0.55, alpha=0.88,
+                error_kw={"elinewidth": 2.0, "ecolor": "black"},
+                zorder=3,
+            )
+
+            for bar, mv, sv in zip(bars, means, stds):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + sv + abs(bar.get_height()) * 0.02 + 1e-9,
+                    f"{mv:.3f}",
+                    ha="center", va="bottom", fontsize=9, fontweight="bold",
+                )
+
+            ax.set_title(METRIC_DISPLAY.get(metric, metric), fontsize=12, fontweight="bold")
+            ax.set_xticks(x)
+            ax.set_xticklabels(algos, rotation=15, ha="right", fontsize=10)
+            ax.set_ylabel("Value", fontsize=10)
+            ax.grid(axis="y", linestyle="--", alpha=0.45, zorder=0)
+            ax.spines[["top", "right"]].set_visible(False)
+
+        fig.suptitle(
+            f"Evaluation Metrics  (n={n_eps} episodes)",
+            fontsize=14, fontweight="bold", y=1.02,
+        )
+        plt.tight_layout()
+        out_path = _os.path.join(plot_dir, "eval_metrics_bar.png")
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"[Eval] Bar chart saved -> {out_path}")
+
